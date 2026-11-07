@@ -230,6 +230,14 @@ class SecretScanTests(unittest.TestCase):
         self.assertEqual(governance.scan_text("\n".join(lines)),
                          [(1, "credential-assignment"), (2, "environment-fallback")])
 
+    def test_unterminated_escaped_literal_does_not_backtrack(self):
+        text = 'password = """' + "\\" * 200
+        script = ("import sys; sys.path.insert(0, {!r}); import governance; "
+                  "governance.scan_text(sys.argv[1])").format(str(Path(__file__).parent))
+        result = subprocess.run([sys.executable, "-c", script, text],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_slack_app_token_is_detected(self):
         self.assertEqual(governance.scan_text('SLACK = "xapp-1-A123-456-abcdef123456"'),
                          [(1, "slack-token")])
