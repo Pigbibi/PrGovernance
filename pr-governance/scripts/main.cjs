@@ -19,6 +19,23 @@ function configuredOwner() {
   return { user_id: id, login };
 }
 
+// The reviewer is the same kind of account identity, so a repository that keeps
+// accounts out of public source can configure it the same way. A partial set
+// fails closed instead of falling back to a committed identity.
+function configuredReviewer() {
+  const appId = process.env.GOVERNANCE_REVIEWER_APP_ID;
+  const userId = process.env.GOVERNANCE_REVIEWER_USER_ID;
+  const login = process.env.GOVERNANCE_REVIEWER_LOGIN;
+  if (!appId && !userId && !login) return null;
+  const app = Number(appId);
+  const user = Number(userId);
+  if (!Number.isSafeInteger(app) || app < 1 || !Number.isSafeInteger(user) || user < 1
+    || typeof login !== 'string' || !login) {
+    throw new Error('Incomplete reviewer configuration');
+  }
+  return { provider: process.env.GOVERNANCE_REVIEWER_PROVIDER || 'codex', app_id: app, user_id: user, login };
+}
+
 async function defaultBranch(github, context) {
   const known = context.payload?.repository?.default_branch
     || context.payload?.pull_request?.base?.ref;
@@ -45,6 +62,8 @@ async function loadPolicy(github, context, branch) {
   }
   const owner = configuredOwner();
   if (owner) policy.owner = owner;
+  const reviewer = configuredReviewer();
+  if (reviewer) policy.reviewer = reviewer;
   gate.validatePolicy(policy);
   // Without an owner nobody can ever satisfy owner-approved, so a missing
   // configuration must fail the check instead of silently downgrading it.

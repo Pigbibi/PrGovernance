@@ -36,6 +36,9 @@ async function load(policy, environment) {
   } finally {
     delete process.env.GOVERNANCE_OWNER_ID;
     delete process.env.GOVERNANCE_OWNER_LOGIN;
+    delete process.env.GOVERNANCE_REVIEWER_APP_ID;
+    delete process.env.GOVERNANCE_REVIEWER_USER_ID;
+    delete process.env.GOVERNANCE_REVIEWER_LOGIN;
     Object.assign(process.env, saved);
   }
 }
@@ -55,6 +58,27 @@ test('a policy without owner is valid when the variables are set', async () => {
 
 test('a policy without owner and without variables fails closed', async () => {
   await assert.rejects(load(POLICY, {}));
+});
+
+const OWNER_ENV = { GOVERNANCE_OWNER_ID: '42', GOVERNANCE_OWNER_LOGIN: 'owner' };
+const REVIEWER_ENV = { ...OWNER_ENV, GOVERNANCE_REVIEWER_APP_ID: '7',
+  GOVERNANCE_REVIEWER_USER_ID: '8', GOVERNANCE_REVIEWER_LOGIN: 'reviewer[bot]' };
+
+test('reviewer configuration replaces a committed reviewer', async () => {
+  const { policy } = await load(POLICY, REVIEWER_ENV);
+  assert.deepEqual(policy.reviewer, { provider: 'codex', app_id: 7, user_id: 8, login: 'reviewer[bot]' });
+});
+
+test('a policy without reviewer is valid when the variables are set', async () => {
+  const { reviewer, ...rest } = POLICY;
+  const { policy } = await load(rest, REVIEWER_ENV);
+  assert.deepEqual(policy.reviewer, { provider: 'codex', app_id: 7, user_id: 8, login: 'reviewer[bot]' });
+});
+
+test('an incomplete reviewer configuration fails closed', async () => {
+  await assert.rejects(load(POLICY, { GOVERNANCE_REVIEWER_APP_ID: '7' }), /reviewer configuration/);
+  await assert.rejects(load(POLICY, { ...REVIEWER_ENV, GOVERNANCE_REVIEWER_USER_ID: '0' }),
+    /reviewer configuration/);
 });
 
 test('an incomplete owner configuration fails closed', async () => {

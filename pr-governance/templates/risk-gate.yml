@@ -88,6 +88,11 @@ jobs:
         env:
           GOVERNANCE_OWNER_ID: ${{ vars.RISK_GATE_OWNER_ID }}
           GOVERNANCE_OWNER_LOGIN: ${{ vars.RISK_GATE_OWNER }}
+          # Optional: a repository that keeps account identifiers out of public
+          # source configures the reviewer here instead of in policy.json.
+          GOVERNANCE_REVIEWER_APP_ID: ${{ vars.RISK_GATE_REVIEWER_APP_ID }}
+          GOVERNANCE_REVIEWER_USER_ID: ${{ vars.RISK_GATE_REVIEWER_USER_ID }}
+          GOVERNANCE_REVIEWER_LOGIN: ${{ vars.RISK_GATE_REVIEWER_LOGIN }}
         with:
           mode: gate
           record-label: 'false'

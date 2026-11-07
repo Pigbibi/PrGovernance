@@ -83,9 +83,16 @@ python3 "$hooks/governance.py" audit --staged     # whole index
 python3 "$hooks/governance.py" pre-commit
 python3 "$hooks/governance.py" commit-msg FILE
 python3 "$hooks/governance.py" pre-push           # reads ref updates on stdin
+python3 "$hooks/governance.py" verify             # installed copy matches .githooks
 ```
 
 Every command exits non-zero and prints `governance: <finding>` on failure.
+
+`verify` compares the installed copy in the common git directory with the
+committed `.githooks/` source, policy included, and checks that every worktree
+still resolves `core.hooksPath` there. Run it after pulling a change to the
+vendored hooks, and before trusting a clone that was installed by someone else;
+a non-empty result means `install` must run again from a trusted copy.
 
 ## Configuration
 

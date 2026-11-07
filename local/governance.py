@@ -342,6 +342,36 @@ def hook_pre_commit(root):
     return audit(root, True, config(root), changed_only=True)
 
 
+def verify(root):
+    root = repository_root(root)
+    source = Path(root) / ".githooks"
+    names = ["governance.py", "pre-commit", "commit-msg", "pre-push", "governance.json"]
+    missing = [name for name in names if not (source / name).is_file()]
+    if missing:
+        return [f"missing file {name} in {source}" for name in missing]
+    target = Path(git_output(root, "rev-parse", "--path-format=absolute",
+                             "--git-common-dir").strip()) / "governance"
+    problems = []
+    for name in names:
+        installed = target / name
+        if not installed.is_file():
+            problems.append(f"{installed} is missing; run install")
+        elif installed.read_bytes() != (source / name).read_bytes():
+            problems.append(f"{installed} differs from {source / name}; run install")
+    layout = repository_layout(root)
+    worktrees = [str(path) for path in layout[2] if Path(path).is_dir()]
+    enabled = git("-C", root, "config", "--bool", "--get", "extensions.worktreeConfig")
+    if enabled.stdout.strip() != "true":
+        worktrees = [root]
+    for worktree in worktrees:
+        effective = git("-C", worktree, "config", "--path", "--get", "core.hooksPath")
+        configured = effective.stdout.strip()
+        if not configured or Path(configured).resolve() != target.resolve():
+            problems.append(f"core.hooksPath for {worktree} is {configured or 'unset'}, "
+                            f"not {target}; run install")
+    return problems
+
+
 def hook_commit_msg(root, message_file):
     if not message_file:
         return ["commit-msg hook needs the message file"]
@@ -487,7 +517,8 @@ def repository_root(path):
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",
-                        choices=["audit", "pre-commit", "commit-msg", "pre-push", "install"])
+                        choices=["audit", "pre-commit", "commit-msg", "pre-push", "install",
+                                 "verify"])
     parser.add_argument("argument", nargs="?")
     parser.add_argument("--staged", action="store_true",
                         help="audit the index instead of the committed tree")
@@ -497,6 +528,8 @@ def main(argv):
     root = repository_root(str(Path(options.root).resolve()))
     if options.command == "install":
         problems = install(root, options.source)
+    elif options.command == "verify":
+        problems = verify(root)
     else:
         problems = {
             "audit": lambda: audit(root, options.staged, config(root)),
