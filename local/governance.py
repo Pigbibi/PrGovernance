@@ -44,10 +44,17 @@ SECRET_RULES = [
         r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
         r"(?:api[_-]?key|secret|token|password|passwd)"
         r"(?:[_-]?(?:access[_-]?key|key[_-]?base|value|hash|token|secret))*"
-        r"[\"']?\s*[:=]\s*(?P<q>['\"])(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)")),
+        r"[\"']?\s*[:=]\s*(?P<q>['\"]{3})(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)"
+        r"(?![A-Za-z0-9_])")),
+    ("credential-assignment", re.compile(
+        r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
+        r"(?:api[_-]?key|secret|token|password|passwd)"
+        r"(?:[_-]?(?:access[_-]?key|key[_-]?base|value|hash|token|secret))*"
+        r"[\"']?\s*[:=]\s*(?P<q>['\"])(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)"
+        r"(?![A-Za-z0-9_])")),
     ("environment-fallback", re.compile(
         r"(?i)(?:os\.)?(?:getenv|environ\.get)\(\s*(['\"])(?P<name>[^'\"]+)\1\s*,\s*"
-        r"(?P<q>['\"])(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)")),
+        r"(?P<q>['\"])(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)(?![A-Za-z0-9_])")),
 ]
 
 PLACEHOLDER = re.compile(
@@ -175,8 +182,6 @@ def scan_text(text, allow=()):
         for rule, pattern in SECRET_RULES:
             for match in pattern.finditer(line):
                 value = match.group("value") if "value" in pattern.groupindex else match.group(0)
-                if value != value.strip():
-                    continue
                 if (rule == "environment-fallback"
                         and not CREDENTIAL_NAME.search(match.group("name"))):
                     continue

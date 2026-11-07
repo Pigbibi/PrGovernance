@@ -82,9 +82,22 @@ class SecretScanTests(unittest.TestCase):
             'password = "example pass phrase for local use"',
             'password = "${SOME_LONG_ENVIRONMENT_VARIABLE}"',
             'PASSWORD="${DB_PASSWORD:?Missing DB_PASSWORD}"',
+            'password = " hunter2hunter2hunter2"',
+            'password = "hunter2hunter2hunter2 "',
+            'secret = os.getenv("DB_PASSWORD", "hunter2hunter2hunter2 ")',
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)),
-                         [(1, "credential-assignment"), (2, "environment-fallback")])
+                         [(1, "credential-assignment"), (2, "environment-fallback"),
+                          (6, "credential-assignment"), (7, "credential-assignment"),
+                          (8, "environment-fallback")])
+
+    def test_triple_quoted_values_are_scanned(self):
+        lines = [
+            'password = """correct horse battery staple 2026"""',
+            "token = '''hunter2hunter2hunter2'''",
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "credential-assignment")])
 
     def test_prose_values_are_not_credentials(self):
         lines = [
