@@ -47,6 +47,7 @@ class SecretScanTests(unittest.TestCase):
             'client_secret = "synthetic"',
             'PASSWORD="${DB_PASSWORD:-}"',
             'TIKHUB_API_KEY="${TIKHUB_API_KEY:-${FALLBACK_KEY:-}}"',
+            'PASSWORD="${PASSWORD-}"',
             'API_KEY="$API_KEY"',
             'TARGET_SECRET = "CONTACT_PHONE_LIST_JSON"',
             'DEV_SESSION_SECRET = "dev-session-secret-change-me"',
@@ -119,9 +120,12 @@ class SecretScanTests(unittest.TestCase):
         lines = [
             'PASSWORD="${PASSWORD:-hunter2hunter2hunter2}"',
             'PASSWORD="${PASSWORD:-${FALLBACK:-hunter2hunter2hunter2}}"',
+            'PASSWORD="${PASSWORD-hunter2hunter2hunter2}"',
+            'PASSWORD="${PASSWORD:=hunter2hunter2hunter2}"',
+            'PASSWORD="${PASSWORD:+hunter2hunter2hunter2}"',
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)),
-                         [(1, "credential-assignment"), (2, "credential-assignment")])
+                         [(number, "credential-assignment") for number in range(1, 6)])
 
     def test_slack_app_token_is_detected(self):
         self.assertEqual(governance.scan_text('SLACK = "xapp-1-A123-456-abcdef123456"'),
@@ -560,6 +564,13 @@ class RepositoryTests(unittest.TestCase):
         (Path(self.root) / "image.bin").write_bytes(b"\x00\x01\x02" * 100)
         self.git("add", "image.bin")
         self.assertEqual(governance.audit(self.root, True, governance.config(self.root)), [])
+
+    def test_text_with_a_single_nul_byte_is_scanned(self):
+        (Path(self.root) / "notes.txt").write_bytes(
+            b'TOKEN = "' + GITHUB_TOKEN.encode() + b'"\x00\n')
+        self.git("add", "notes.txt")
+        self.assertEqual(governance.audit(self.root, True, governance.config(self.root)),
+                         ["notes.txt:1: github-token"])
 
     def test_credentials_beside_the_hooks_are_scanned(self):
         self.write(".githooks/release.py", f'TOKEN = "{GITHUB_TOKEN}"\n')

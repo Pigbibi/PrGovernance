@@ -84,11 +84,14 @@ def shell_fallbacks(text):
                     end += 1
                 else:
                     end += 1
-            _name, separator, default = text[index + 2:end].partition(":-")
-            if separator and default:
+            inner = text[index + 2:end]
+            match = re.match(r"[A-Za-z_][A-Za-z0-9_]*"
+                             r"(:-|:=|:\+|:\?|-|=|\+|\?)(.*)$", inner, re.S)
+            if match:
+                default = match.group(2)
                 if default.startswith("$"):
                     literals.extend(shell_fallbacks(default))
-                else:
+                elif default:
                     literals.append(default)
             index = end + 1
         else:
@@ -99,6 +102,8 @@ def shell_fallbacks(text):
 def shell_reference_is_safe(value):
     return bool(SHELL_REFERENCE.match(value)) and all(
         exempt(literal) for literal in shell_fallbacks(value))
+
+
 ZERO_SHA = re.compile(r"^0+$")
 CONVENTIONAL = r"^(?:%s)(?:\([^)]+\))?!?: .+"
 
@@ -227,7 +232,9 @@ def text_of(content):
         if half and max(even, odd) / half > 0.3:
             encoding = "utf-16-le" if odd > even else "utf-16-be"
             return content.decode(encoding, errors="replace")
-        return None
+        if content.count(0) / len(content) > 0.3:
+            return None
+        content = content.replace(b"\x00", b"")
     return content.decode("utf-8", errors="replace")
 
 

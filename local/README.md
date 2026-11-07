@@ -24,11 +24,12 @@ Secret rules: PEM private keys (including encrypted PKCS#8), GitHub tokens
 assignments of 16 characters or more. Placeholder and fixture values (`example`,
 `sample`, `synthetic`, `dummy`, `test`, `fake`, `mock`, `fixture`, `changeme`,
 `change-me`, `redacted`, `your_token`, `<token>`), environment references
-(`os.environ`, `getenv`, `process.env`, `secrets.`, shell `${NAME:-}`), and
-all-caps names such as `CONTACT_PHONE_LIST_JSON` are allowed. The exemption
-applies to the matched value, not to the whole line, so a hard-coded fallback
-beside `getenv` or inside `${NAME:-...}` is still reported. UTF-16 text is
-decoded, not treated as binary.
+(`os.environ`, `getenv`, `process.env`, `secrets.`, shell `${NAME:-}` and
+`${NAME-word}`), and all-caps names such as `CONTACT_PHONE_LIST_JSON` are
+allowed. The exemption applies to the matched value, not to the whole line, so a
+hard-coded fallback beside `getenv` or inside a shell parameter expansion is
+still reported. UTF-16 text is decoded. A stray NUL byte does not hide a text
+file; dense binary content is still skipped.
 
 `audit` reads the committed tree (`HEAD`); `audit --staged` reads the index.
 That keeps a staged deletion from hiding a credential that is still committed.
