@@ -18,6 +18,9 @@ const at = (offsetSeconds) => new Date((NOW + offsetSeconds) * 1000).toISOString
 
 function fixture(options = {}) {
   const clone = structuredClone(policy);
+  // The shipped policy leaves the owner to protected variables, so fixtures
+  // inject a synthetic one for the label and digest assertions.
+  clone.owner ??= { user_id: 101, login: 'synthetic-owner' };
   if (options.policy) options.policy(clone);
   const files = options.files || [{
     filename: options.path || 'src/view.js',

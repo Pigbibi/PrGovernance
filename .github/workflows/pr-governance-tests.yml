@@ -24,7 +24,8 @@ jobs:
         run: >-
           node --test pr-governance/scripts/test-gate.cjs
           pr-governance/scripts/test-labels.cjs pr-governance/scripts/test-codex.cjs
-          pr-governance/scripts/test-runner.cjs pr-governance/scripts/test-nudge.cjs
+          pr-governance/scripts/test-main.cjs pr-governance/scripts/test-runner.cjs
+          pr-governance/scripts/test-nudge.cjs
       - name: Install the pinned scanner
         run: bash pr-governance/scripts/install-gitleaks.sh
       - name: Test the scanner

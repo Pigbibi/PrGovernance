@@ -33,14 +33,21 @@ test('the shipped default policy validates', () => {
   assert.equal(shipped.reviewer.provider, 'codex');
 });
 
+test('the owner is optional and resolved from protected variables', () => {
+  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'policy.default.json'), 'utf8'));
+  assert.equal(shipped.owner, undefined);
+  const withOwner = { ...shipped, owner: { user_id: 101, login: 'synthetic-owner' } };
+  assert.deepEqual(gate.validatePolicy(withOwner), withOwner);
+});
+
 test('the schema file lists exactly the fields the evaluator enforces', () => {
   const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'policy.schema.json'), 'utf8'));
   assert.equal(schema.$id, 'pr-governance/v3');
   assert.equal(schema.additionalProperties, false);
   const declared = Object.keys(schema.properties).sort();
-  const validated = ['version', 'mode', 'reviewer', 'owner', 'r0_paths', 'r2_paths',
+  const validated = ['version', 'mode', 'reviewer', 'r0_paths', 'r2_paths',
     'dependabot_template_exemption', 'max_evidence_age_hours'].sort();
-  assert.deepEqual(declared, validated);
+  assert.deepEqual(declared, [...validated, 'owner'].sort());
   assert.deepEqual([...schema.required].sort(), validated);
   assert.deepEqual([...schema.properties.mode.enum].sort(), ['enforce', 'local', 'report-only']);
   assert.deepEqual(schema.properties.reviewer.required.sort(), ['app_id', 'login', 'provider', 'user_id']);
@@ -54,7 +61,9 @@ for (const [name, mutate] of [
   ['extra reviewer field', policy => { policy.reviewer.app_slug = 'synthetic'; }],
   ['unknown top level field', policy => { policy.repository = 'example-org/example-repo'; }],
   ['non bot reviewer login', policy => { policy.reviewer.login = 'some-user'; }],
-  ['string owner id', policy => { policy.owner.user_id = '20649888'; }],
+  ['string owner id', policy => { policy.owner.user_id = '101'; }],
+  ['unknown owner field', policy => { policy.owner.team = 'synthetic'; }],
+  ['empty owner login', policy => { policy.owner.login = ''; }],
   ['unsupported provider', policy => { policy.reviewer.provider = 'coderabbit'; }],
   ['duplicate r2 rule', policy => { policy.r2_paths.push(policy.r2_paths[0]); }],
   ['absolute r0 rule', policy => { policy.r0_paths.push('/etc/passwd'); }],
