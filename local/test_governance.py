@@ -88,11 +88,26 @@ class SecretScanTests(unittest.TestCase):
 
     def test_prose_values_are_not_credentials(self):
         lines = [
-            '"BRAVE_SEARCH_API_KEY": "Brave Web Search discovery",',
-            "export IMAP_PASSWORD='邮箱 IMAP 授权码或 App Password'",
             'if "u_atoken=" in page_url and "u_asig=" in page_url:',
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)), [])
+
+    def test_word_only_passphrases_are_reported(self):
+        lines = [
+            'password = "correct horse battery staple"',
+            '"BRAVE_SEARCH_API_KEY": "Brave Web Search discovery",',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "credential-assignment")])
+
+    def test_allowed_values_match_the_whole_value(self):
+        lines = [
+            '"BRAVE_SEARCH_API_KEY": "Brave Web Search discovery",',
+            'password = "correct horse battery staple"',
+        ]
+        self.assertEqual(
+            governance.scan_text("\n".join(lines), ["Brave Web Search discovery"]),
+            [(2, "credential-assignment")])
 
     def test_prefixed_credential_names_are_detected(self):
         lines = [
@@ -335,6 +350,15 @@ class RepositoryTests(unittest.TestCase):
         self.write(".env.example", "PORT=8080\nTOKEN=your_token_here\n")
         self.git("add", ".env.example")
         self.assertEqual(governance.audit(self.root, True, governance.config(self.root)), [])
+
+    def test_allowed_value_from_config_is_not_reported(self):
+        self.write("search.py", '"BRAVE_SEARCH_API_KEY": "Brave Web Search discovery"\n')
+        self.git("add", "search.py")
+        self.assertEqual(governance.audit(self.root, True, governance.config(self.root)),
+                         ["search.py:1: credential-assignment"])
+        settings = dict(governance.DEFAULT_CONFIG,
+                        allow_values=["Brave Web Search discovery"])
+        self.assertEqual(governance.audit(self.root, True, settings), [])
 
     def test_example_named_key_container_is_reported(self):
         self.write("keys/signing.example.p12", "not a placeholder\n")

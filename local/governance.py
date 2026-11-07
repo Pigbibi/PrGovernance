@@ -29,6 +29,7 @@ DEFAULT_CONFIG = {
     "commit_types": ["feat", "fix", "docs", "refactor", "test", "chore",
                      "perf", "ci", "build", "revert"],
     "ignore_paths": [],
+    "allow_values": [],
 }
 
 SECRET_RULES = [
@@ -52,7 +53,6 @@ SECRET_RULES = [
 PLACEHOLDER = re.compile(
     r"(?i)(?:\bexample\b|\bsample\b|\bsynthetic\b|\bdummy\b|\bplaceholder\b"
     r"|\bchange[_-]?me\b|\bredacted\b|your[_-]?(?:token|key|secret)|<[^>]+>)")
-PROSE_VALUE = re.compile(r"[^\W\d_]+(?:[ \t]+[^\W\d_]+)+")
 SENSITIVE_FILE = re.compile(
     r"(^|/)(?:\.env(?:\.[^/]+)?|id_(?:rsa|dsa|ecdsa|ed25519)|credentials\.json"
     r"|[^/]+\.(?:pem|key|p12|pfx|keystore|jks|bks))$", re.IGNORECASE)
@@ -147,7 +147,7 @@ def config(root):
         if not isinstance(loaded, dict):
             raise SystemExit("governance: .githooks/governance.json must be an object")
         values.update(loaded)
-    for key in ("protected_branches", "commit_types", "ignore_paths"):
+    for key in ("protected_branches", "commit_types", "ignore_paths", "allow_values"):
         listed = values[key]
         if not isinstance(listed, list) or not all(isinstance(item, str) and item for item in listed):
             raise SystemExit(f"governance: {key} must be a list of non-empty strings")
@@ -156,7 +156,7 @@ def config(root):
     return values
 
 
-def scan_text(text):
+def scan_text(text, allow=()):
     findings = []
     for number, line in enumerate(text.splitlines(), 1):
         found = False
@@ -166,7 +166,7 @@ def scan_text(text):
                 if (rule == "environment-fallback"
                         and not CREDENTIAL_NAME.search(match.group("name"))):
                     continue
-                if exempt(value) or PROSE_VALUE.fullmatch(value):
+                if value in allow or exempt(value):
                     continue
                 if shell_reference_is_safe(value):
                     continue
@@ -266,11 +266,12 @@ def audit(root, staged, settings, changed_only=False):
     findings.extend(f"{path}: sensitive file is tracked" for path in sorted(sensitive_paths))
     candidates = [(path, sha) for path, sha in entries if path not in sensitive_paths]
     objects = read_objects(root, [sha for _path, sha in candidates])
+    allow = settings.get("allow_values", ())
     for path, sha in candidates:
         content = text_of(objects[sha])
         if content is None:
             continue
-        for number, rule in scan_text(content):
+        for number, rule in scan_text(content, allow):
             findings.append(f"{path}:{number}: {rule}")
     return findings
 

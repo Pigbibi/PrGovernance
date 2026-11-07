@@ -22,17 +22,18 @@ Use it before publishing a repository or after importing history.
 Secret rules: PEM private keys (including encrypted PKCS#8), GitHub tokens
 (classic and fine-grained), AWS access keys, Slack tokens, and quoted credential
 assignments of 16 characters or more. Quoted values may contain spaces and
-punctuation, so a passphrase is reported; a value made only of words and spaces
-is treated as prose and is not. Placeholder values (`example`, `sample`,
-`synthetic`, `dummy`, `changeme`, `change-me`, `redacted`, `your_token`,
-`<token>`), environment references (`os.environ`, `getenv`, `process.env`,
-`secrets.`, shell `${NAME:-}` and `${NAME-word}`), shell fallbacks that are
-themselves placeholders, and `${NAME:?message}` guards are allowed. The
+punctuation, so a word-only passphrase is reported. Placeholder values
+(`example`, `sample`, `synthetic`, `dummy`, `changeme`, `change-me`, `redacted`,
+`your_token`, `<token>`), environment references (`os.environ`, `getenv`,
+`process.env`, `secrets.`, shell `${NAME:-}` and `${NAME-word}`), shell fallbacks
+that are themselves placeholders, and `${NAME:?message}` guards are allowed. The
 exemption applies to the matched value, not to the whole line, so a hard-coded
 fallback beside `getenv` or inside a shell parameter expansion is still
 reported. Test fixtures that spell a credential generically are not exempt;
-list the test file in `ignore_paths` instead. UTF-16 text is decoded. A stray
-NUL byte does not hide a text file; dense binary content is still skipped.
+list the test file in `ignore_paths` instead. Documentation that must quote a
+full literal lists that exact value in `allow_values`. UTF-16 text is decoded.
+A stray NUL byte does not hide a text file; dense binary content is still
+skipped.
 
 `audit` reads the committed tree (`HEAD`); `audit --staged` reads the index.
 That keeps a staged deletion from hiding a credential that is still committed.
@@ -93,7 +94,8 @@ The installed snapshot of `.githooks/governance.json` overrides the defaults:
   "max_header": 72,
   "commit_types": ["feat", "fix", "docs", "refactor", "test", "chore",
                    "perf", "ci", "build", "revert"],
-  "ignore_paths": ["tests/fixtures/"]
+  "ignore_paths": ["tests/fixtures/"],
+  "allow_values": ["Brave Web Search discovery"]
 }
 ```
 
@@ -103,8 +105,11 @@ so ignoring `governance.json` cannot also hide `governance.json.bak`. The
 vendored hook files need no entry because the runner and shims contain no
 credentials; ignoring all of `.githooks/` would hide a secret added beside them.
 Add a test directory only when the suite intentionally contains synthetic key
-material that cannot be spelled as a placeholder. Editing `governance.json` on a
-branch has no effect until someone re-installs from a trusted copy.
+material that cannot be spelled as a placeholder. `allow_values` exempts a
+scanned value only when the quoted literal matches it in full; it is meant for
+documentation that describes a setting, not for passphrases. Editing
+`governance.json` on a branch has no effect until someone re-installs from a
+trusted copy.
 
 ## Limits
 
