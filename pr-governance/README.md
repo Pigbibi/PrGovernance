@@ -65,7 +65,11 @@ organization community-health files.
 2. Copy `templates/risk-gate.yml`, `templates/codex-nudge.yml`,
    `templates/gitleaks.yml` and `templates/weekly-secret-scan.yml` into
    `.github/workflows/`, replacing `__GOVERNANCE_REPO__` with the
-   `owner/repository` of this governance repository.
+   `owner/repository` of this governance repository and `__GOVERNANCE_SHA__`
+   with the full commit SHA at the head of `v1`. Copy
+   `templates/pr-review-signal.yml` unchanged as well: review events on fork
+   and Dependabot pull requests get a read-only token, so the gate is started
+   by that workflow's completion instead.
 3. Add the required contexts to branch protection on the default branch:
    `pr-template`, `ai-review`, `risk-gate`, `Gitleaks`, and the repository's
    own checks. Keep `strict` (require branches to be up to date) and
@@ -79,8 +83,8 @@ file, which is read from the default branch head.
 ## Trust model
 
 - Workflows never check out or execute pull request code.
-- The action is pinned by the `v1` branch of this repository, not by the
-  repository under judgement.
+- The action is pinned to a full commit SHA of this repository, not by the
+  repository under judgement. Update the pins after `v1` moves.
 - The policy is read from the default branch head, so a pull request cannot
   change the rules that judge it.
 - Reviewer evidence is a marker comment written by the configured reviewer

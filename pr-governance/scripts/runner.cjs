@@ -36,6 +36,22 @@ async function selectTargets(github, context, defaultBranch) {
     if (!Number.isSafeInteger(event.issue.number) || event.issue.number < 1) throw new Error('Invalid PR number');
     return [event.issue.number];
   }
+  if (context.eventName === 'workflow_run') {
+    // Reviews on fork and Dependabot pull requests arrive through a
+    // permissionless signal workflow; only its completion is trusted here.
+    const run = event.workflow_run;
+    if (!run) throw new Error('Missing workflow run payload');
+    const listed = Array.isArray(run.pull_requests) ? run.pull_requests : [];
+    const numbers = listed
+      .map(item => item?.number)
+      .filter(number => Number.isSafeInteger(number) && number > 0);
+    if (numbers.length) return [...new Set(numbers)];
+    const owner = run.head_repository?.owner?.login;
+    if (!owner || typeof run.head_branch !== 'string' || !run.head_branch) return [];
+    const pulls = await github.paginate(github.rest.pulls.list,
+      { ...repo, state: 'open', base: defaultBranch, head: `${owner}:${run.head_branch}`, per_page: 100 });
+    return pulls.map(pull => pull.number);
+  }
   if (context.eventName === 'workflow_dispatch') {
     if (context.ref !== `refs/heads/${defaultBranch}`) throw new Error('Dispatch must use the default branch');
     const number = Number(event.inputs?.pr_number);
