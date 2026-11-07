@@ -9,51 +9,91 @@
     "version",
     "mode",
     "reviewer",
-    "owner",
     "r0_paths",
     "r2_paths",
     "dependabot_template_exemption",
     "max_evidence_age_hours"
   ],
   "properties": {
-    "version": { "const": "pr-governance/v3" },
+    "version": {
+      "const": "pr-governance/v3"
+    },
     "mode": {
       "description": "enforce publishes and fails; report-only publishes advisory statuses and never fails the run; local publishes nothing.",
-      "enum": ["enforce", "local", "report-only"]
+      "enum": [
+        "enforce",
+        "local",
+        "report-only"
+      ]
     },
     "reviewer": {
       "description": "The only fixed identity in the gate. Reviewer-authored evidence is the sole review source.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["provider", "app_id", "user_id", "login"],
+      "required": [
+        "provider",
+        "app_id",
+        "user_id",
+        "login"
+      ],
       "properties": {
-        "provider": { "enum": ["codex"] },
-        "app_id": { "type": "integer", "minimum": 1 },
-        "user_id": { "type": "integer", "minimum": 1 },
-        "login": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\[bot\\]$" }
+        "provider": {
+          "enum": [
+            "codex"
+          ]
+        },
+        "app_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "user_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "login": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\[bot\\]$"
+        }
       }
     },
     "owner": {
-      "description": "The only actor whose timeline label event can claim owner-approved.",
+      "description": "Optional. The only actor whose label event can claim owner-approved. Prefer setting RISK_GATE_OWNER_ID and RISK_GATE_OWNER as repository or organization variables; the action then replaces this object and the policy carries no account identity.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["user_id", "login"],
+      "required": [
+        "user_id",
+        "login"
+      ],
       "properties": {
-        "user_id": { "type": "integer", "minimum": 1 },
-        "login": { "type": "string", "minLength": 1 }
+        "user_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "login": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "r0_paths": {
       "description": "Prose paths that may be classified R0 when the change has no sensitive keyword. Trailing slash matches a prefix.",
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "pattern": "^[^/\\\\][^\\\\]*$", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "pattern": "^[^/\\\\][^\\\\]*$",
+        "minLength": 1
+      }
     },
     "r2_paths": {
       "description": "Repository-specific high-risk paths; added to the canonical heuristics.",
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "pattern": "^[^/\\\\][^\\\\]*$", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "pattern": "^[^/\\\\][^\\\\]*$",
+        "minLength": 1
+      }
     },
     "dependabot_template_exemption": {
       "description": "Skip the pull request template check for verified Dependabot heads.",

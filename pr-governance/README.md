@@ -61,7 +61,10 @@ organization community-health files.
 ## Wiring a repository
 
 1. Copy `.github/governance/policy.json` from `policy.default.json` and set
-   `owner`, `reviewer`, and repository-specific `r2_paths`.
+   `reviewer` and repository-specific `r2_paths`. Leave `owner` out: account
+   identities belong in protected configuration, so the action reads
+   `RISK_GATE_OWNER_ID` and `RISK_GATE_OWNER` from repository or organization
+   variables and replaces `owner` when they are set.
 2. Copy `templates/risk-gate.yml`, `templates/codex-nudge.yml`,
    `templates/gitleaks.yml` and `templates/weekly-secret-scan.yml` into
    `.github/workflows/`, replacing `__GOVERNANCE_REPO__` with the
@@ -77,8 +80,9 @@ organization community-health files.
 4. Add the `SECRET_SCAN_BASELINE_B64` secret before enabling the weekly scan.
    The scan refuses to run without it.
 
-`RISK_GATE_OWNER` is not read by this action; the owner is part of the policy
-file, which is read from the default branch head.
+The owner identity comes from the `RISK_GATE_OWNER_ID` and `RISK_GATE_OWNER`
+variables. A policy that still carries `owner` keeps working until the
+variables are set, but no account identity is required in the file.
 
 ## Trust model
 
