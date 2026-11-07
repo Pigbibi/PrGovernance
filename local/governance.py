@@ -395,15 +395,25 @@ def install(root, source=None):
     result = git("-C", root, "config", "core.hooksPath", str(target))
     if result.returncode != 0:
         return [f"git config failed: {result.stderr.strip()}"]
-    effective = git("-C", root, "config", "--path", "--get", "core.hooksPath")
-    configured = effective.stdout.strip()
-    if not configured or Path(configured).resolve() != target.resolve():
-        worktree = git("-C", root, "config", "--worktree", "core.hooksPath", str(target))
-        effective = git("-C", root, "config", "--path", "--get", "core.hooksPath")
+    worktrees = [root]
+    enabled = git("-C", root, "config", "--bool", "--get", "extensions.worktreeConfig")
+    if enabled.stdout.strip() == "true":
+        worktrees = [str(path) for path in repository_layout(root)[2]]
+    for worktree in worktrees:
+        if not Path(worktree).is_dir():
+            continue
+        effective = git("-C", worktree, "config", "--path", "--get", "core.hooksPath")
         configured = effective.stdout.strip()
-        if worktree.returncode != 0 or not configured or Path(configured).resolve() != target.resolve():
-            return [f"core.hooksPath is overridden by worktree or environment config: "
-                    f"{configured or 'unset'}"]
+        if configured and Path(configured).resolve() == target.resolve():
+            continue
+        worktree_set = git("-C", worktree, "config", "--worktree",
+                           "core.hooksPath", str(target))
+        effective = git("-C", worktree, "config", "--path", "--get", "core.hooksPath")
+        configured = effective.stdout.strip()
+        if (worktree_set.returncode != 0 or not configured
+                or Path(configured).resolve() != target.resolve()):
+            return [f"core.hooksPath for {worktree} is overridden by worktree or "
+                    f"environment config: {configured or 'unset'}"]
     return []
 
 

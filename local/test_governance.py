@@ -572,14 +572,24 @@ class RepositoryTests(unittest.TestCase):
     def test_install_overrides_per_worktree_hooks_config(self):
         for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
             self.write(f".githooks/{name}", "#!/bin/sh\n")
+        self.write("README.md", "init\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "docs: init")
         self.git("config", "extensions.worktreeConfig", "true")
         self.git("config", "--worktree", "core.hooksPath", ".git/hooks")
-        result = self.cli("install")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        configured = run("git", "-C", self.root, "config", "--path",
-                         "--get", "core.hooksPath").stdout.strip()
-        self.assertEqual(Path(configured).resolve(),
-                         (Path(self.root) / ".git" / "governance").resolve())
+        with tempfile.TemporaryDirectory() as parent:
+            linked = Path(parent) / "linked"
+            self.git("worktree", "add", str(linked), "-b", "side")
+            subprocess.run(["git", "-C", str(linked), "config", "--worktree",
+                            "core.hooksPath", str(Path(self.root) / ".git" / "hooks")],
+                           check=True)
+            result = self.cli("install")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            target = (Path(self.root) / ".git" / "governance").resolve()
+            for path in [Path(self.root), linked]:
+                configured = run("git", "-C", str(path), "config", "--path",
+                                 "--get", "core.hooksPath").stdout.strip()
+                self.assertEqual(Path(configured).resolve(), target)
 
     def test_utf16_text_is_scanned(self):
         (Path(self.root) / "deploy.ps1").write_bytes(
