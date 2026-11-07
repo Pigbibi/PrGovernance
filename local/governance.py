@@ -33,15 +33,14 @@ SECRET_RULES = [
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
     ("credential-assignment", re.compile(
-        r"(?i)\b(?:api[_-]?key|secret|token|password|passwd)\b\s*[:=]\s*"
-        r"(['\"])(?=[A-Za-z0-9/+_-]*[0-9])(?=[A-Za-z0-9/+_-]*[A-Za-z])"
-        r"[A-Za-z0-9/+_-]{16,}\1")),
+        r"(?i)(?<![A-Za-z0-9_])[\"']?(?:api[_-]?key|secret|token|password|passwd)[\"']?\s*[:=]\s*"
+        r"(['\"])(?P<value>(?=[A-Za-z0-9/+_-]*[0-9])(?=[A-Za-z0-9/+_-]*[A-Za-z])"
+        r"[A-Za-z0-9/+_-]{16,})\1")),
 ]
 
 PLACEHOLDER = re.compile(
     r"(?i)(?:\bexample\b|\bsample\b|\bsynthetic\b|\bdummy\b|\bplaceholder\b"
     r"|\bchangeme\b|\bredacted\b|your[_-]?(?:token|key|secret)|<[^>]+>)")
-ENV_REFERENCE = re.compile(r"(?:os\.environ|getenv|process\.env|secrets\.)")
 SENSITIVE_FILE = re.compile(
     r"(^|/)(?:\.env(?:\.[^/]+)?|id_(?:rsa|dsa|ecdsa|ed25519)|credentials\.json"
     r"|[^/]+\.(?:pem|key|p12|pfx|keystore))$", re.IGNORECASE)
@@ -61,6 +60,13 @@ def git(*args, input_text=None):
     return run("git", *args, input_text=input_text)
 
 
+def git_output(root, *args):
+    result = git("-C", root, *args)
+    if result.returncode != 0:
+        raise SystemExit(f"governance: git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
 def config(root):
     path = Path(root) / ".githooks" / "governance.json"
     values = {key: list(value) if isinstance(value, list) else value
@@ -70,74 +76,99 @@ def config(root):
         if not isinstance(loaded, dict):
             raise SystemExit("governance: .githooks/governance.json must be an object")
         values.update(loaded)
+    for key in ("protected_branches", "commit_types", "ignore_paths"):
+        listed = values[key]
+        if not isinstance(listed, list) or not all(isinstance(item, str) and item for item in listed):
+            raise SystemExit(f"governance: {key} must be a list of non-empty strings")
+    if not isinstance(values["max_header"], int) or values["max_header"] < 1:
+        raise SystemExit("governance: max_header must be a positive integer")
     return values
 
 
 def scan_text(text):
     findings = []
     for number, line in enumerate(text.splitlines(), 1):
-        if PLACEHOLDER.search(line) or ENV_REFERENCE.search(line):
-            continue
         for rule, pattern in SECRET_RULES:
-            if pattern.search(line):
-                findings.append((number, rule))
-                break
+            match = pattern.search(line)
+            if not match:
+                continue
+            value = match.group("value") if "value" in pattern.groupindex else match.group(0)
+            if PLACEHOLDER.search(value):
+                continue
+            findings.append((number, rule))
+            break
     return findings
 
 
-def tracked_files(root, staged):
+def tracked_entries(root, staged):
+    """Return (path, blob sha) for the index or for the committed tree."""
     if staged:
-        output = git("-C", root, "diff", "--cached", "--name-only", "-z",
-                     "--diff-filter=ACMR").stdout
-    else:
-        output = git("-C", root, "ls-files", "-z").stdout
-    return [name for name in output.split("\0") if name]
+        changed = set(filter(None, git_output(
+            root, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR").split("\0")))
+        entries = []
+        for record in git_output(root, "ls-files", "-s", "-z").split("\0"):
+            if not record:
+                continue
+            meta, path = record.split("\t", 1)
+            _mode, sha, _stage = meta.split()
+            if path in changed:
+                entries.append((path, sha))
+        return entries
+    entries = []
+    for record in git_output(root, "ls-tree", "-r", "-z", "HEAD").split("\0"):
+        if not record:
+            continue
+        meta, path = record.split("\t", 1)
+        mode, _kind, sha = meta.split()
+        if mode != "160000":
+            entries.append((path, sha))
+    return entries
 
 
-def read_blobs(root, paths, staged):
-    if not paths:
+def read_objects(root, shas):
+    unique = sorted(set(shas))
+    if not unique:
         return {}
-    specs = "".join(f"{':' + path if staged else 'HEAD:' + path}\n" for path in paths)
     result = subprocess.run(("git", "-C", root, "cat-file", "--batch"),
-                            input=specs.encode(), capture_output=True, check=False)
+                            input="".join(sha + "\n" for sha in unique).encode(),
+                            capture_output=True, check=False)
     if result.returncode != 0:
-        raise SystemExit(f"governance: cannot read tracked objects: {result.stderr.decode(errors='replace').strip()}")
+        raise SystemExit("governance: cannot read tracked objects: "
+                         + result.stderr.decode("utf-8", "replace").strip())
     data = result.stdout
-    blobs = {}
+    objects = {}
     index = 0
-    for path in paths:
+    for sha in unique:
         end = data.find(b"\n", index)
         if end < 0:
-            break
+            raise SystemExit("governance: truncated object stream")
         header = data[index:end].decode("utf-8", "replace").split()
         index = end + 1
         if len(header) < 3:
-            blobs[path] = None
+            objects[sha] = None
             continue
         size = int(header[2])
         content = data[index:index + size]
         index += size + 1
-        if header[1] != "blob":
-            blobs[path] = None
-            continue
-        blobs[path] = content.decode("utf-8", errors="replace")
-    return blobs
+        objects[sha] = content if header[1] == "blob" else None
+    return objects
 
 
 def audit(root, staged, settings):
     findings = []
-    paths = []
-    for path in tracked_files(root, staged):
-        if any(path.startswith(prefix) for prefix in settings["ignore_paths"]):
+    entries = [(path, sha) for path, sha in tracked_entries(root, staged)
+               if not any(path.startswith(prefix) for prefix in settings["ignore_paths"])]
+    sensitive = [(path, sha) for path, sha in entries
+                 if SENSITIVE_FILE.search(path) and not SENSITIVE_EXEMPT.search(path)]
+    sensitive_paths = {path for path, _sha in sensitive}
+    findings.extend(f"{path}: sensitive file is tracked" for path in sorted(sensitive_paths))
+    candidates = [(path, sha) for path, sha in entries if path not in sensitive_paths]
+    objects = read_objects(root, [sha for _path, sha in candidates])
+    for path, sha in candidates:
+        content = objects.get(sha)
+        if content is None or b"\x00" in content:
             continue
-        if SENSITIVE_FILE.search(path) and not SENSITIVE_EXEMPT.search(path):
-            findings.append(f"{path}: sensitive file is tracked")
-            continue
-        paths.append(path)
-    for path, text in read_blobs(root, paths, staged).items():
-        if text is None or "\x00" in text:
-            continue
-        for number, rule in scan_text(text):
+        for number, rule in scan_text(content.decode("utf-8", errors="replace")):
             findings.append(f"{path}:{number}: {rule}")
     return findings
 
@@ -211,7 +242,7 @@ def main(argv):
                         choices=["audit", "pre-commit", "commit-msg", "pre-push", "install"])
     parser.add_argument("argument", nargs="?")
     parser.add_argument("--staged", action="store_true",
-                        help="audit the index instead of the tracked tree")
+                        help="audit the index instead of the committed tree")
     parser.add_argument("--root", default=".")
     options = parser.parse_args(argv)
     root = str(Path(options.root).resolve())

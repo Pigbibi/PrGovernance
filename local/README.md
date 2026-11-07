@@ -23,7 +23,11 @@ Secret rules: PEM private keys, GitHub tokens, AWS access keys, Slack tokens,
 and quoted credential assignments. Placeholder values (`example`, `sample`,
 `synthetic`, `dummy`, `changeme`, `redacted`, `your_token`, `<token>`) and
 environment references (`os.environ`, `getenv`, `process.env`, `secrets.`) are
-allowed.
+allowed. The exemption applies to the matched value, not to the whole line, so a
+hard-coded fallback beside `getenv` is still reported.
+
+`audit` reads the committed tree (`HEAD`); `audit --staged` reads the index.
+That keeps a staged deletion from hiding a credential that is still committed.
 
 ## Install in a repository
 

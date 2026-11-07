@@ -48,6 +48,28 @@ class SecretScanTests(unittest.TestCase):
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)), [])
 
+    def test_an_exemption_on_the_line_does_not_exempt_the_value(self):
+        lines = [
+            'token = os.getenv("TOKEN", "' + GITHUB_TOKEN + '")',
+            'token = "' + GITHUB_TOKEN + '"  # example account',
+            'password = "hunter2hunter2hunter2"  # see sample config',
+        ]
+        findings = governance.scan_text("\n".join(lines))
+        self.assertEqual([rule for _number, rule in findings],
+                         ["github-token", "github-token", "credential-assignment"])
+
+    def test_quoted_keys_are_recognized(self):
+        self.assertEqual(
+            governance.scan_text('{"token": "hunter2hunter2hunter2"}'),
+            [(1, "credential-assignment")])
+
+    def test_short_or_low_entropy_values_are_not_credentials(self):
+        lines = [
+            '{"token": "changeme"}',
+            '{"password": "hunter2"}',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)), [])
+
     def test_finding_reports_the_line_number(self):
         text = "clean line\nanother\n" + PRIVATE_KEY
         self.assertEqual(governance.scan_text(text), [(3, "private-key")])
@@ -200,6 +222,26 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(governance.audit(self.root, False, governance.config(self.root)),
                          ["notes.txt:1: aws-access-key"])
 
+    def test_history_audit_ignores_staged_deletion(self):
+        self.write("settings.txt", f'TOKEN = "{GITHUB_TOKEN}"\n')
+        self.git("add", "settings.txt")
+        self.git("commit", "-q", "-m", "feat: add settings")
+        self.git("rm", "-q", "settings.txt")
+        findings = governance.audit(self.root, False, governance.config(self.root))
+        self.assertEqual(findings, ["settings.txt:1: github-token"])
+
+    def test_newline_in_filename_does_not_hide_other_files(self):
+        self.write("a\nb.txt", f'TOKEN = "{GITHUB_TOKEN}"\n')
+        self.write("z.txt", f'TOKEN = "{GITHUB_TOKEN}"\n')
+        self.git("add", "-A")
+        findings = governance.audit(self.root, True, governance.config(self.root))
+        self.assertEqual(sum("github-token" in finding for finding in findings), 2)
+
+    def test_audit_fails_outside_a_repository(self):
+        with tempfile.TemporaryDirectory() as plain:
+            with self.assertRaises(SystemExit):
+                governance.audit(plain, False, governance.config(plain))
+
     def test_repository_config_overrides_defaults(self):
         self.write(".githooks/governance.json",
                    json.dumps({"protected_branches": ["trunk"], "max_header": 10}))
@@ -207,6 +249,14 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(settings["protected_branches"], ["trunk"])
         self.assertEqual(settings["max_header"], 10)
         self.assertEqual(settings["commit_types"], governance.DEFAULT_CONFIG["commit_types"])
+
+    def test_config_cannot_disable_the_audit(self):
+        for payload in [{"ignore_paths": [""]}, {"ignore_paths": "tests/"},
+                        {"max_header": 0}, {"commit_types": [""]}]:
+            with self.subTest(payload=payload):
+                self.write(".githooks/governance.json", json.dumps(payload))
+                with self.assertRaises(SystemExit):
+                    governance.config(self.root)
 
     def test_pre_commit_command_fails_closed(self):
         self.write("app.js", "const token = '" + SLACK_TOKEN + "';\n")
