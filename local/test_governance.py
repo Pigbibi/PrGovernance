@@ -58,6 +58,18 @@ class SecretScanTests(unittest.TestCase):
         self.assertEqual([rule for _number, rule in findings],
                          ["github-token", "github-token", "credential-assignment"])
 
+    def test_placeholders_do_not_mask_a_later_match(self):
+        line = '{"token":"your_token_123456789012345","password":"hunter2hunter2hunter2"}'
+        self.assertEqual(governance.scan_text(line), [(1, "credential-assignment")])
+
+    def test_quoted_values_may_contain_punctuation(self):
+        lines = [
+            'password = "S0mething!LongEnough123"',
+            'token = "c2VjcmV0S2V5MTIzNDU2Nzg5MA=="',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "credential-assignment")])
+
     def test_quoted_keys_are_recognized(self):
         self.assertEqual(
             governance.scan_text('{"token": "hunter2hunter2hunter2"}'),
@@ -242,6 +254,17 @@ class RepositoryTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 governance.audit(plain, False, governance.config(plain))
 
+    def test_type_change_is_scanned(self):
+        self.write("real.txt", "x\n")
+        (Path(self.root) / "settings.py").symlink_to("real.txt")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "feat: add link")
+        (Path(self.root) / "settings.py").unlink()
+        self.write("settings.py", f'TOKEN = "{GITHUB_TOKEN}"\n')
+        self.git("add", "settings.py")
+        findings = governance.audit(self.root, True, governance.config(self.root))
+        self.assertEqual(findings, ["settings.py:1: github-token"])
+
     def test_repository_config_overrides_defaults(self):
         self.write(".githooks/governance.json",
                    json.dumps({"protected_branches": ["trunk"], "max_header": 10}))
@@ -278,20 +301,25 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("protected branch main", result.stderr)
 
     def test_install_wires_the_hooks_path(self):
-        for name in ["pre-commit", "commit-msg", "pre-push"]:
+        names = ["governance.py", "pre-commit", "commit-msg", "pre-push"]
+        for name in names:
             self.write(f".githooks/{name}", "#!/bin/sh\n")
         result = self.cli("install")
         self.assertEqual(result.returncode, 0, result.stderr)
+        git_dir = run("git", "-C", self.root, "rev-parse", "--absolute-git-dir").stdout.strip()
+        target = Path(git_dir) / "governance"
         configured = run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip()
-        self.assertEqual(configured, ".githooks")
-        for name in ["pre-commit", "commit-msg", "pre-push"]:
-            self.assertTrue(os.access(Path(self.root) / ".githooks" / name, os.X_OK))
+        self.assertEqual(configured, str(target))
+        for name in names:
+            self.assertTrue((target / name).is_file())
+            self.assertTrue(os.access(target / name, os.X_OK))
+        self.assertFalse(os.access(Path(self.root) / ".githooks" / "pre-commit", os.X_OK))
 
     def test_install_refuses_a_partial_checkout(self):
         self.write(".githooks/pre-commit", "#!/bin/sh\n")
         result = self.cli("install")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("missing hook commit-msg", result.stderr)
+        self.assertIn("missing file commit-msg", result.stderr)
 
 
 if __name__ == "__main__":

@@ -40,9 +40,13 @@ cp <governance-repo>/local/governance.example.json .githooks/governance.json
 python3 .githooks/governance.py install
 ```
 
-`install` makes the shims executable and sets `core.hooksPath=.githooks` for this
-clone. Commit `.githooks/` so every clone can install the same rules. Each
-developer and each agent runs `install` once per clone; CI cannot do it for them.
+`install` copies the runner and shims into `.git/governance/`, makes them
+executable, and sets `core.hooksPath` to that directory for this clone. The
+tracked `.githooks/` directory is the source template only, so checking out a
+branch cannot replace an installed hook or its code; `governance.json` stays in
+`.githooks/` and is read as data. Commit `.githooks/` so every clone can install
+the same rules, and re-run `install` after updating it. Each developer and each
+agent runs `install` once per clone; CI cannot do it for them.
 
 ## Commands
 

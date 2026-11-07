@@ -15,6 +15,7 @@ publishes a credential.
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -34,8 +35,7 @@ SECRET_RULES = [
     ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
     ("credential-assignment", re.compile(
         r"(?i)(?<![A-Za-z0-9_])[\"']?(?:api[_-]?key|secret|token|password|passwd)[\"']?\s*[:=]\s*"
-        r"(['\"])(?P<value>(?=[A-Za-z0-9/+_-]*[0-9])(?=[A-Za-z0-9/+_-]*[A-Za-z])"
-        r"[A-Za-z0-9/+_-]{16,})\1")),
+        r"(['\"])(?P<value>[^\"'\s]{16,})\1")),
 ]
 
 PLACEHOLDER = re.compile(
@@ -88,15 +88,20 @@ def config(root):
 def scan_text(text):
     findings = []
     for number, line in enumerate(text.splitlines(), 1):
+        found = False
         for rule, pattern in SECRET_RULES:
-            match = pattern.search(line)
-            if not match:
-                continue
-            value = match.group("value") if "value" in pattern.groupindex else match.group(0)
-            if PLACEHOLDER.search(value):
-                continue
-            findings.append((number, rule))
-            break
+            for match in pattern.finditer(line):
+                value = match.group("value") if "value" in pattern.groupindex else match.group(0)
+                if "value" in pattern.groupindex and not (
+                        re.search("[A-Za-z]", value) and re.search("[0-9]", value)):
+                    continue
+                if PLACEHOLDER.search(value):
+                    continue
+                findings.append((number, rule))
+                found = True
+                break
+            if found:
+                break
     return findings
 
 
@@ -104,7 +109,7 @@ def tracked_entries(root, staged):
     """Return (path, blob sha) for the index or for the committed tree."""
     if staged:
         changed = set(filter(None, git_output(
-            root, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR").split("\0")))
+            root, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRT").split("\0")))
         entries = []
         for record in git_output(root, "ls-files", "-s", "-z").split("\0"):
             if not record:
@@ -223,14 +228,17 @@ def hook_pre_push(root, lines):
 
 
 def install(root):
-    directory = Path(root) / ".githooks"
-    shims = ["pre-commit", "commit-msg", "pre-push"]
-    missing = [name for name in shims if not (directory / name).is_file()]
+    source = Path(root) / ".githooks"
+    names = ["governance.py", "pre-commit", "commit-msg", "pre-push"]
+    missing = [name for name in names if not (source / name).is_file()]
     if missing:
-        return [f"missing hook {name} in .githooks/" for name in missing]
-    for name in shims:
-        (directory / name).chmod(0o755)
-    result = git("-C", root, "config", "core.hooksPath", ".githooks")
+        return [f"missing file {name} in .githooks/" for name in missing]
+    target = Path(git_output(root, "rev-parse", "--absolute-git-dir").strip()) / "governance"
+    target.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        shutil.copyfile(source / name, target / name)
+        (target / name).chmod(0o755)
+    result = git("-C", root, "config", "core.hooksPath", str(target))
     if result.returncode != 0:
         return [f"git config failed: {result.stderr.strip()}"]
     return []
