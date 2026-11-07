@@ -44,7 +44,7 @@ SECRET_RULES = [
 
 PLACEHOLDER = re.compile(
     r"(?i)(?:\bexample\b|\bsample\b|\bsynthetic\b|\bdummy\b|\bplaceholder\b"
-    r"|\bchangeme\b|\bredacted\b|your[_-]?(?:token|key|secret)|<[^>]+>)")
+    r"|\bchange[_-]?me\b|\bredacted\b|your[_-]?(?:token|key|secret)|<[^>]+>)")
 SENSITIVE_FILE = re.compile(
     r"(^|/)(?:\.env(?:\.[^/]+)?|id_(?:rsa|dsa|ecdsa|ed25519)|credentials\.json"
     r"|[^/]+\.(?:pem|key|p12|pfx|keystore|jks|bks))$", re.IGNORECASE)
@@ -54,6 +54,8 @@ SENSITIVE_EXEMPT = re.compile(
 TEST_VALUE = re.compile(
     r"(?i)(?:^|[-_.])(?:test|fake|mock|fixture|dummy|synthetic|example|sample"
     r"|placeholder|redacted)(?:$|[-_.])")
+SHELL_REFERENCE = re.compile(r'^\$(?:\{[^"\']*\}|[A-Za-z_][A-Za-z0-9_]*)$')
+CONSTANT_NAME = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
 ZERO_SHA = re.compile(r"^0+$")
 CONVENTIONAL = r"^(?:%s)(?:\([^)]+\))?!?: .+"
 
@@ -105,7 +107,8 @@ def scan_text(text):
         for rule, pattern in SECRET_RULES:
             for match in pattern.finditer(line):
                 value = match.group("value") if "value" in pattern.groupindex else match.group(0)
-                if PLACEHOLDER.search(value) or TEST_VALUE.search(value):
+                if any(exemption.search(value) for exemption in
+                       (PLACEHOLDER, TEST_VALUE, SHELL_REFERENCE, CONSTANT_NAME)):
                     continue
                 findings.append((number, rule))
                 found = True

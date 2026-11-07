@@ -23,10 +23,12 @@ Secret rules: PEM private keys (including encrypted PKCS#8), GitHub tokens
 (classic and fine-grained), AWS access keys, Slack tokens, and quoted credential
 assignments of 16 characters or more. Placeholder and fixture values (`example`,
 `sample`, `synthetic`, `dummy`, `test`, `fake`, `mock`, `fixture`, `changeme`,
-`redacted`, `your_token`, `<token>`) and environment references (`os.environ`,
-`getenv`, `process.env`, `secrets.`) are allowed. The exemption applies to the
-matched value, not to the whole line, so a hard-coded fallback beside `getenv`
-is still reported. UTF-16 text is decoded, not treated as binary.
+`change-me`, `redacted`, `your_token`, `<token>`), environment references
+(`os.environ`, `getenv`, `process.env`, `secrets.`, shell `${NAME:-}`), and
+all-caps names such as `CONTACT_PHONE_LIST_JSON` are allowed. The exemption
+applies to the matched value, not to the whole line, so a hard-coded fallback
+beside `getenv` is still reported. UTF-16 text is decoded, not treated as
+binary.
 
 `audit` reads the committed tree (`HEAD`); `audit --staged` reads the index.
 That keeps a staged deletion from hiding a credential that is still committed.

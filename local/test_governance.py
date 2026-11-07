@@ -45,6 +45,11 @@ class SecretScanTests(unittest.TestCase):
             "token: process.env.GITHUB_TOKEN",
             "api_key = getenv('API_KEY')",
             'client_secret = "synthetic"',
+            'PASSWORD="${DB_PASSWORD:-}"',
+            'TIKHUB_API_KEY="${TIKHUB_API_KEY:-${FALLBACK_KEY:-}}"',
+            'API_KEY="$API_KEY"',
+            'TARGET_SECRET = "CONTACT_PHONE_LIST_JSON"',
+            'DEV_SESSION_SECRET = "dev-session-secret-change-me"',
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)), [])
 
