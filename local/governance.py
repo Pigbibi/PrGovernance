@@ -44,17 +44,19 @@ SECRET_RULES = [
         r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
         r"(?:api[_-]?key|secret|token|password|passwd)"
         r"(?:[_-]?(?:access[_-]?key|key[_-]?base|value|hash|token|secret))*"
-        r"[\"']?\s*[:=]\s*(?P<q>['\"]{3})(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)"
+        r"[\"']?\s*[:=]\s*(?P<q>['\"]{3})"
+        r"(?P<value>(?:\\.|(?!(?P=q))[^\n]){16,})(?P=q)"
         r"(?![A-Za-z0-9_])")),
     ("credential-assignment", re.compile(
         r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
         r"(?:api[_-]?key|secret|token|password|passwd)"
         r"(?:[_-]?(?:access[_-]?key|key[_-]?base|value|hash|token|secret))*"
-        r"[\"']?\s*[:=]\s*(?P<q>['\"])(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)"
+        r"[\"']?\s*[:=]\s*(?P<q>['\"])(?P<value>(?:\\.|(?!(?P=q))[^\n]){16,})(?P=q)"
         r"(?![A-Za-z0-9_])")),
     ("environment-fallback", re.compile(
         r"(?i)(?:os\.)?(?:getenv|environ\.get)\(\s*(['\"])(?P<name>[^'\"]+)\1\s*,\s*"
-        r"(?P<q>['\"])(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)(?![A-Za-z0-9_])")),
+        r"(?P<q>['\"])(?P<value>(?:\\.|(?!(?P=q))[^\n]){16,})(?P=q)"
+        r"(?![A-Za-z0-9_])")),
 ]
 
 PLACEHOLDER = re.compile(
@@ -132,6 +134,14 @@ def shell_reference_is_safe(value):
 
 
 ZERO_SHA = re.compile(r"^0+$")
+HOOK_NAMES = frozenset("""
+applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit
+prepare-commit-msg commit-msg post-commit pre-rebase post-checkout post-merge
+pre-push pre-receive update proc-receive post-receive post-update
+reference-transaction push-to-checkout pre-auto-gc post-rewrite
+sendemail-validate fsmonitor-watchman p4-changelist p4-prepare-changelist
+p4-post-changelist p4-pre-submit post-index-change
+""".split())
 CONVENTIONAL = r"^(?:%s)(?:\([^)]+\))?!?: .+"
 
 
@@ -317,6 +327,10 @@ def protected_push(lines, settings, is_ancestor):
         branch = remote_ref.removeprefix("refs/heads/")
         if remote_ref.startswith("refs/heads/") and branch in settings["protected_branches"]:
             problems.append(f"direct push to protected branch {branch}; open a pull request")
+        if remote_ref.startswith("refs/tags/"):
+            if not ZERO_SHA.match(remote_sha) and remote_sha != local_sha:
+                problems.append(f"refusing to move or delete tag {remote_ref}; tags are immutable")
+            continue
         if ZERO_SHA.match(local_sha) or ZERO_SHA.match(remote_sha):
             continue
         if not is_ancestor(remote_sha, local_sha):
@@ -401,9 +415,8 @@ def inherited_hooks(worktrees, target, layout, skip):
             continue
         for entry in directory.iterdir():
             if not (entry.is_file() and os.access(entry, os.X_OK)
-                    and not entry.name.endswith(".sample")
+                    and entry.name in HOOK_NAMES
                     and entry.name not in skip
-                    and not entry.name.startswith(".")
                     and not worktree_controlled(entry, layout)):
                 continue
             known = sources.get(entry.name)

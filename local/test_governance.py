@@ -222,6 +222,14 @@ class SecretScanTests(unittest.TestCase):
         self.assertEqual(governance.scan_text("\n".join(lines)),
                          [(1, "credential-assignment"), (2, "environment-fallback")])
 
+    def test_escaped_delimiters_do_not_end_a_literal(self):
+        lines = [
+            r'{"password": "correct\"horse-battery-staple"}',
+            r'secret = os.getenv("DB_SECRET", "correct\"horse-battery-staple")',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "environment-fallback")])
+
     def test_slack_app_token_is_detected(self):
         self.assertEqual(governance.scan_text('SLACK = "xapp-1-A123-456-abcdef123456"'),
                          [(1, "slack-token")])
@@ -340,6 +348,24 @@ class ProtectedPushTests(unittest.TestCase):
         line = f"(delete) {'0' * 40} refs/heads/main {'b' * 40}"
         self.assertIn("protected branch main",
                       governance.protected_push([line], self.settings, self.ancestor)[0])
+
+    def test_replacing_a_tag_fails(self):
+        line = f"refs/tags/v1 {'a' * 40} refs/tags/v1 {'b' * 40}"
+        self.assertIn("tags are immutable",
+                      governance.protected_push([line], self.settings, self.ancestor)[0])
+
+    def test_deleting_a_tag_fails(self):
+        line = f"(delete) {'0' * 40} refs/tags/v1 {'b' * 40}"
+        self.assertIn("tags are immutable",
+                      governance.protected_push([line], self.settings, self.ancestor)[0])
+
+    def test_new_tag_passes(self):
+        line = f"refs/tags/v1 {'a' * 40} refs/tags/v1 {'0' * 40}"
+        self.assertEqual(governance.protected_push([line], self.settings, self.ancestor), [])
+
+    def test_unchanged_tag_passes(self):
+        line = f"refs/tags/v1 {'b' * 40} refs/tags/v1 {'b' * 40}"
+        self.assertEqual(governance.protected_push([line], self.settings, self.ancestor), [])
 
 
 class RepositoryTests(unittest.TestCase):
@@ -616,6 +642,21 @@ class RepositoryTests(unittest.TestCase):
             [sys.executable, str(Path(__file__).parent / "governance.py"),
              "install", "--root", str(root or self.root)],
             cwd=root or self.root, capture_output=True, text=True, env=env)
+
+    def test_install_forwards_only_real_hook_names(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        git_dir = Path(run("git", "-C", self.root, "rev-parse",
+                           "--absolute-git-dir").stdout.strip())
+        for name in ["post-merge", "json.py"]:
+            helper = git_dir / "hooks" / name
+            helper.write_text("#!/bin/sh\nexit 0\n")
+            helper.chmod(0o755)
+        result = self.install_without_global_config()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = git_dir / "governance"
+        self.assertTrue(os.access(target / "post-merge", os.X_OK))
+        self.assertFalse((target / "json.py").exists())
 
     def test_install_forwards_the_default_hooks_directory(self):
         for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:

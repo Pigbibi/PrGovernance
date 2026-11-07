@@ -14,7 +14,7 @@ gets the same rules.
 | --- | --- |
 | `pre-commit` | staged credentials, tracked `.env`/key/keystore files |
 | `commit-msg` | headers that are not conventional, or longer than 72 characters |
-| `pre-push` | direct pushes to `main`/`master`, non-fast-forward pushes |
+| `pre-push` | direct pushes to `main`/`master`, non-fast-forward pushes, moving or deleting an existing tag |
 
 `audit` runs the same secret and sensitive-file scan over the whole tracked tree.
 Use it before publishing a repository or after importing history.
@@ -57,7 +57,10 @@ the common git directory (`.git/governance/`, shared by linked worktrees), makes
 them executable, and sets `core.hooksPath` to that directory for this clone.
 Hooks already configured through `core.hooksPath`, and executable hooks in the
 default hooks directory, keep running: `install` adds forwarding shims for every
-hook it does not provide itself, such as a global `prepare-commit-msg`. Every
+hook it does not provide itself, such as a global `prepare-commit-msg`. Only
+files named after a hook git actually runs are forwarded, so helpers kept beside
+a hook (for example `json.py`) are not copied into the hook directory, where they
+would shadow the runner's imports. Every
 linked worktree contributes its own configured hooks; if two worktrees resolve
 the same hook name to different files, `install` stops and asks for a single
 hook directory instead of dropping one. Nothing inside a worktree is forwarded,
