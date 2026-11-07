@@ -310,7 +310,6 @@ function markerPayloads(body, name) {
 const carriesMarker = body => MARKER_NAMES.some(name => markerPayloads(body, name).length > 0);
 
 const REVIEW_TEXT = {
-  review_not_required: 'Low-risk prose: reviewer evidence not required',
   review_complete: 'Reviewer evidence covers this head',
   review_pending: 'Waiting for reviewer evidence on this head',
   review_running: 'Reviewer review is still running on this head',
@@ -471,10 +470,9 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
   const template = templateVerdict(snapshot, policy, dependabot);
   const labels = labelEvidence(snapshot, policy);
   const threads = unresolvedReviewerThreads(snapshot, policy);
-  let review = risk.tier === 'R0'
-    ? { provider: policy.reviewer.provider, state: 'success', reason: 'review_not_required', comment_id: null,
-      format: null, commit_sha: null, coverage: null, unresolved: null }
-    : reviewerEvidence(snapshot, policy, now);
+  // Reviewer evidence is required at every tier: a prose-only change can still
+  // introduce a misleading claim, so R0 only lowers the label requirement.
+  let review = reviewerEvidence(snapshot, policy, now);
   // Thread state comes from GitHub, the marker from the provider. The stricter
   // reading wins, and a resolved-or-missing thread never proves a clean review.
   if (threads.length && review.state !== 'failure') review = { ...review, state: 'failure', reason: 'review_threads' };
@@ -496,7 +494,7 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
   const cleared = labels.applied === 'owner' ? 'cleared by owner-approved'
     : labels.applied === 'agent' ? 'cleared by agent-approved, NOT confirmed by the owner' : null;
   const gateDescription = gateState === 'success'
-    ? `${risk.tier}: ${cleared || (review.reason === 'review_not_required' ? 'low-risk prose' : 'review verified')}`
+    ? `${risk.tier}: ${cleared || 'review verified'}`
     : gateState === 'pending' ? `${risk.tier}: waiting for reviewer`
       : `${risk.tier}: ${GATE_TEXT[reason] || REVIEW_TEXT[reason] || reason}`;
   const evidenceSha = digest({

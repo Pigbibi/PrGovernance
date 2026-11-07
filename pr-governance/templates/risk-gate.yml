@@ -57,6 +57,7 @@ jobs:
           GOVERNANCE_OWNER_LOGIN: ${{ vars.RISK_GATE_OWNER }}
         with:
           mode: gate
+          record-label: 'true'
 
   evaluate:
     name: Evaluate PR governance
@@ -89,3 +90,4 @@ jobs:
           GOVERNANCE_OWNER_LOGIN: ${{ vars.RISK_GATE_OWNER }}
         with:
           mode: gate
+          record-label: 'false'

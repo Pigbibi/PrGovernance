@@ -168,7 +168,7 @@ def range_scan(binary, base, head, root=None, config=None):
     verify_range(root, base, head)
     with tempfile.TemporaryDirectory(prefix='gitleaks-', dir=os.environ.get('RUNNER_TEMP')) as directory:
         findings = scan(binary, 'git', root, Path(directory) / 'range.json',
-                        config=config, log_opts=f'{base}..{head}')
+                        config=config, log_opts=f'--diff-merges=first-parent {base}..{head}')
     if findings:
         print(f'Range scan: {len(findings)} finding(s) in added commits')
     else:
