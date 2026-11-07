@@ -8,8 +8,9 @@
 
 const SCHEMA = 'pr-governance/v3';
 const MODES = ['enforce', 'local', 'report-only'];
-const POLICY_FIELDS = ['version', 'mode', 'reviewer', 'owner', 'r0_paths', 'r2_paths',
+const POLICY_FIELDS = ['version', 'mode', 'reviewer', 'r0_paths', 'r2_paths',
   'dependabot_template_exemption', 'max_evidence_age_hours'];
+const POLICY_OPTIONAL_FIELDS = ['owner'];
 const REVIEWER_FIELDS = ['provider', 'app_id', 'user_id', 'login'];
 const OWNER_FIELDS = ['user_id', 'login'];
 const PROVIDERS = ['codex'];
@@ -105,17 +106,19 @@ const normalizeLogin = login => String(login || '').replace(/\[bot\]$/i, '').toL
 
 // ----------------------------------------------------------------- policy ---
 
-function sameKeys(object, expected, label) {
+function sameKeys(object, expected, label, optional = []) {
   assert(object && typeof object === 'object' && !Array.isArray(object), `Invalid ${label}`);
-  const actual = Object.keys(object).sort();
-  assert(actual.length === expected.length && actual.every((key, index) => key === [...expected].sort()[index]),
+  const allowed = new Set([...expected, ...optional]);
+  const actual = Object.keys(object);
+  assert(actual.every(key => allowed.has(key))
+    && expected.every(key => Object.prototype.hasOwnProperty.call(object, key)),
     `Invalid ${label} fields`);
 }
 
 const isPositiveId = value => Number.isSafeInteger(value) && value > 0;
 
 function validatePolicy(policy) {
-  sameKeys(policy, POLICY_FIELDS, 'policy');
+  sameKeys(policy, POLICY_FIELDS, 'policy', POLICY_OPTIONAL_FIELDS);
   assert(policy.version === SCHEMA, `Unsupported policy version: ${String(policy.version)}`);
   assert(MODES.includes(policy.mode), `Unsupported policy mode: ${String(policy.mode)}`);
   sameKeys(policy.reviewer, REVIEWER_FIELDS, 'reviewer');
@@ -124,9 +127,13 @@ function validatePolicy(policy) {
   assert(isPositiveId(policy.reviewer.user_id), 'Invalid reviewer user id');
   assert(typeof policy.reviewer.login === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]*\[bot\]$/.test(policy.reviewer.login),
     'Invalid reviewer login');
-  sameKeys(policy.owner, OWNER_FIELDS, 'owner');
-  assert(isPositiveId(policy.owner.user_id), 'Invalid owner user id');
-  assert(typeof policy.owner.login === 'string' && policy.owner.login.length > 0, 'Invalid owner login');
+  // The owner comes from protected repository variables, so the committed
+  // policy may leave it out. When it is present, it must be well formed.
+  if (policy.owner !== undefined) {
+    sameKeys(policy.owner, OWNER_FIELDS, 'owner');
+    assert(isPositiveId(policy.owner.user_id), 'Invalid owner user id');
+    assert(typeof policy.owner.login === 'string' && policy.owner.login.length > 0, 'Invalid owner login');
+  }
   for (const field of ['r0_paths', 'r2_paths']) {
     const rules = policy[field];
     assert(Array.isArray(rules), `Invalid ${field}`);
@@ -418,7 +425,7 @@ function labelEvidence(snapshot, policy) {
     // The owner label claims a human confirmation; only the configured owner id
     // can carry that claim. Any actor may claim agent-approved, and the actor is
     // recorded in the digest because the label API already requires write access.
-    if (name === 'owner-approved' && latest.actor?.id !== policy.owner.user_id) continue;
+    if (name === 'owner-approved' && latest.actor?.id !== policy.owner?.user_id) continue;
     if (!Number.isSafeInteger(latest.id) || latest.id < 1 || !Number.isSafeInteger(latest.actor?.id)) continue;
     const expected = `${name} for PR ${snapshot.pr.number} at event ${latest.id} on this head`;
     const bound = (snapshot.statuses || []).some(status => status.context === 'clearing-label'

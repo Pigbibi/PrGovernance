@@ -52,6 +52,9 @@ jobs:
     steps:
       - name: Record label head
         uses: __GOVERNANCE_REPO__/pr-governance@__GOVERNANCE_SHA__
+        env:
+          GOVERNANCE_OWNER_ID: ${{ vars.RISK_GATE_OWNER_ID }}
+          GOVERNANCE_OWNER_LOGIN: ${{ vars.RISK_GATE_OWNER }}
         with:
           mode: gate
 
@@ -81,5 +84,8 @@ jobs:
     steps:
       - name: Evaluate
         uses: __GOVERNANCE_REPO__/pr-governance@__GOVERNANCE_SHA__
+        env:
+          GOVERNANCE_OWNER_ID: ${{ vars.RISK_GATE_OWNER_ID }}
+          GOVERNANCE_OWNER_LOGIN: ${{ vars.RISK_GATE_OWNER }}
         with:
           mode: gate
