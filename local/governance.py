@@ -41,8 +41,9 @@ SECRET_RULES = [
         r"\b(?:xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,})")),
     ("credential-assignment", re.compile(
         r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
-        r"(?:api[_-]?key|secret|token|password|passwd)[\"']?\s*[:=]\s*"
-        r"(['\"])(?P<value>[^\"'\s]{16,})\1")),
+        r"(?:api[_-]?key|secret|token|password|passwd)"
+        r"(?:[_-]?(?:access[_-]?key|key[_-]?base|value|hash|token|secret))*"
+        r"[\"']?\s*[:=]\s*(['\"])(?P<value>[^\"'\s]{16,})\1")),
 ]
 
 PLACEHOLDER = re.compile(

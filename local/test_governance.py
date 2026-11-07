@@ -91,6 +91,16 @@ class SecretScanTests(unittest.TestCase):
             governance.scan_text('{"token": "hunter2hunter2hunter2"}'),
             [(1, "credential-assignment")])
 
+    def test_credential_keywords_with_suffixes_are_detected(self):
+        lines = [
+            'aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCY1234567890"',
+            'awsSecretAccessKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCY1234567890"',
+            '{"api_key_value": "S0mething!LongEnough123"}',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "credential-assignment"),
+                          (3, "credential-assignment")])
+
     def test_short_or_low_entropy_values_are_not_credentials(self):
         lines = [
             '{"token": "changeme"}',
