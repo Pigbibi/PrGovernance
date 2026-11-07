@@ -54,14 +54,17 @@ the common git directory (`.git/governance/`, shared by linked worktrees), makes
 them executable, and sets `core.hooksPath` to that directory for this clone.
 Hooks already configured through `core.hooksPath`, and executable hooks in the
 default hooks directory, keep running: `install` adds forwarding shims for every
-hook it does not provide itself, such as a global `prepare-commit-msg`. Nothing
-inside a worktree is forwarded, including symlinks that resolve there, because a
-contributor branch could replace those scripts. When
-`extensions.worktreeConfig` sets a per-worktree `core.hooksPath`, `install`
-updates that value too. Checking out a branch cannot replace an installed hook or
-its policy. Commit `.githooks/` so every clone has the source, and re-run
-`install` from a trusted copy whenever the policy or the runner changes. Each
-developer and each agent installs once per clone; CI cannot do it for them.
+hook it does not provide itself, such as a global `prepare-commit-msg`. Every
+linked worktree contributes its own configured hooks; if two worktrees resolve
+the same hook name to different files, `install` stops and asks for a single
+hook directory instead of dropping one. Nothing inside a worktree is forwarded,
+including symlinks that resolve there, because a contributor branch could
+replace those scripts. When `extensions.worktreeConfig` sets a per-worktree
+`core.hooksPath`, `install` updates that value too. Checking out a branch cannot
+replace an installed hook or its policy. Commit `.githooks/` so every clone has
+the source, and re-run `install` from a trusted copy whenever the policy or the
+runner changes. Each developer and each agent installs once per clone; CI cannot
+do it for them.
 
 ## Commands
 

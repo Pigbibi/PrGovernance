@@ -344,7 +344,7 @@ def worktree_controlled(path, layout):
     return any(inside(resolved, base) for base in roots)
 
 
-def previous_hooks(root, target):
+def previous_hooks(root, target, layout):
     result = git("-C", root, "config", "--path", "--get", "core.hooksPath")
     value = result.stdout.strip()
     if result.returncode == 0 and value:
@@ -359,9 +359,31 @@ def previous_hooks(root, target):
     path = path.resolve()
     if path == target.resolve() or not path.is_dir():
         return None
-    if worktree_controlled(path, repository_layout(root)):
+    if worktree_controlled(path, layout):
         return None
     return path
+
+
+def inherited_hooks(worktrees, target, layout, skip):
+    sources = {}
+    for root in worktrees:
+        directory = previous_hooks(root, target, layout)
+        if directory is None:
+            continue
+        for entry in directory.iterdir():
+            if not (entry.is_file() and os.access(entry, os.X_OK)
+                    and not entry.name.endswith(".sample")
+                    and entry.name not in skip
+                    and not entry.name.startswith(".")
+                    and not worktree_controlled(entry, layout)):
+                continue
+            source = entry.resolve()
+            known = sources.get(entry.name)
+            if known is not None and known != source:
+                return None, [f"{entry.name} is inherited from both {known} and "
+                              f"{source}; keep a single hook directory"]
+            sources[entry.name] = source
+    return sources, []
 
 
 def install(root, source=None):
@@ -373,32 +395,29 @@ def install(root, source=None):
         return [f"missing file {name} in {source}" for name in missing]
     target = Path(git_output(root, "rev-parse", "--path-format=absolute",
                              "--git-common-dir").strip()) / "governance"
-    inherited = previous_hooks(root, target)
+    layout = repository_layout(root)
+    worktrees = [str(path) for path in layout[2] if Path(path).is_dir()]
+    enabled = git("-C", root, "config", "--bool", "--get", "extensions.worktreeConfig")
+    if enabled.stdout.strip() != "true":
+        worktrees = [root]
+    sources, conflicts = inherited_hooks(worktrees, target, layout, names)
+    if conflicts:
+        return conflicts
     target.mkdir(parents=True, exist_ok=True)
     for name in names:
         shutil.copyfile(source / name, target / name)
         (target / name).chmod(0o755)
     policy = source / "governance.json"
     (target / "governance.json").write_text(policy.read_text() if policy.is_file() else "{}\n")
-    if inherited is not None:
-        layout = repository_layout(root)
-        for entry in inherited.iterdir():
-            if (entry.is_file() and os.access(entry, os.X_OK)
-                    and not entry.name.endswith(".sample")
-                    and entry.name not in names and not entry.name.startswith(".")
-                    and not worktree_controlled(entry, layout)):
-                shim = target / entry.name
-                if not shim.exists():
-                    shim.write_text(
-                        f"#!/bin/sh\nexec {shlex.quote(str(entry.resolve()))} \"$@\"\n")
-                    shim.chmod(0o755)
+    for name, inherited in sorted(sources.items()):
+        shim = target / name
+        if not shim.exists():
+            shim.write_text(
+                f"#!/bin/sh\nexec {shlex.quote(str(inherited))} \"$@\"\n")
+            shim.chmod(0o755)
     result = git("-C", root, "config", "core.hooksPath", str(target))
     if result.returncode != 0:
         return [f"git config failed: {result.stderr.strip()}"]
-    worktrees = [root]
-    enabled = git("-C", root, "config", "--bool", "--get", "extensions.worktreeConfig")
-    if enabled.stdout.strip() == "true":
-        worktrees = [str(path) for path in repository_layout(root)[2]]
     for worktree in worktrees:
         if not Path(worktree).is_dir():
             continue

@@ -591,6 +591,67 @@ class RepositoryTests(unittest.TestCase):
                                  "--get", "core.hooksPath").stdout.strip()
                 self.assertEqual(Path(configured).resolve(), target)
 
+    def test_install_preserves_hooks_from_every_worktree(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        self.write("README.md", "init\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "docs: init")
+        self.git("config", "extensions.worktreeConfig", "true")
+        with tempfile.TemporaryDirectory() as parent:
+            shared = Path(parent)
+            main_hooks = shared / "main-hooks"
+            side_hooks = shared / "side-hooks"
+            main_hooks.mkdir()
+            side_hooks.mkdir()
+            prepare = main_hooks / "prepare-commit-msg"
+            prepare.write_text("#!/bin/sh\nexit 0\n")
+            prepare.chmod(0o755)
+            post = side_hooks / "post-commit"
+            post.write_text("#!/bin/sh\nexit 0\n")
+            post.chmod(0o755)
+            self.git("config", "--worktree", "core.hooksPath", str(main_hooks))
+            linked = shared / "linked"
+            self.git("worktree", "add", str(linked), "-b", "side")
+            subprocess.run(["git", "-C", str(linked), "config", "--worktree",
+                            "core.hooksPath", str(side_hooks)], check=True)
+            result = self.install_without_global_config()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            target = (Path(self.root) / ".git" / "governance").resolve()
+            for name, source in [("prepare-commit-msg", prepare),
+                                 ("post-commit", post)]:
+                shim = target / name
+                self.assertTrue(os.access(shim, os.X_OK))
+                self.assertIn(str(source.resolve()), shim.read_text())
+
+    def test_install_rejects_conflicting_inherited_hooks(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        self.write("README.md", "init\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "docs: init")
+        self.git("config", "extensions.worktreeConfig", "true")
+        with tempfile.TemporaryDirectory() as parent:
+            shared = Path(parent)
+            main_hooks = shared / "main-hooks"
+            side_hooks = shared / "side-hooks"
+            main_hooks.mkdir()
+            side_hooks.mkdir()
+            for directory, body in [(main_hooks, "#!/bin/sh\nexit 0\n"),
+                                    (side_hooks, "#!/bin/sh\nexit 1\n")]:
+                hook = directory / "post-commit"
+                hook.write_text(body)
+                hook.chmod(0o755)
+            self.git("config", "--worktree", "core.hooksPath", str(main_hooks))
+            linked = shared / "linked"
+            self.git("worktree", "add", str(linked), "-b", "side")
+            subprocess.run(["git", "-C", str(linked), "config", "--worktree",
+                            "core.hooksPath", str(side_hooks)], check=True)
+            result = self.install_without_global_config()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("inherited from both", result.stderr)
+            self.assertFalse((Path(self.root) / ".git" / "governance").exists())
+
     def test_utf16_text_is_scanned(self):
         (Path(self.root) / "deploy.ps1").write_bytes(
             f'TOKEN = "{GITHUB_TOKEN}"\n'.encode("utf-16"))
