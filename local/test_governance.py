@@ -92,6 +92,11 @@ class SecretScanTests(unittest.TestCase):
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)), [])
 
+    def test_fine_grained_token_is_detected(self):
+        token = "github_pat_" + "11ABCDEFG0123456789_abcdefghijklmnop"
+        self.assertEqual(governance.scan_text(f"Authorization: Bearer {token}"),
+                         [(1, "github-token")])
+
     def test_finding_reports_the_line_number(self):
         text = "clean line\nanother\n" + PRIVATE_KEY
         self.assertEqual(governance.scan_text(text), [(3, "private-key")])
@@ -304,6 +309,26 @@ class RepositoryTests(unittest.TestCase):
                              (Path(self.root) / ".git" / "governance").resolve())
             self.git("worktree", "remove", "--force", str(worktree))
             self.assertTrue((Path(configured) / "governance.py").is_file())
+
+    def test_staged_submodule_is_skipped(self):
+        self.write("a.txt", "x\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-q", "-m", "feat: add a")
+        sha = run("git", "-C", self.root, "rev-parse", "HEAD").stdout.strip()
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{sha},vendor/sub")
+        self.assertEqual(governance.audit(self.root, True, governance.config(self.root)), [])
+
+    def test_audit_from_subdirectory_covers_the_whole_tree(self):
+        self.write("secret.txt", f'TOKEN = "{GITHUB_TOKEN}"\n')
+        self.git("add", "secret.txt")
+        self.git("commit", "-q", "-m", "feat: add secret")
+        self.write("src/clean.py", "print(1)\n")
+        self.git("add", "src/clean.py")
+        self.git("commit", "-q", "-m", "feat: add clean")
+        result = run(sys.executable, str(Path(__file__).parent / "governance.py"),
+                     "audit", cwd=Path(self.root) / "src")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("secret.txt", result.stderr)
 
     def test_repository_config_overrides_defaults(self):
         self.write(".githooks/governance.json",

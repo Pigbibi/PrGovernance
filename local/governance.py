@@ -30,7 +30,8 @@ DEFAULT_CONFIG = {
 
 SECRET_RULES = [
     ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")),
-    ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
+    ("github-token", re.compile(
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
     ("credential-assignment", re.compile(
@@ -116,8 +117,8 @@ def tracked_entries(root, staged):
             if not record:
                 continue
             meta, path = record.split("\t", 1)
-            _mode, sha, _stage = meta.split()
-            if path in changed:
+            mode, sha, _stage = meta.split()
+            if path in changed and mode != "160000":
                 entries.append((path, sha))
         return entries
     entries = []
@@ -247,6 +248,11 @@ def install(root):
     return []
 
 
+def repository_root(path):
+    result = git("-C", path, "rev-parse", "--show-toplevel")
+    return result.stdout.strip() if result.returncode == 0 else path
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",
@@ -256,7 +262,7 @@ def main(argv):
                         help="audit the index instead of the committed tree")
     parser.add_argument("--root", default=".")
     options = parser.parse_args(argv)
-    root = str(Path(options.root).resolve())
+    root = repository_root(str(Path(options.root).resolve()))
     if options.command == "install":
         problems = install(root)
     else:
