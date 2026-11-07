@@ -58,8 +58,15 @@ SENSITIVE_FILE = re.compile(
 SENSITIVE_EXEMPT = re.compile(
     r"(?i)(?:^|/)(?:\.env\.(?:example|sample|template)|[^/]+\.example\.[^/]+"
     r"|[^/]*_example\.[^/]+)$")
+KEY_CONTAINER = re.compile(
+    r"[^/]+\.(?:pem|key|p12|pfx|keystore|jks|bks)$", re.IGNORECASE)
 SHELL_REFERENCE = re.compile(r'^\$(?:\{[^"\']*\}|[A-Za-z_][A-Za-z0-9_]*)$')
 CREDENTIAL_NAME = re.compile(r"(?i)api[_-]?key|secret|token|password|passwd")
+
+
+def is_sensitive(path):
+    return bool(SENSITIVE_FILE.search(path)) and (
+        bool(KEY_CONTAINER.search(path)) or not SENSITIVE_EXEMPT.search(path))
 
 
 def exempt(value):
@@ -251,8 +258,7 @@ def audit(root, staged, settings, changed_only=False):
     findings = []
     entries = [(path, sha) for path, sha in tracked_entries(root, staged, changed_only)
                if not ignored(path, settings["ignore_paths"])]
-    sensitive = [(path, sha) for path, sha in entries
-                 if SENSITIVE_FILE.search(path) and not SENSITIVE_EXEMPT.search(path)]
+    sensitive = [(path, sha) for path, sha in entries if is_sensitive(path)]
     sensitive_paths = {path for path, _sha in sensitive}
     findings.extend(f"{path}: sensitive file is tracked" for path in sorted(sensitive_paths))
     candidates = [(path, sha) for path, sha in entries if path not in sensitive_paths]

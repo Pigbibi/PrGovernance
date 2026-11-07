@@ -200,6 +200,14 @@ class SensitivePathTests(unittest.TestCase):
                      "credentials.example.json"]:
             with self.subTest(path=path):
                 self.assertIsNotNone(governance.SENSITIVE_EXEMPT.search(path))
+                self.assertFalse(governance.is_sensitive(path))
+
+    def test_key_containers_are_never_exempt(self):
+        for path in ["keys/signing.example.p12", "keys/signing_example.jks",
+                     "certs/server.example.pem", "keys/release_example.key",
+                     "keys/release.example.pfx", "keys/store_example.bks"]:
+            with self.subTest(path=path):
+                self.assertTrue(governance.is_sensitive(path))
 
 
 class CommitHeaderTests(unittest.TestCase):
@@ -308,6 +316,12 @@ class RepositoryTests(unittest.TestCase):
         self.write(".env.example", "PORT=8080\nTOKEN=your_token_here\n")
         self.git("add", ".env.example")
         self.assertEqual(governance.audit(self.root, True, governance.config(self.root)), [])
+
+    def test_example_named_key_container_is_reported(self):
+        self.write("keys/signing.example.p12", "not a placeholder\n")
+        self.git("add", "keys/signing.example.p12")
+        self.assertEqual(governance.audit(self.root, True, governance.config(self.root)),
+                         ["keys/signing.example.p12: sensitive file is tracked"])
 
     def test_history_audit_reads_committed_content(self):
         self.write("notes.txt", "nothing to see\n")
