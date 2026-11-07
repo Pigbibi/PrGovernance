@@ -123,6 +123,13 @@ class SecretScanTests(unittest.TestCase):
         base = self.suppression_repository()
         self.assertEqual(self.range_scan(base), 0)
 
+    def test_range_scan_survives_non_utf8_history(self):
+        base = self.suppression_repository()
+        (self.source / 'legacy.txt').write_bytes(b'\xd2\xbb\xb6\xce\xce\xc4\xb1\xbe\n')
+        self.git('add', '.')
+        self.git('commit', '--quiet', '-m', 'test: legacy encoding')
+        self.assertEqual(self.range_scan(base), 0)
+
     def test_range_scan_unknown_head_fails(self):
         base = self.suppression_repository()
         with self.assertRaises(RuntimeError):

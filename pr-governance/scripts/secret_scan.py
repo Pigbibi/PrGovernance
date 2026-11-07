@@ -69,10 +69,15 @@ def reject_source_ignores(target):
             raise RuntimeError('Source ignore files are not permitted')
 
 
-def git(target, *arguments):
+def git(target, *arguments, capture=False):
+    # Patch output is only needed for its exit status, and historical blobs are
+    # not guaranteed to be UTF-8. Decoding them would abort the scan on any
+    # repository that ever committed a non-UTF-8 file.
     try:
         return subprocess.run(['git', '-C', str(target), *arguments],
-                              capture_output=True, text=True, check=False)
+                              stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              text=True, encoding='utf-8', errors='replace', check=False)
     except OSError:
         raise RuntimeError('Git history is unreadable; scan blocked') from None
 
@@ -81,7 +86,7 @@ def verify_history(target):
     # Gitleaks can report success after its internal Git reader fails. Read the
     # complete patch history first, suppressing every source-controlled diagnostic.
     try:
-        root = git(target, 'rev-parse', '--show-toplevel')
+        root = git(target, 'rev-parse', '--show-toplevel', capture=True)
         if root.returncode or Path(root.stdout.strip()).resolve() != Path(target).resolve():
             raise RuntimeError('Git history is unreadable; scan blocked')
     except (OSError, ValueError):

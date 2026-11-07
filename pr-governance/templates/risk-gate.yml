@@ -9,10 +9,12 @@ on:
     types: [opened, reopened, synchronize, edited, labeled, unlabeled, ready_for_review, closed]
   issue_comment:
     types: [created, edited, deleted]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
-  pull_request_review_comment:
-    types: [created, edited, deleted]
+  # A review or inline comment on a fork or Dependabot pull request gets a
+  # read-only token, so those events are relayed through the permissionless
+  # `PR review signal` workflow and evaluated by this trusted run.
+  workflow_run:
+    workflows: ["PR review signal"]
+    types: [completed]
   push:
     branches: [main, master]
   # A merge made with GITHUB_TOKEN raises no push, and nothing raises an event
@@ -49,7 +51,7 @@ jobs:
       statuses: write
     steps:
       - name: Record label head
-        uses: __GOVERNANCE_REPO__/pr-governance@v1
+        uses: __GOVERNANCE_REPO__/pr-governance@__GOVERNANCE_SHA__
         with:
           mode: gate
 
@@ -74,10 +76,10 @@ jobs:
     # Job-level, so an irrelevant comment skips the job without cancelling an
     # evaluation already running. Label evidence no longer rides on this run.
     concurrency:
-      group: pr-governance-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || github.run_id }}
+      group: pr-governance-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
       cancel-in-progress: true
     steps:
       - name: Evaluate
-        uses: __GOVERNANCE_REPO__/pr-governance@v1
+        uses: __GOVERNANCE_REPO__/pr-governance@__GOVERNANCE_SHA__
         with:
           mode: gate
