@@ -92,6 +92,10 @@ class SecretScanTests(unittest.TestCase):
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)), [])
 
+    def test_encrypted_private_key_is_detected(self):
+        self.assertEqual(governance.scan_text("-----BEGIN ENCRYPTED PRIVATE KEY-----"),
+                         [(1, "private-key")])
+
     def test_fine_grained_token_is_detected(self):
         token = "github_pat_" + "11ABCDEFG0123456789_abcdefghijklmnop"
         self.assertEqual(governance.scan_text(f"Authorization: Bearer {token}"),

@@ -29,7 +29,8 @@ DEFAULT_CONFIG = {
 }
 
 SECRET_RULES = [
-    ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")),
+    ("private-key", re.compile(
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")),
     ("github-token", re.compile(
         r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
@@ -124,7 +125,7 @@ def tracked_entries(root, staged, changed_only):
                 entries.append((path, sha))
         return entries
     entries = []
-    for record in git_output(root, "ls-tree", "-r", "-z", "HEAD").split("\0"):
+    for record in git_output(root, "ls-tree", "-r", "-z", "--full-tree", "HEAD").split("\0"):
         if not record:
             continue
         meta, path = record.split("\t", 1)
