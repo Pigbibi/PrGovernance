@@ -24,6 +24,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Scan added commits
-        uses: __GOVERNANCE_REPO__/pr-governance@v1
+        uses: __GOVERNANCE_REPO__/pr-governance@__GOVERNANCE_SHA__
         with:
           mode: scan
