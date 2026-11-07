@@ -91,6 +91,19 @@ class SecretScanTests(unittest.TestCase):
             governance.scan_text('{"token": "hunter2hunter2hunter2"}'),
             [(1, "credential-assignment")])
 
+    def test_environment_lookup_fallbacks_are_credentials(self):
+        lines = [
+            'password = os.getenv("DB_PASSWORD", "correcthorsebatterystaple")',
+            "secret = os.environ.get('APP_SECRET', 'correcthorsebatterystaple')",
+            'token = os.getenv("API_TOKEN", "abcdefghijklmnopqrst")',
+            'root = os.environ.get("GITHUB_API_URL", "https://api.github.com")',
+            'password = os.getenv("DB_PASSWORD")',
+            'password = os.getenv("DB_PASSWORD", "changeme")',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "environment-fallback"), (2, "environment-fallback"),
+                          (3, "environment-fallback")])
+
     def test_credential_keywords_with_suffixes_are_detected(self):
         lines = [
             'aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCY1234567890"',

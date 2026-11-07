@@ -44,6 +44,9 @@ SECRET_RULES = [
         r"(?:api[_-]?key|secret|token|password|passwd)"
         r"(?:[_-]?(?:access[_-]?key|key[_-]?base|value|hash|token|secret))*"
         r"[\"']?\s*[:=]\s*(['\"])(?P<value>[^\"'\s]{16,})\1")),
+    ("environment-fallback", re.compile(
+        r"(?i)(?:os\.)?(?:getenv|environ\.get)\(\s*(['\"])(?P<name>[^'\"]+)\1\s*,\s*"
+        r"(['\"])(?P<value>[^'\"\s]{16,})\3")),
 ]
 
 PLACEHOLDER = re.compile(
@@ -60,6 +63,7 @@ TEST_VALUE = re.compile(
     r"|placeholder|redacted)(?:$|[-_.])")
 SHELL_REFERENCE = re.compile(r'^\$(?:\{[^"\']*\}|[A-Za-z_][A-Za-z0-9_]*)$')
 CONSTANT_NAME = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+CREDENTIAL_NAME = re.compile(r"(?i)api[_-]?key|secret|token|password|passwd")
 
 
 def exempt(value):
@@ -156,6 +160,9 @@ def scan_text(text):
         for rule, pattern in SECRET_RULES:
             for match in pattern.finditer(line):
                 value = match.group("value") if "value" in pattern.groupindex else match.group(0)
+                if (rule == "environment-fallback"
+                        and not CREDENTIAL_NAME.search(match.group("name"))):
+                    continue
                 if exempt(value) or shell_reference_is_safe(value):
                     continue
                 findings.append((number, rule))
