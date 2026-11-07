@@ -34,7 +34,7 @@ SECRET_RULES = [
         r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")),
     ("github-token", re.compile(
         r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
-    ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
     ("credential-assignment", re.compile(
         r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
@@ -73,15 +73,15 @@ def git_output(root, *args):
 
 def config(root):
     root = repository_root(root)
-    path = Path(root) / ".githooks" / "governance.json"
+    path = None
     common = git("-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if common.returncode == 0:
-        snapshot = Path(common.stdout.strip()) / "governance" / "governance.json"
-        if snapshot.is_file():
-            path = snapshot
+        candidate = Path(common.stdout.strip()) / "governance" / "governance.json"
+        if candidate.is_file():
+            path = candidate
     values = {key: list(value) if isinstance(value, list) else value
               for key, value in DEFAULT_CONFIG.items()}
-    if path.is_file():
+    if path is not None:
         loaded = json.loads(path.read_text())
         if not isinstance(loaded, dict):
             raise SystemExit("governance: .githooks/governance.json must be an object")

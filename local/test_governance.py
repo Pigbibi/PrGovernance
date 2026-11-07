@@ -92,6 +92,11 @@ class SecretScanTests(unittest.TestCase):
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)), [])
 
+    def test_temporary_aws_key_is_detected(self):
+        token = "ASIA" + "ABCDEFGHIJKLMNOP"
+        self.assertEqual(governance.scan_text(f"AWS_ACCESS_KEY_ID={token}"),
+                         [(1, "aws-access-key")])
+
     def test_encrypted_private_key_is_detected(self):
         self.assertEqual(governance.scan_text("-----BEGIN ENCRYPTED PRIVATE KEY-----"),
                          [(1, "private-key")])
@@ -347,18 +352,25 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("secret.txt", result.stderr)
 
     def test_repository_config_overrides_defaults(self):
-        self.write(".githooks/governance.json",
+        self.write(".git/governance/governance.json",
                    json.dumps({"protected_branches": ["trunk"], "max_header": 10}))
         settings = governance.config(self.root)
         self.assertEqual(settings["protected_branches"], ["trunk"])
         self.assertEqual(settings["max_header"], 10)
         self.assertEqual(settings["commit_types"], governance.DEFAULT_CONFIG["commit_types"])
 
+    def test_branch_config_is_not_read_before_install(self):
+        self.write(".githooks/governance.json",
+                   json.dumps({"ignore_paths": ["secret.txt"], "protected_branches": []}))
+        settings = governance.config(self.root)
+        self.assertEqual(settings["ignore_paths"], [".githooks/"])
+        self.assertEqual(settings["protected_branches"], ["main", "master"])
+
     def test_config_cannot_disable_the_audit(self):
         for payload in [{"ignore_paths": [""]}, {"ignore_paths": "tests/"},
                         {"max_header": 0}, {"commit_types": [""]}]:
             with self.subTest(payload=payload):
-                self.write(".githooks/governance.json", json.dumps(payload))
+                self.write(".git/governance/governance.json", json.dumps(payload))
                 with self.assertRaises(SystemExit):
                     governance.config(self.root)
 
