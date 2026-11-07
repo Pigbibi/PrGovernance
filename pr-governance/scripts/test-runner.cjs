@@ -187,6 +187,8 @@ test('review threads paginate to the last page and refuse a repeating cursor', a
   let page = 0;
   m.github.graphql = async (query, params) => {
     page++;
+    // `Actor` has no databaseId field; asking for one makes every evaluation fail.
+    assert.doesNotMatch(query, /databaseId/);
     assert.equal(params.cursor, page === 1 ? null : 'cursor1');
     return { repository: { pullRequest: { reviewThreads: {
       nodes: [{ id: `thread-${page}`, isResolved: page === 1, comments: { nodes: [{ author: { login: 'agent' } }] } }],
