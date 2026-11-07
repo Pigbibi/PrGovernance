@@ -482,6 +482,13 @@ class RepositoryTests(unittest.TestCase):
         git_dir = run("git", "-C", self.root, "rev-parse", "--absolute-git-dir").stdout.strip()
         self.assertFalse((Path(git_dir) / "governance" / "prepare-commit-msg").exists())
 
+    def install_without_global_config(self, root=None):
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).parent / "governance.py"),
+             "install", "--root", str(root or self.root)],
+            cwd=root or self.root, capture_output=True, text=True, env=env)
+
     def test_install_forwards_the_default_hooks_directory(self):
         for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
             self.write(f".githooks/{name}", "#!/bin/sh\n")
@@ -491,15 +498,56 @@ class RepositoryTests(unittest.TestCase):
             hook = git_dir / "hooks" / name
             hook.write_text("#!/bin/sh\nexit 0\n")
             hook.chmod(0o755)
-        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).parent / "governance.py"),
-             "install", "--root", self.root],
-            cwd=self.root, capture_output=True, text=True, env=env)
+        result = self.install_without_global_config()
         self.assertEqual(result.returncode, 0, result.stderr)
         target = git_dir / "governance"
         self.assertTrue(os.access(target / "post-checkout", os.X_OK))
         self.assertFalse((target / "pre-rebase.sample").exists())
+
+    def test_install_skips_hooks_symlinked_into_the_worktree(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        script = self.write("legacy/prepare-commit-msg", "#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+        git_dir = Path(run("git", "-C", self.root, "rev-parse",
+                           "--absolute-git-dir").stdout.strip())
+        link = git_dir / "hooks" / "prepare-commit-msg"
+        link.symlink_to(script)
+        result = self.install_without_global_config()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((git_dir / "governance" / "prepare-commit-msg").exists())
+
+    def test_install_skips_hooks_from_another_worktree(self):
+        self.write("README.md", "init\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "docs: init")
+        with tempfile.TemporaryDirectory() as linked_dir:
+            linked = Path(linked_dir) / "linked"
+            self.git("worktree", "add", str(linked), "-b", "side")
+            for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+                target = linked / ".githooks" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("#!/bin/sh\n")
+            script = self.write("legacy/prepare-commit-msg", "#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+            self.git("config", "core.hooksPath", str(Path(self.root) / "legacy"))
+            result = self.install_without_global_config(linked)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            git_dir = Path(run("git", "-C", self.root, "rev-parse",
+                               "--absolute-git-dir").stdout.strip())
+            self.assertFalse((git_dir / "governance" / "prepare-commit-msg").exists())
+
+    def test_install_overrides_per_worktree_hooks_config(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        self.git("config", "extensions.worktreeConfig", "true")
+        self.git("config", "--worktree", "core.hooksPath", ".git/hooks")
+        result = self.cli("install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        configured = run("git", "-C", self.root, "config", "--path",
+                         "--get", "core.hooksPath").stdout.strip()
+        self.assertEqual(Path(configured).resolve(),
+                         (Path(self.root) / ".git" / "governance").resolve())
 
     def test_utf16_text_is_scanned(self):
         (Path(self.root) / "deploy.ps1").write_bytes(

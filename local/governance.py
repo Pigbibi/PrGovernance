@@ -305,6 +305,35 @@ def hook_pre_push(root, lines):
     return protected_push(lines, settings, is_ancestor)
 
 
+def inside(path, base):
+    return path == base or base in path.parents
+
+
+def repository_layout(root):
+    common = Path(git_output(root, "rev-parse", "--path-format=absolute",
+                             "--git-common-dir").strip()).resolve()
+    git_dir = Path(git_output(root, "rev-parse", "--path-format=absolute",
+                              "--absolute-git-dir").strip()).resolve()
+    roots = []
+    listed = git("-C", root, "worktree", "list", "--porcelain")
+    if listed.returncode == 0:
+        roots.extend(Path(line[len("worktree "):]).resolve()
+                     for line in listed.stdout.splitlines()
+                     if line.startswith("worktree "))
+    current = Path(root).resolve()
+    if current not in roots:
+        roots.append(current)
+    return common, git_dir, roots
+
+
+def worktree_controlled(path, layout):
+    common, git_dir, roots = layout
+    resolved = path.resolve()
+    if inside(resolved, git_dir) or inside(resolved, common):
+        return False
+    return any(inside(resolved, base) for base in roots)
+
+
 def previous_hooks(root, target):
     result = git("-C", root, "config", "--path", "--get", "core.hooksPath")
     value = result.stdout.strip()
@@ -320,13 +349,7 @@ def previous_hooks(root, target):
     path = path.resolve()
     if path == target.resolve() or not path.is_dir():
         return None
-    common = Path(git_output(root, "rev-parse", "--path-format=absolute",
-                             "--git-common-dir").strip()).resolve()
-    git_dir = Path(git_output(root, "rev-parse", "--path-format=absolute",
-                              "--absolute-git-dir").strip()).resolve()
-    inside_git = any(path == base or base in path.parents for base in (git_dir, common))
-    root_path = Path(root).resolve()
-    if not inside_git and (path == root_path or root_path in path.parents):
+    if worktree_controlled(path, repository_layout(root)):
         return None
     return path
 
@@ -348,17 +371,29 @@ def install(root, source=None):
     policy = source / "governance.json"
     (target / "governance.json").write_text(policy.read_text() if policy.is_file() else "{}\n")
     if inherited is not None:
+        layout = repository_layout(root)
         for entry in inherited.iterdir():
             if (entry.is_file() and os.access(entry, os.X_OK)
                     and not entry.name.endswith(".sample")
-                    and entry.name not in names and not entry.name.startswith(".")):
+                    and entry.name not in names and not entry.name.startswith(".")
+                    and not worktree_controlled(entry, layout)):
                 shim = target / entry.name
                 if not shim.exists():
-                    shim.write_text(f"#!/bin/sh\nexec {shlex.quote(str(entry))} \"$@\"\n")
+                    shim.write_text(
+                        f"#!/bin/sh\nexec {shlex.quote(str(entry.resolve()))} \"$@\"\n")
                     shim.chmod(0o755)
     result = git("-C", root, "config", "core.hooksPath", str(target))
     if result.returncode != 0:
         return [f"git config failed: {result.stderr.strip()}"]
+    effective = git("-C", root, "config", "--path", "--get", "core.hooksPath")
+    configured = effective.stdout.strip()
+    if not configured or Path(configured).resolve() != target.resolve():
+        worktree = git("-C", root, "config", "--worktree", "core.hooksPath", str(target))
+        effective = git("-C", root, "config", "--path", "--get", "core.hooksPath")
+        configured = effective.stdout.strip()
+        if worktree.returncode != 0 or not configured or Path(configured).resolve() != target.resolve():
+            return [f"core.hooksPath is overridden by worktree or environment config: "
+                    f"{configured or 'unset'}"]
     return []
 
 
