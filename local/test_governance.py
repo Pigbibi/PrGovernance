@@ -181,11 +181,15 @@ class ProtectedPushTests(unittest.TestCase):
                       governance.protected_push([line], self.settings, self.ancestor)[0])
 
     def test_deleting_a_feature_branch_passes(self):
-        line = f"(delete) {governance.ZERO_SHA} refs/heads/feat/x {'b' * 40}"
+        line = f"(delete) {'0' * 40} refs/heads/feat/x {'b' * 40}"
+        self.assertEqual(governance.protected_push([line], self.settings, self.ancestor), [])
+
+    def test_sha256_null_object_ids_are_recognized(self):
+        line = f"(delete) {'0' * 64} refs/heads/feat/x {'b' * 64}"
         self.assertEqual(governance.protected_push([line], self.settings, self.ancestor), [])
 
     def test_deleting_a_protected_branch_fails(self):
-        line = f"(delete) {governance.ZERO_SHA} refs/heads/main {'b' * 40}"
+        line = f"(delete) {'0' * 40} refs/heads/main {'b' * 40}"
         self.assertIn("protected branch main",
                       governance.protected_push([line], self.settings, self.ancestor)[0])
 
@@ -309,6 +313,14 @@ class RepositoryTests(unittest.TestCase):
                              (Path(self.root) / ".git" / "governance").resolve())
             self.git("worktree", "remove", "--force", str(worktree))
             self.assertTrue((Path(configured) / "governance.py").is_file())
+
+    def test_staged_audit_scans_the_whole_index(self):
+        self.write("settings.py", f'TOKEN = "{GITHUB_TOKEN}"\n')
+        self.git("add", "settings.py")
+        self.git("commit", "-q", "-m", "feat: add settings")
+        self.assertEqual(governance.audit(self.root, True, governance.config(self.root)),
+                         ["settings.py:1: github-token"])
+        self.assertEqual(governance.hook_pre_commit(self.root), [])
 
     def test_staged_submodule_is_skipped(self):
         self.write("a.txt", "x\n")

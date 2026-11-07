@@ -49,7 +49,7 @@ SENSITIVE_FILE = re.compile(
 SENSITIVE_EXEMPT = re.compile(
     r"(?i)(?:^|/)(?:\.env\.(?:example|sample|template)|[^/]+\.example\.[^/]+"
     r"|[^/]*_example\.[^/]+)$")
-ZERO_SHA = "0" * 40
+ZERO_SHA = re.compile(r"^0+$")
 CONVENTIONAL = r"^(?:%s)(?:\([^)]+\))?!?: .+"
 
 
@@ -107,18 +107,20 @@ def scan_text(text):
     return findings
 
 
-def tracked_entries(root, staged):
+def tracked_entries(root, staged, changed_only):
     """Return (path, blob sha) for the index or for the committed tree."""
     if staged:
-        changed = set(filter(None, git_output(
-            root, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRT").split("\0")))
+        changed = None
+        if changed_only:
+            changed = set(filter(None, git_output(
+                root, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRT").split("\0")))
         entries = []
         for record in git_output(root, "ls-files", "-s", "-z").split("\0"):
             if not record:
                 continue
             meta, path = record.split("\t", 1)
             mode, sha, _stage = meta.split()
-            if path in changed and mode != "160000":
+            if mode != "160000" and (changed is None or path in changed):
                 entries.append((path, sha))
         return entries
     entries = []
@@ -162,9 +164,10 @@ def read_objects(root, shas):
     return objects
 
 
-def audit(root, staged, settings):
+def audit(root, staged, settings, changed_only=False):
+    root = repository_root(root)
     findings = []
-    entries = [(path, sha) for path, sha in tracked_entries(root, staged)
+    entries = [(path, sha) for path, sha in tracked_entries(root, staged, changed_only)
                if not any(path.startswith(prefix) for prefix in settings["ignore_paths"])]
     sensitive = [(path, sha) for path, sha in entries
                  if SENSITIVE_FILE.search(path) and not SENSITIVE_EXEMPT.search(path)]
@@ -203,7 +206,7 @@ def protected_push(lines, settings, is_ancestor):
         branch = remote_ref.removeprefix("refs/heads/")
         if remote_ref.startswith("refs/heads/") and branch in settings["protected_branches"]:
             problems.append(f"direct push to protected branch {branch}; open a pull request")
-        if local_sha == ZERO_SHA or remote_sha == ZERO_SHA:
+        if ZERO_SHA.match(local_sha) or ZERO_SHA.match(remote_sha):
             continue
         if not is_ancestor(remote_sha, local_sha):
             problems.append(f"non-fast-forward push to {remote_ref}; rebase instead of force-pushing")
@@ -211,7 +214,7 @@ def protected_push(lines, settings, is_ancestor):
 
 
 def hook_pre_commit(root):
-    return audit(root, True, config(root))
+    return audit(root, True, config(root), changed_only=True)
 
 
 def hook_commit_msg(root, message_file):
