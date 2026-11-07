@@ -44,15 +44,16 @@ SECRET_RULES = [
         r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
         r"(?:api[_-]?key|secret|token|password|passwd)"
         r"(?:[_-]?(?:access[_-]?key|key[_-]?base|value|hash|token|secret))*"
-        r"[\"']?\s*[:=]\s*(['\"])(?P<value>[^\"'\n\s][^\"'\n]{14,}[^\"'\n\s])\1")),
+        r"[\"']?\s*[:=]\s*(?P<q>['\"])(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)")),
     ("environment-fallback", re.compile(
         r"(?i)(?:os\.)?(?:getenv|environ\.get)\(\s*(['\"])(?P<name>[^'\"]+)\1\s*,\s*"
-        r"(['\"])(?P<value>[^'\"\n\s][^'\"\n]{14,}[^'\"\n\s])\3")),
+        r"(?P<q>['\"])(?P<value>(?:(?!(?P=q))[^\n]){16,})(?P=q)")),
 ]
 
 PLACEHOLDER = re.compile(
     r"(?i)(?:\bexample\b|\bsample\b|\bsynthetic\b|\bdummy\b|\bplaceholder\b"
-    r"|\bchange[_-]?me\b|\bredacted\b|your[_-]?(?:token|key|secret)|<[^>]+>)")
+    r"|\bchange[_-]?me\b|\bredacted\b|your[_-]?(?:token|key|secret))")
+ANGLE_PLACEHOLDER = re.compile(r"<[^>]+>")
 SENSITIVE_FILE = re.compile(
     r"(^|/)(?:\.env(?:\.[^/]+)?|id_(?:rsa|dsa|ecdsa|ed25519)|credentials\.json"
     r"|[^/]+\.(?:pem|key|p12|pfx|keystore|jks|bks))$", re.IGNORECASE)
@@ -71,12 +72,14 @@ def is_sensitive(path):
 
 
 def exempt(value):
-    return bool(PLACEHOLDER.search(value))
+    return (bool(ANGLE_PLACEHOLDER.fullmatch(value))
+            or bool(PLACEHOLDER.search(value)))
 
 
 def shell_fallbacks(text):
     literals = []
     index = 0
+    literal_start = 0
     while index < len(text):
         if text.startswith("${", index):
             depth = 0
@@ -92,18 +95,27 @@ def shell_fallbacks(text):
                     end += 1
                 else:
                     end += 1
+            if literal_start < index:
+                literals.append(text[literal_start:index])
             inner = text[index + 2:end]
             match = re.match(r"[A-Za-z_][A-Za-z0-9_]*"
                              r"(:-|:=|:\+|:\?|-|=|\+|\?)(.*)$", inner, re.S)
             if match and match.group(1) not in (":?", "?"):
-                default = match.group(2)
-                if default.startswith("$"):
-                    literals.extend(shell_fallbacks(default))
-                elif default:
-                    literals.append(default)
+                literals.extend(shell_fallbacks(match.group(2)))
             index = end + 1
+            literal_start = index
+        elif text[index] == "$" and re.match(r"[A-Za-z_]", text[index + 1:index + 2]):
+            if literal_start < index:
+                literals.append(text[literal_start:index])
+            end = index + 1
+            while end < len(text) and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+            index = end
+            literal_start = index
         else:
             index += 1
+    if literal_start < len(text):
+        literals.append(text[literal_start:])
     return literals
 
 
@@ -163,6 +175,8 @@ def scan_text(text, allow=()):
         for rule, pattern in SECRET_RULES:
             for match in pattern.finditer(line):
                 value = match.group("value") if "value" in pattern.groupindex else match.group(0)
+                if value != value.strip():
+                    continue
                 if (rule == "environment-fallback"
                         and not CREDENTIAL_NAME.search(match.group("name"))):
                     continue
@@ -387,12 +401,11 @@ def inherited_hooks(worktrees, target, layout, skip):
                     and not entry.name.startswith(".")
                     and not worktree_controlled(entry, layout)):
                 continue
-            source = entry.resolve()
             known = sources.get(entry.name)
-            if known is not None and known != source:
-                return None, [f"{entry.name} is inherited from both {known} and "
-                              f"{source}; keep a single hook directory"]
-            sources[entry.name] = source
+            if known is not None and known.resolve() != entry.resolve():
+                return None, [f"{entry.name} is inherited from both {known.resolve()} and "
+                              f"{entry.resolve()}; keep a single hook directory"]
+            sources[entry.name] = entry
     return sources, []
 
 

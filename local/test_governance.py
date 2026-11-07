@@ -183,6 +183,32 @@ class SecretScanTests(unittest.TestCase):
         self.assertEqual(governance.scan_text("\n".join(lines)),
                          [(number, "credential-assignment") for number in range(1, 6)])
 
+    def test_mixed_shell_fallbacks_are_checked(self):
+        lines = [
+            'PASSWORD="${PASSWORD:-${PREFIX}hunter2hunter2hunter2}"',
+            'PASSWORD="${PASSWORD:-${PREFIX}hunter2:-}"',
+            'PASSWORD="${PASSWORD:-${FALLBACK_PASSWORD}}"',
+            'PASSWORD="${PASSWORD:-$FALLBACK_PASSWORD}"',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "credential-assignment")])
+
+    def test_angle_brackets_are_only_placeholders_when_complete(self):
+        lines = [
+            'password = "N7v<2026>r9!K4p2Z8q5"',
+            'token = "<token>"',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment")])
+
+    def test_opposite_quote_is_allowed_inside_a_literal(self):
+        lines = [
+            'password = "correct horse\'s battery staple"',
+            'secret = os.getenv("DB_PASSWORD", "correct horse\'s battery staple")',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "environment-fallback")])
+
     def test_slack_app_token_is_detected(self):
         self.assertEqual(governance.scan_text('SLACK = "xapp-1-A123-456-abcdef123456"'),
                          [(1, "slack-token")])
@@ -605,6 +631,22 @@ class RepositoryTests(unittest.TestCase):
         result = self.install_without_global_config()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((git_dir / "governance" / "prepare-commit-msg").exists())
+
+    def test_install_keeps_the_symlink_name_of_a_trusted_hook(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        with tempfile.TemporaryDirectory() as trusted:
+            dispatcher = Path(trusted) / "dispatcher"
+            dispatcher.write_text("#!/bin/sh\nexit 0\n")
+            dispatcher.chmod(0o755)
+            link = Path(trusted) / "post-checkout"
+            link.symlink_to(dispatcher)
+            self.git("config", "core.hooksPath", trusted)
+            result = self.install_without_global_config()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            shim = Path(self.root) / ".git" / "governance" / "post-checkout"
+            self.assertIn(str(link), shim.read_text())
+            self.assertNotIn(str(dispatcher), shim.read_text())
 
     def test_install_skips_hooks_from_another_worktree(self):
         self.write("README.md", "init\n")
