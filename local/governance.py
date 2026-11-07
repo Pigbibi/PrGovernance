@@ -334,11 +334,11 @@ def repository_layout(root):
     git_dir = Path(git_output(root, "rev-parse", "--path-format=absolute",
                               "--absolute-git-dir").strip()).resolve()
     roots = []
-    listed = git("-C", root, "worktree", "list", "--porcelain")
+    listed = git("-C", root, "worktree", "list", "--porcelain", "-z")
     if listed.returncode == 0:
-        roots.extend(Path(line[len("worktree "):]).resolve()
-                     for line in listed.stdout.splitlines()
-                     if line.startswith("worktree "))
+        roots.extend(Path(field[len("worktree "):]).resolve()
+                     for field in listed.stdout.split("\0")
+                     if field.startswith("worktree "))
     current = Path(root).resolve()
     if current not in roots:
         roots.append(current)

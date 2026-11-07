@@ -706,6 +706,25 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(str((second / "post-commit").resolve()), shim.read_text())
 
+    def test_install_ignores_worktree_paths_containing_newlines(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        self.write("README.md", "init\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "docs: init")
+        with tempfile.TemporaryDirectory() as parent:
+            linked = Path(parent) / "linked\ncheckout"
+            self.git("worktree", "add", str(linked), "-b", "side")
+            hooks = linked / "hooks"
+            hooks.mkdir()
+            script = hooks / "post-commit"
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+            self.git("config", "core.hooksPath", str(hooks))
+            result = self.install_without_global_config()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((Path(self.root) / ".git" / "governance" / "post-commit").exists())
+
     def test_utf16_text_is_scanned(self):
         (Path(self.root) / "deploy.ps1").write_bytes(
             f'TOKEN = "{GITHUB_TOKEN}"\n'.encode("utf-16"))
