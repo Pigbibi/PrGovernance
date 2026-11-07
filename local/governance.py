@@ -420,9 +420,11 @@ def install(root, source=None):
     (target / "governance.json").write_text(policy.read_text() if policy.is_file() else "{}\n")
     for name, inherited in sorted(sources.items()):
         shim = target / name
-        if not shim.exists():
-            shim.write_text(
-                f"#!/bin/sh\nexec {shlex.quote(str(inherited))} \"$@\"\n")
+        if shim.is_symlink() or (shim.exists() and not shim.is_file()):
+            return [f"{shim} is not a regular file"]
+        content = f"#!/bin/sh\nexec {shlex.quote(str(inherited))} \"$@\"\n"
+        if not shim.exists() or shim.read_text() != content:
+            shim.write_text(content)
             shim.chmod(0o755)
     result = git("-C", root, "config", "core.hooksPath", str(target))
     if result.returncode != 0:

@@ -685,6 +685,27 @@ class RepositoryTests(unittest.TestCase):
             self.assertIn("inherited from both", result.stderr)
             self.assertFalse((Path(self.root) / ".git" / "governance").exists())
 
+    def test_reinstall_updates_a_forwarding_shim(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        with tempfile.TemporaryDirectory() as parent:
+            first = Path(parent) / "first"
+            second = Path(parent) / "second"
+            for directory in [first, second]:
+                directory.mkdir()
+                hook = directory / "post-commit"
+                hook.write_text(f"#!/bin/sh\n# {directory.name}\nexit 0\n")
+                hook.chmod(0o755)
+            self.git("config", "core.hooksPath", str(first))
+            self.assertEqual(self.install_without_global_config().returncode, 0)
+            target = Path(self.root) / ".git" / "governance"
+            shim = target / "post-commit"
+            self.assertIn(str((first / "post-commit").resolve()), shim.read_text())
+            self.git("config", "core.hooksPath", str(second))
+            result = self.install_without_global_config()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(str((second / "post-commit").resolve()), shim.read_text())
+
     def test_utf16_text_is_scanned(self):
         (Path(self.root) / "deploy.ps1").write_bytes(
             f'TOKEN = "{GITHUB_TOKEN}"\n'.encode("utf-16"))
