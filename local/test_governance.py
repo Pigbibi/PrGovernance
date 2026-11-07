@@ -458,16 +458,48 @@ class RepositoryTests(unittest.TestCase):
     def test_install_forwards_hooks_from_the_previous_path(self):
         for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
             self.write(f".githooks/{name}", "#!/bin/sh\n")
+        with tempfile.TemporaryDirectory() as legacy_dir:
+            legacy = Path(legacy_dir) / "prepare-commit-msg"
+            legacy.write_text("#!/bin/sh\nexit 0\n")
+            legacy.chmod(0o755)
+            self.git("config", "core.hooksPath", legacy_dir)
+            self.assertEqual(self.cli("install").returncode, 0)
+            git_dir = run("git", "-C", self.root, "rev-parse",
+                          "--absolute-git-dir").stdout.strip()
+            shim = Path(git_dir) / "governance" / "prepare-commit-msg"
+            self.assertTrue(os.access(shim, os.X_OK))
+            self.assertIn(str(legacy.resolve()), shim.read_text())
+            self.assertEqual(self.cli("install").returncode, 0)
+            self.assertIn(str(legacy.resolve()), shim.read_text())
+
+    def test_install_does_not_forward_hooks_from_the_worktree(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
         legacy = self.write("legacy/prepare-commit-msg", "#!/bin/sh\nexit 0\n")
         legacy.chmod(0o755)
         self.git("config", "core.hooksPath", "legacy")
         self.assertEqual(self.cli("install").returncode, 0)
         git_dir = run("git", "-C", self.root, "rev-parse", "--absolute-git-dir").stdout.strip()
-        shim = Path(git_dir) / "governance" / "prepare-commit-msg"
-        self.assertTrue(os.access(shim, os.X_OK))
-        self.assertIn(str(legacy.resolve()), shim.read_text())
-        self.assertEqual(self.cli("install").returncode, 0)
-        self.assertIn(str(legacy.resolve()), shim.read_text())
+        self.assertFalse((Path(git_dir) / "governance" / "prepare-commit-msg").exists())
+
+    def test_install_forwards_the_default_hooks_directory(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        git_dir = Path(run("git", "-C", self.root, "rev-parse",
+                           "--absolute-git-dir").stdout.strip())
+        for name in ["post-checkout", "pre-rebase.sample"]:
+            hook = git_dir / "hooks" / name
+            hook.write_text("#!/bin/sh\nexit 0\n")
+            hook.chmod(0o755)
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).parent / "governance.py"),
+             "install", "--root", self.root],
+            cwd=self.root, capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = git_dir / "governance"
+        self.assertTrue(os.access(target / "post-checkout", os.X_OK))
+        self.assertFalse((target / "pre-rebase.sample").exists())
 
     def test_utf16_text_is_scanned(self):
         (Path(self.root) / "deploy.ps1").write_bytes(

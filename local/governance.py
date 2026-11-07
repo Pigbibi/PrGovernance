@@ -308,13 +308,27 @@ def hook_pre_push(root, lines):
 def previous_hooks(root, target):
     result = git("-C", root, "config", "--path", "--get", "core.hooksPath")
     value = result.stdout.strip()
-    if result.returncode != 0 or not value:
-        return None
-    path = Path(value)
-    if not path.is_absolute():
-        path = Path(root) / path
+    if result.returncode == 0 and value:
+        path = Path(value)
+        if not path.is_absolute():
+            path = Path(root) / path
+    else:
+        default = git("-C", root, "rev-parse", "--path-format=absolute", "--git-path", "hooks")
+        if default.returncode != 0:
+            return None
+        path = Path(default.stdout.strip())
     path = path.resolve()
-    return path if path != target.resolve() and path.is_dir() else None
+    if path == target.resolve() or not path.is_dir():
+        return None
+    common = Path(git_output(root, "rev-parse", "--path-format=absolute",
+                             "--git-common-dir").strip()).resolve()
+    git_dir = Path(git_output(root, "rev-parse", "--path-format=absolute",
+                              "--absolute-git-dir").strip()).resolve()
+    inside_git = any(path == base or base in path.parents for base in (git_dir, common))
+    root_path = Path(root).resolve()
+    if not inside_git and (path == root_path or root_path in path.parents):
+        return None
+    return path
 
 
 def install(root, source=None):
@@ -336,6 +350,7 @@ def install(root, source=None):
     if inherited is not None:
         for entry in inherited.iterdir():
             if (entry.is_file() and os.access(entry, os.X_OK)
+                    and not entry.name.endswith(".sample")
                     and entry.name not in names and not entry.name.startswith(".")):
                 shim = target / entry.name
                 if not shim.exists():
