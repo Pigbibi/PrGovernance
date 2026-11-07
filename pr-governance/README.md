@@ -23,6 +23,10 @@ A pull request may merge when all of these hold:
 Branch protection, not this action, is the merge constraint. The action only
 publishes evidence; it cannot merge, label, or write repository contents.
 
+The gate applies to repositories that build, deploy or run code. A repository
+that only publishes a static site through a `pages` workflow keeps that
+deployment workflow and is exempt from the gate.
+
 ## Risk tiers
 
 | Tier | Typical paths | Requirement |
