@@ -678,6 +678,22 @@ class RepositoryTests(unittest.TestCase):
         problems = governance.verify(self.root)
         self.assertTrue(any("governance.json" in problem for problem in problems), problems)
 
+    def test_verify_reports_a_non_executable_installed_hook(self):
+        self.install_local_source()
+        self.assertEqual(self.install_without_global_config().returncode, 0)
+        git_dir = Path(run("git", "-C", self.root, "rev-parse",
+                           "--absolute-git-dir").stdout.strip())
+        (git_dir / "governance" / "pre-push").chmod(0o644)
+        problems = governance.verify(self.root)
+        self.assertTrue(any("not executable" in problem and "pre-push" in problem
+                            for problem in problems), problems)
+
+    def test_verify_accepts_a_missing_source_policy(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        self.assertEqual(self.install_without_global_config().returncode, 0)
+        self.assertEqual(governance.verify(self.root), [])
+
     def test_verify_reports_a_foreign_hooks_path(self):
         self.install_local_source()
         self.assertEqual(self.install_without_global_config().returncode, 0)

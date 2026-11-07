@@ -89,8 +89,10 @@ python3 "$hooks/governance.py" verify             # installed copy matches .gith
 Every command exits non-zero and prints `governance: <finding>` on failure.
 
 `verify` compares the installed copy in the common git directory with the
-committed `.githooks/` source, policy included, and checks that every worktree
-still resolves `core.hooksPath` there. Run it after pulling a change to the
+committed `.githooks/` source, checks that the hook scripts are executable, and
+checks that every worktree still resolves `core.hooksPath` there. A source
+without `governance.json` compares against the default policy `install` writes,
+so an optional policy file never makes a clone unverifiable. Run it after pulling a change to the
 vendored hooks, and before trusting a clone that was installed by someone else;
 a non-empty result means `install` must run again from a trusted copy.
 

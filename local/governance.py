@@ -345,19 +345,29 @@ def hook_pre_commit(root):
 def verify(root):
     root = repository_root(root)
     source = Path(root) / ".githooks"
-    names = ["governance.py", "pre-commit", "commit-msg", "pre-push", "governance.json"]
+    names = ["governance.py", "pre-commit", "commit-msg", "pre-push"]
     missing = [name for name in names if not (source / name).is_file()]
     if missing:
         return [f"missing file {name} in {source}" for name in missing]
     target = Path(git_output(root, "rev-parse", "--path-format=absolute",
                              "--git-common-dir").strip()) / "governance"
+    policy = source / "governance.json"
+    expected_policy = policy.read_text() if policy.is_file() else "{}\n"
     problems = []
     for name in names:
         installed = target / name
         if not installed.is_file():
             problems.append(f"{installed} is missing; run install")
-        elif installed.read_bytes() != (source / name).read_bytes():
+            continue
+        if installed.read_bytes() != (source / name).read_bytes():
             problems.append(f"{installed} differs from {source / name}; run install")
+        if not os.access(installed, os.X_OK):
+            problems.append(f"{installed} is not executable; run install")
+    installed_policy = target / "governance.json"
+    if not installed_policy.is_file():
+        problems.append(f"{installed_policy} is missing; run install")
+    elif installed_policy.read_text() != expected_policy:
+        problems.append(f"{installed_policy} differs from {policy if policy.is_file() else 'the default policy'}; run install")
     layout = repository_layout(root)
     worktrees = [str(path) for path in layout[2] if Path(path).is_dir()]
     enabled = git("-C", root, "config", "--bool", "--get", "extensions.worktreeConfig")
