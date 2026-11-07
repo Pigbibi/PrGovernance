@@ -70,6 +70,16 @@ class SecretScanTests(unittest.TestCase):
         self.assertEqual(governance.scan_text("\n".join(lines)),
                          [(1, "credential-assignment"), (2, "credential-assignment")])
 
+    def test_prefixed_credential_names_are_detected(self):
+        lines = [
+            'client_secret = "hunter2hunter2hunter2"',
+            'DATABASE_PASSWORD = "hunter2hunter2hunter2"',
+            'OPENAI_API_KEY = "hunter2hunter2hunter2"',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "credential-assignment"),
+                          (3, "credential-assignment")])
+
     def test_quoted_keys_are_recognized(self):
         self.assertEqual(
             governance.scan_text('{"token": "hunter2hunter2hunter2"}'),
@@ -264,6 +274,36 @@ class RepositoryTests(unittest.TestCase):
         self.git("add", "settings.py")
         findings = governance.audit(self.root, True, governance.config(self.root))
         self.assertEqual(findings, ["settings.py:1: github-token"])
+
+    def test_missing_blob_fails_closed(self):
+        self.write("settings.py", f'TOKEN = "{GITHUB_TOKEN}"\n')
+        self.git("add", "settings.py")
+        sha = run("git", "-C", self.root, "ls-files", "-s", "settings.py").stdout.split()[1]
+        object_path = Path(self.root) / ".git" / "objects" / sha[:2] / sha[2:]
+        object_path.unlink()
+        with self.assertRaises(SystemExit):
+            governance.audit(self.root, True, governance.config(self.root))
+
+    def test_install_uses_the_common_git_directory(self):
+        self.write("a.txt", "x\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-q", "-m", "feat: add a")
+        with tempfile.TemporaryDirectory() as parent:
+            worktree = Path(parent) / "wt"
+            self.git("worktree", "add", "-q", "-b", "wt-branch", str(worktree))
+            hooks = worktree / ".githooks"
+            hooks.mkdir()
+            for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+                (hooks / name).write_bytes(
+                    (Path(__file__).parent / name).read_bytes())
+            result = run(sys.executable, str(hooks / "governance.py"), "install",
+                         "--root", str(worktree))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            configured = run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip()
+            self.assertEqual(Path(configured).resolve(),
+                             (Path(self.root) / ".git" / "governance").resolve())
+            self.git("worktree", "remove", "--force", str(worktree))
+            self.assertTrue((Path(configured) / "governance.py").is_file())
 
     def test_repository_config_overrides_defaults(self):
         self.write(".githooks/governance.json",

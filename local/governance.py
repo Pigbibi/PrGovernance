@@ -34,7 +34,8 @@ SECRET_RULES = [
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
     ("credential-assignment", re.compile(
-        r"(?i)(?<![A-Za-z0-9_])[\"']?(?:api[_-]?key|secret|token|password|passwd)[\"']?\s*[:=]\s*"
+        r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
+        r"(?:api[_-]?key|secret|token|password|passwd)[\"']?\s*[:=]\s*"
         r"(['\"])(?P<value>[^\"'\s]{16,})\1")),
 ]
 
@@ -150,12 +151,13 @@ def read_objects(root, shas):
         header = data[index:end].decode("utf-8", "replace").split()
         index = end + 1
         if len(header) < 3:
-            objects[sha] = None
-            continue
+            raise SystemExit(f"governance: object {sha} is missing from the object database")
         size = int(header[2])
         content = data[index:index + size]
         index += size + 1
-        objects[sha] = content if header[1] == "blob" else None
+        if header[1] != "blob":
+            raise SystemExit(f"governance: object {sha} is a {header[1]}, not a blob")
+        objects[sha] = content
     return objects
 
 
@@ -170,8 +172,8 @@ def audit(root, staged, settings):
     candidates = [(path, sha) for path, sha in entries if path not in sensitive_paths]
     objects = read_objects(root, [sha for _path, sha in candidates])
     for path, sha in candidates:
-        content = objects.get(sha)
-        if content is None or b"\x00" in content:
+        content = objects[sha]
+        if b"\x00" in content:
             continue
         for number, rule in scan_text(content.decode("utf-8", errors="replace")):
             findings.append(f"{path}:{number}: {rule}")
@@ -233,7 +235,8 @@ def install(root):
     missing = [name for name in names if not (source / name).is_file()]
     if missing:
         return [f"missing file {name} in .githooks/" for name in missing]
-    target = Path(git_output(root, "rev-parse", "--absolute-git-dir").strip()) / "governance"
+    target = Path(git_output(root, "rev-parse", "--path-format=absolute",
+                             "--git-common-dir").strip()) / "governance"
     target.mkdir(parents=True, exist_ok=True)
     for name in names:
         shutil.copyfile(source / name, target / name)
