@@ -396,6 +396,39 @@ class RepositoryTests(unittest.TestCase):
             self.assertTrue(os.access(target / name, os.X_OK))
         self.assertFalse(os.access(Path(self.root) / ".githooks" / "pre-commit", os.X_OK))
 
+    def test_installed_config_wins_over_the_branch(self):
+        names = ["governance.py", "pre-commit", "commit-msg", "pre-push"]
+        for name in names:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        self.write(".githooks/governance.json",
+                   json.dumps({"ignore_paths": [".githooks/"]}))
+        self.assertEqual(self.cli("install").returncode, 0)
+        self.write(".githooks/governance.json",
+                   json.dumps({"ignore_paths": ["secret.txt"], "protected_branches": []}))
+        self.assertEqual(governance.config(self.root)["ignore_paths"], [".githooks/"])
+        self.assertEqual(governance.config(self.root)["protected_branches"], ["main", "master"])
+
+    def test_install_from_a_trusted_source(self):
+        with tempfile.TemporaryDirectory() as trusted:
+            for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+                (Path(trusted) / name).write_text("#!/bin/sh\n")
+            result = governance.install(self.root, trusted)
+            self.assertEqual(result, [])
+            configured = run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip()
+            self.assertTrue((Path(configured) / "governance.py").is_file())
+
+    def test_utf16_text_is_scanned(self):
+        (Path(self.root) / "deploy.ps1").write_bytes(
+            f'TOKEN = "{GITHUB_TOKEN}"\n'.encode("utf-16"))
+        self.git("add", "deploy.ps1")
+        findings = governance.audit(self.root, True, governance.config(self.root))
+        self.assertEqual(findings, ["deploy.ps1:1: github-token"])
+
+    def test_binary_files_are_skipped(self):
+        (Path(self.root) / "image.bin").write_bytes(b"\x00\x01\x02" * 100)
+        self.git("add", "image.bin")
+        self.assertEqual(governance.audit(self.root, True, governance.config(self.root)), [])
+
     def test_install_refuses_a_partial_checkout(self):
         self.write(".githooks/pre-commit", "#!/bin/sh\n")
         result = self.cli("install")

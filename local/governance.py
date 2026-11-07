@@ -13,6 +13,7 @@ publishes a credential.
 """
 
 import argparse
+import codecs
 import json
 import re
 import shutil
@@ -71,7 +72,13 @@ def git_output(root, *args):
 
 
 def config(root):
+    root = repository_root(root)
     path = Path(root) / ".githooks" / "governance.json"
+    common = git("-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common.returncode == 0:
+        snapshot = Path(common.stdout.strip()) / "governance" / "governance.json"
+        if snapshot.is_file():
+            path = snapshot
     values = {key: list(value) if isinstance(value, list) else value
               for key, value in DEFAULT_CONFIG.items()}
     if path.is_file():
@@ -165,6 +172,20 @@ def read_objects(root, shas):
     return objects
 
 
+def text_of(content):
+    if content.startswith(codecs.BOM_UTF16_LE) or content.startswith(codecs.BOM_UTF16_BE):
+        return content.decode("utf-16", errors="replace")
+    if b"\x00" in content:
+        half = len(content) // 2
+        even = content[0::2].count(0)
+        odd = content[1::2].count(0)
+        if half and max(even, odd) / half > 0.3:
+            encoding = "utf-16-le" if odd > even else "utf-16-be"
+            return content.decode(encoding, errors="replace")
+        return None
+    return content.decode("utf-8", errors="replace")
+
+
 def audit(root, staged, settings, changed_only=False):
     root = repository_root(root)
     findings = []
@@ -177,10 +198,10 @@ def audit(root, staged, settings, changed_only=False):
     candidates = [(path, sha) for path, sha in entries if path not in sensitive_paths]
     objects = read_objects(root, [sha for _path, sha in candidates])
     for path, sha in candidates:
-        content = objects[sha]
-        if b"\x00" in content:
+        content = text_of(objects[sha])
+        if content is None:
             continue
-        for number, rule in scan_text(content.decode("utf-8", errors="replace")):
+        for number, rule in scan_text(content):
             findings.append(f"{path}:{number}: {rule}")
     return findings
 
@@ -234,18 +255,20 @@ def hook_pre_push(root, lines):
     return protected_push(lines, settings, is_ancestor)
 
 
-def install(root):
-    source = Path(root) / ".githooks"
+def install(root, source=None):
+    source = Path(source) if source else Path(root) / ".githooks"
     names = ["governance.py", "pre-commit", "commit-msg", "pre-push"]
     missing = [name for name in names if not (source / name).is_file()]
     if missing:
-        return [f"missing file {name} in .githooks/" for name in missing]
+        return [f"missing file {name} in {source}" for name in missing]
     target = Path(git_output(root, "rev-parse", "--path-format=absolute",
                              "--git-common-dir").strip()) / "governance"
     target.mkdir(parents=True, exist_ok=True)
     for name in names:
         shutil.copyfile(source / name, target / name)
         (target / name).chmod(0o755)
+    policy = source / "governance.json"
+    (target / "governance.json").write_text(policy.read_text() if policy.is_file() else "{}\n")
     result = git("-C", root, "config", "core.hooksPath", str(target))
     if result.returncode != 0:
         return [f"git config failed: {result.stderr.strip()}"]
@@ -265,10 +288,11 @@ def main(argv):
     parser.add_argument("--staged", action="store_true",
                         help="audit the index instead of the committed tree")
     parser.add_argument("--root", default=".")
+    parser.add_argument("--source", help="directory to install the hooks from")
     options = parser.parse_args(argv)
     root = repository_root(str(Path(options.root).resolve()))
     if options.command == "install":
-        problems = install(root)
+        problems = install(root, options.source)
     else:
         problems = {
             "audit": lambda: audit(root, options.staged, config(root)),

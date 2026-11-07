@@ -19,52 +19,58 @@ gets the same rules.
 `audit` runs the same secret and sensitive-file scan over the whole tracked tree.
 Use it before publishing a repository or after importing history.
 
-Secret rules: PEM private keys, GitHub tokens, AWS access keys, Slack tokens,
-and quoted credential assignments. Placeholder values (`example`, `sample`,
-`synthetic`, `dummy`, `changeme`, `redacted`, `your_token`, `<token>`) and
-environment references (`os.environ`, `getenv`, `process.env`, `secrets.`) are
-allowed. The exemption applies to the matched value, not to the whole line, so a
-hard-coded fallback beside `getenv` is still reported.
+Secret rules: PEM private keys (including encrypted PKCS#8), GitHub tokens
+(classic and fine-grained), AWS access keys, Slack tokens, and quoted credential
+assignments. Placeholder values (`example`, `sample`, `synthetic`, `dummy`,
+`changeme`, `redacted`, `your_token`, `<token>`) and environment references
+(`os.environ`, `getenv`, `process.env`, `secrets.`) are allowed. The exemption
+applies to the matched value, not to the whole line, so a hard-coded fallback
+beside `getenv` is still reported. UTF-16 text is decoded, not treated as
+binary.
 
 `audit` reads the committed tree (`HEAD`); `audit --staged` reads the index.
 That keeps a staged deletion from hiding a credential that is still committed.
 
 ## Install in a repository
 
+Install from a trusted checkout of this repository, not from the branch being
+reviewed:
+
 ```sh
-mkdir -p .githooks
-cp <governance-repo>/local/governance.py .githooks/
-cp <governance-repo>/local/pre-commit <governance-repo>/local/commit-msg \
-   <governance-repo>/local/pre-push .githooks/
-cp <governance-repo>/local/governance.example.json .githooks/governance.json
-python3 .githooks/governance.py install
+git clone https://github.com/Pigbibi/governance
+python3 governance/local/governance.py install --root <repository> \
+  --source governance/local
 ```
 
-`install` copies the runner and shims into the common git directory
-(`.git/governance/`, shared by linked worktrees), makes them executable, and
-sets `core.hooksPath` to that directory for this clone. The tracked
-`.githooks/` directory is the source template only, so checking out a branch
-cannot replace an installed hook or its code; `governance.json` stays in
-`.githooks/` and is read as data. Commit `.githooks/` so every clone can install
-the same rules, and re-run `install` after updating it. Each developer and each
-agent runs `install` once per clone; CI cannot do it for them.
+A repository that vendors `.githooks/` can instead run
+`python3 .githooks/governance.py install` once from the reviewed default branch.
+
+`install` copies the runner, the shims and a snapshot of `governance.json` into
+the common git directory (`.git/governance/`, shared by linked worktrees), makes
+them executable, and sets `core.hooksPath` to that directory for this clone.
+Checking out a branch cannot replace an installed hook or its policy. Commit
+`.githooks/` so every clone has the source, and re-run `install` from a trusted
+copy whenever the policy or the runner changes. Each developer and each agent
+installs once per clone; CI cannot do it for them.
 
 ## Commands
 
+Use the installed copy, so an untrusted branch cannot substitute its own runner:
+
 ```sh
-python3 .githooks/governance.py audit              # tracked tree
-python3 .githooks/governance.py audit --staged     # index only
-python3 .githooks/governance.py pre-commit
-python3 .githooks/governance.py commit-msg FILE
-python3 .githooks/governance.py pre-push           # reads ref updates on stdin
-python3 .githooks/governance.py install
+hooks=$(git rev-parse --path-format=absolute --git-common-dir)/governance
+python3 "$hooks/governance.py" audit              # committed tree
+python3 "$hooks/governance.py" audit --staged     # whole index
+python3 "$hooks/governance.py" pre-commit
+python3 "$hooks/governance.py" commit-msg FILE
+python3 "$hooks/governance.py" pre-push           # reads ref updates on stdin
 ```
 
 Every command exits non-zero and prints `governance: <finding>` on failure.
 
 ## Configuration
 
-`.githooks/governance.json` overrides the defaults:
+The installed snapshot of `.githooks/governance.json` overrides the defaults:
 
 ```json
 {
@@ -78,7 +84,8 @@ Every command exits non-zero and prints `governance: <finding>` on failure.
 
 `ignore_paths` skips a path in both the hook scan and the publication audit.
 Add `tests/` only when the suite intentionally contains synthetic key material
-that cannot be spelled as a placeholder.
+that cannot be spelled as a placeholder. Editing `governance.json` on a branch
+has no effect until someone re-installs from a trusted copy.
 
 ## Limits
 
@@ -87,6 +94,7 @@ that cannot be spelled as a placeholder.
   discipline plus the publication audit, not enforcement.
 - The audit scans the current tree, not history. A credential removed from a
   file is still in the objects; rotate it if it ever appears in a finding.
-- Review before merge still applies: open a pull request, run `audit` on the
-  branch, and merge only after it passes. The reviewer identity rules of the
-  public track apply unchanged; only the enforcement point is local.
+- Review before merge still applies: open a pull request, run `audit` from the
+  installed copy on the branch, and merge only after it passes. The reviewer
+  identity rules of the public track apply unchanged; only the enforcement point
+  is local.
