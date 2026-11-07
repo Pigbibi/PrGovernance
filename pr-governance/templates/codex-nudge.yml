@@ -1,0 +1,30 @@
+name: Review request
+
+# Copy to .github/workflows/codex-nudge.yml and replace __GOVERNANCE_REPO__.
+# Asks the reviewer for one review per head that has no receipt yet. It does
+# not judge the review; the risk gate remains the only pass/fail authority.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: review-request
+  cancel-in-progress: false
+
+jobs:
+  nudge:
+    name: Request a review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Request
+        uses: __GOVERNANCE_REPO__/pr-governance@v1
+        with:
+          mode: nudge

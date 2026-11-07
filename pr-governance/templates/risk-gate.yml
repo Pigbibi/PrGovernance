@@ -1,0 +1,83 @@
+name: PR risk gate
+
+# Copy to .github/workflows/risk-gate.yml and replace __GOVERNANCE_REPO__ with
+# the organization's governance repository (for example Pigbibi/governance).
+# The job names in this file are the required status check contexts; keep them.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled, ready_for_review, closed]
+  issue_comment:
+    types: [created, edited, deleted]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  push:
+    branches: [main, master]
+  # A merge made with GITHUB_TOKEN raises no push, and nothing raises an event
+  # for a resolved review thread, so a sweep closes both gaps.
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Existing pull request number to evaluate
+        required: true
+        type: string
+
+# The gate reads metadata only. It never checks out or runs pull request code.
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  statuses: write
+  actions: write
+
+jobs:
+  # The labeled payload is the only authenticated record of which head a
+  # clearing label was added to. Recording it in its own job keeps the evidence
+  # independent of an evaluation that a later event may supersede.
+  record_label:
+    name: Record the head a clearing label was added to
+    if: github.event_name == 'pull_request_target' && github.event.action == 'labeled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Record label head
+        uses: __GOVERNANCE_REPO__/pr-governance@v1
+        with:
+          mode: gate
+
+  evaluate:
+    name: Evaluate PR governance
+    needs: record_label
+    # A skipped recorder is the normal case for every other event.
+    if: >-
+      always() && needs.record_label.result != 'cancelled' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.pull_request &&
+        (github.event.comment.user.type == 'Bot' ||
+         contains(github.event.comment.body || '', 'codex-review'))))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      statuses: write
+      actions: write
+    # Job-level, so an irrelevant comment skips the job without cancelling an
+    # evaluation already running. Label evidence no longer rides on this run.
+    concurrency:
+      group: pr-governance-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || github.run_id }}
+      cancel-in-progress: true
+    steps:
+      - name: Evaluate
+        uses: __GOVERNANCE_REPO__/pr-governance@v1
+        with:
+          mode: gate

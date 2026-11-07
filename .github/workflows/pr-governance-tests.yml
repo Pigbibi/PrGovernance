@@ -1,0 +1,32 @@
+name: Tests
+
+# The v1 branch is the trust anchor for every consumer repository, so this
+# workflow is its required status check. Nothing reaches v1 without it.
+
+on:
+  pull_request:
+  push:
+    branches: [main, v1]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test the gate, label binding and review request
+        run: >-
+          node --test pr-governance/scripts/test-gate.cjs
+          pr-governance/scripts/test-runner.cjs pr-governance/scripts/test-nudge.cjs
+      - name: Install the pinned scanner
+        run: bash pr-governance/scripts/install-gitleaks.sh
+      - name: Test the scanner
+        env:
+          GITLEAKS_BIN: ${{ runner.temp }}/gitleaks-bin/gitleaks
+        run: python3 pr-governance/scripts/test_secret_scan.py

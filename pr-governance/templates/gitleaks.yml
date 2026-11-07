@@ -1,0 +1,29 @@
+name: Secret scan
+
+# Copy to .github/workflows/gitleaks.yml and replace __GOVERNANCE_REPO__.
+# The job name is the required status check context; keep it as `Gitleaks`.
+# The scanner, its config and its pinned binary come from the governance
+# repository, so a pull request cannot change the rules that judge it.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan added commits
+        uses: __GOVERNANCE_REPO__/pr-governance@v1
+        with:
+          mode: scan

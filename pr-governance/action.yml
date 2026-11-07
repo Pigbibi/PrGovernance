@@ -1,0 +1,92 @@
+name: PR governance
+description: Evaluate pull request governance evidence, request a Codex review, or scan for secrets.
+inputs:
+  mode:
+    description: "gate, nudge or scan"
+    required: true
+  full-history:
+    description: "Scan every fetched branch and its complete history"
+    required: false
+    default: "false"
+  artifact-name:
+    description: "Artifact name for the aggregate-only history summary"
+    required: false
+    default: "secret-scan-summary"
+outputs: {}
+runs:
+  using: composite
+  steps:
+    - name: Evaluate pull request governance
+      if: inputs.mode == 'gate'
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      env:
+        GOVERNANCE_ACTION_PATH: ${{ github.action_path }}
+      with:
+        script: |
+          const path = require('node:path');
+          const { runGate } = require(path.join(process.env.GOVERNANCE_ACTION_PATH, 'scripts', 'main.cjs'));
+          await runGate({ github, context, core });
+
+    - name: Request a Codex review when the current head has no receipt
+      if: inputs.mode == 'nudge'
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      env:
+        GOVERNANCE_ACTION_PATH: ${{ github.action_path }}
+      with:
+        script: |
+          const path = require('node:path');
+          const { run } = require(path.join(process.env.GOVERNANCE_ACTION_PATH, 'scripts', 'nudge.cjs'));
+          await run({ github, context, core });
+
+    - name: Install checksum-verified Gitleaks
+      if: inputs.mode == 'scan'
+      shell: bash
+      env:
+        GOVERNANCE_ACTION_PATH: ${{ github.action_path }}
+      run: bash "$GOVERNANCE_ACTION_PATH/scripts/install-gitleaks.sh"
+
+    - name: Scan
+      if: inputs.mode == 'scan'
+      shell: bash
+      env:
+        GOVERNANCE_ACTION_PATH: ${{ github.action_path }}
+        FULL_HISTORY: ${{ inputs.full-history }}
+        BASELINE_B64: ${{ env.SECRET_SCAN_BASELINE_B64 }}
+      run: |
+        set -euo pipefail
+        binary="$RUNNER_TEMP/gitleaks-bin/gitleaks"
+        if [[ "$FULL_HISTORY" == "true" ]]; then
+          if [[ -z "${BASELINE_B64:-}" ]]; then
+            echo "SECRET_SCAN_BASELINE_B64 is not configured; refusing to scan without a baseline" >&2
+            exit 1
+          fi
+          printf '%s' "$BASELINE_B64" | base64 --decode > "$RUNNER_TEMP/secret-baseline.json"
+          python3 "$GOVERNANCE_ACTION_PATH/scripts/secret_scan.py" history \
+            --root "$GITHUB_WORKSPACE" \
+            --gitleaks "$binary" \
+            --baseline "$RUNNER_TEMP/secret-baseline.json" \
+            --summary "$RUNNER_TEMP/secret-summary.json"
+          ARTIFACT_PATHS="$RUNNER_TEMP/secret-summary.json" \
+            python3 "$GOVERNANCE_ACTION_PATH/scripts/secret_scan.py" artifacts --gitleaks "$binary"
+          exit 0
+        fi
+        base="$(jq -r '.pull_request.base.sha // .before // empty' "$GITHUB_EVENT_PATH")"
+        head="$(jq -r '.pull_request.head.sha // .after // .sha // empty' "$GITHUB_EVENT_PATH")"
+        if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+          echo "No base commit is available for this event; the pull request scan covers the branch" >&2
+          exit 0
+        fi
+        python3 "$GOVERNANCE_ACTION_PATH/scripts/secret_scan.py" range \
+          --root "$GITHUB_WORKSPACE" \
+          --base "$base" \
+          --head "$head" \
+          --gitleaks "$binary"
+
+    - name: Upload aggregate-only history summary
+      if: inputs.mode == 'scan' && inputs.full-history == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ runner.temp }}/secret-summary.json
+        if-no-files-found: error
+        retention-days: 3

@@ -1,0 +1,47 @@
+'use strict';
+
+const gate = require('./gate.cjs');
+const { run, recordLabel } = require('./runner.cjs');
+
+const POLICY_PATH = '.github/governance/policy.json';
+
+async function defaultBranch(github, context) {
+  const known = context.payload?.repository?.default_branch
+    || context.payload?.pull_request?.base?.ref;
+  if (known) return known;
+  const { data } = await github.rest.repos.get(context.repo);
+  return data.default_branch;
+}
+
+async function loadPolicy(github, context, branch) {
+  const { data: ref } = await github.rest.repos.getBranch({ ...context.repo, branch });
+  const policyCommit = ref.commit?.sha;
+  if (!gate.isSha(policyCommit)) throw new Error('Unknown policy commit');
+  const { data: file } = await github.rest.repos.getContent({
+    ...context.repo, path: POLICY_PATH, ref: policyCommit,
+  });
+  if (file.type !== 'file' || file.encoding !== 'base64' || !file.content) {
+    throw new Error('Missing trusted policy');
+  }
+  let policy;
+  try {
+    policy = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+  } catch {
+    throw new Error('Trusted policy is not valid JSON');
+  }
+  gate.validatePolicy(policy);
+  return { policy, policyCommit, policySha: gate.sha256Hex(gate.canonical(policy)) };
+}
+
+async function runGate({ github, context, core }) {
+  // Label evidence must not ride on an evaluation a later event can supersede,
+  // so its own job records it and stops. The evaluate job depends on this one.
+  if (context.eventName === 'pull_request_target' && context.payload?.action === 'labeled') {
+    return recordLabel({ github, context, core });
+  }
+  const branch = await defaultBranch(github, context);
+  const { policy, policyCommit, policySha } = await loadPolicy(github, context, branch);
+  return run({ github, context, core, policy, policySha, policyCommit, defaultBranch: branch });
+}
+
+module.exports = { runGate, loadPolicy, defaultBranch };
