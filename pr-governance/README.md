@@ -120,6 +120,7 @@ a fresh review instead of silently reusing one.
 ## Private repositories
 
 GitHub Free does not provide branch protection or secret scanning for private
-repositories, and hosted Actions may be billing-blocked. Use the local track:
-the same policy file, a pre-push hook and `scripts/local` commands recording
-the same receipt and scan results locally. See `docs/private-repositories.md`.
+repositories, and hosted Actions may be billing-blocked. Use the local track in
+`local/`: Git hooks that reject staged credentials, unconventional commit
+headers, direct pushes to a protected branch, and non-fast-forward pushes, plus
+an `audit` command over the tracked tree. See `local/README.md`.
