@@ -115,6 +115,18 @@ class SecretScanTests(unittest.TestCase):
         text = "clean line\nanother\n" + PRIVATE_KEY
         self.assertEqual(governance.scan_text(text), [(3, "private-key")])
 
+    def test_shell_fallbacks_are_checked(self):
+        lines = [
+            'PASSWORD="${PASSWORD:-hunter2hunter2hunter2}"',
+            'PASSWORD="${PASSWORD:-${FALLBACK:-hunter2hunter2hunter2}}"',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "credential-assignment")])
+
+    def test_slack_app_token_is_detected(self):
+        self.assertEqual(governance.scan_text('SLACK = "xapp-1-A123-456-abcdef123456"'),
+                         [(1, "slack-token")])
+
     def test_fixture_words_are_not_credentials(self):
         lines = [
             'token = "test-access-token"',

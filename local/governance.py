@@ -37,7 +37,8 @@ SECRET_RULES = [
     ("github-token", re.compile(
         r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
     ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
-    ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("slack-token", re.compile(
+        r"\b(?:xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,})")),
     ("credential-assignment", re.compile(
         r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
         r"(?:api[_-]?key|secret|token|password|passwd)[\"']?\s*[:=]\s*"
@@ -58,6 +59,46 @@ TEST_VALUE = re.compile(
     r"|placeholder|redacted)(?:$|[-_.])")
 SHELL_REFERENCE = re.compile(r'^\$(?:\{[^"\']*\}|[A-Za-z_][A-Za-z0-9_]*)$')
 CONSTANT_NAME = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+
+
+def exempt(value):
+    return any(pattern.search(value) for pattern in
+               (PLACEHOLDER, TEST_VALUE, CONSTANT_NAME))
+
+
+def shell_fallbacks(text):
+    literals = []
+    index = 0
+    while index < len(text):
+        if text.startswith("${", index):
+            depth = 0
+            end = index
+            while end < len(text):
+                if text.startswith("${", end):
+                    depth += 1
+                    end += 2
+                elif text[end] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                    end += 1
+                else:
+                    end += 1
+            _name, separator, default = text[index + 2:end].partition(":-")
+            if separator and default:
+                if default.startswith("$"):
+                    literals.extend(shell_fallbacks(default))
+                else:
+                    literals.append(default)
+            index = end + 1
+        else:
+            index += 1
+    return literals
+
+
+def shell_reference_is_safe(value):
+    return bool(SHELL_REFERENCE.match(value)) and all(
+        exempt(literal) for literal in shell_fallbacks(value))
 ZERO_SHA = re.compile(r"^0+$")
 CONVENTIONAL = r"^(?:%s)(?:\([^)]+\))?!?: .+"
 
@@ -109,8 +150,7 @@ def scan_text(text):
         for rule, pattern in SECRET_RULES:
             for match in pattern.finditer(line):
                 value = match.group("value") if "value" in pattern.groupindex else match.group(0)
-                if any(exemption.search(value) for exemption in
-                       (PLACEHOLDER, TEST_VALUE, SHELL_REFERENCE, CONSTANT_NAME)):
+                if exempt(value) or shell_reference_is_safe(value):
                     continue
                 findings.append((number, rule))
                 found = True

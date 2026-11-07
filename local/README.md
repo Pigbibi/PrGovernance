@@ -27,8 +27,8 @@ assignments of 16 characters or more. Placeholder and fixture values (`example`,
 (`os.environ`, `getenv`, `process.env`, `secrets.`, shell `${NAME:-}`), and
 all-caps names such as `CONTACT_PHONE_LIST_JSON` are allowed. The exemption
 applies to the matched value, not to the whole line, so a hard-coded fallback
-beside `getenv` is still reported. UTF-16 text is decoded, not treated as
-binary.
+beside `getenv` or inside `${NAME:-...}` is still reported. UTF-16 text is
+decoded, not treated as binary.
 
 `audit` reads the committed tree (`HEAD`); `audit --staged` reads the index.
 That keeps a staged deletion from hiding a credential that is still committed.
