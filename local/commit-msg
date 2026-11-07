@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+root=$(git rev-parse --show-toplevel)
+exec python3 "$root/.githooks/governance.py" commit-msg "$1" --root "$root"
