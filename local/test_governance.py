@@ -113,11 +113,19 @@ class SecretScanTests(unittest.TestCase):
     def test_fixture_words_are_not_credentials(self):
         lines = [
             'token = "test-access-token"',
-            'token = "must-not-land-in-session"',
+            'token = "fake-session-value"',
             'secret = "mca_gemini_test_key_NOT_FOR_LOG"',
             'main.PASSWORD = "test-password-value"',
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)), [])
+
+    def test_long_alphabetic_passphrases_are_credentials(self):
+        lines = [
+            'password = "correcthorsebatterystaple"',
+            'password = "correct-horse-battery-staple"',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "credential-assignment")])
 
     def test_function_results_are_not_credentials(self):
         lines = [
@@ -131,7 +139,8 @@ class SecretScanTests(unittest.TestCase):
 class SensitivePathTests(unittest.TestCase):
     def test_sensitive_files(self):
         flagged = [".env", ".env.local", "config/credentials.json", "deploy/id_rsa",
-                   "certs/server.pem", "keys/signing.key"]
+                   "certs/server.pem", "keys/signing.key", "keys/release.jks",
+                   "keys/release.bks"]
         for path in flagged:
             with self.subTest(path=path):
                 self.assertIsNotNone(governance.SENSITIVE_FILE.search(path))
@@ -363,7 +372,7 @@ class RepositoryTests(unittest.TestCase):
         self.write(".githooks/governance.json",
                    json.dumps({"ignore_paths": ["secret.txt"], "protected_branches": []}))
         settings = governance.config(self.root)
-        self.assertEqual(settings["ignore_paths"], [".githooks/"])
+        self.assertEqual(settings["ignore_paths"], [])
         self.assertEqual(settings["protected_branches"], ["main", "master"])
 
     def test_config_cannot_disable_the_audit(self):
@@ -440,6 +449,20 @@ class RepositoryTests(unittest.TestCase):
         (Path(self.root) / "image.bin").write_bytes(b"\x00\x01\x02" * 100)
         self.git("add", "image.bin")
         self.assertEqual(governance.audit(self.root, True, governance.config(self.root)), [])
+
+    def test_credentials_beside_the_hooks_are_scanned(self):
+        self.write(".githooks/release.py", f'TOKEN = "{GITHUB_TOKEN}"\n')
+        self.git("add", ".githooks/release.py")
+        self.assertEqual(governance.audit(self.root, True, governance.config(self.root)),
+                         [".githooks/release.py:1: github-token"])
+
+    def test_ignored_file_does_not_hide_a_sibling(self):
+        self.write(".githooks/governance.json", "{}\n")
+        self.write(".githooks/governance.json.bak", f'TOKEN = "{GITHUB_TOKEN}"\n')
+        self.git("add", ".githooks")
+        settings = dict(governance.DEFAULT_CONFIG, ignore_paths=[".githooks/governance.json"])
+        self.assertEqual(governance.audit(self.root, True, settings),
+                         [".githooks/governance.json.bak:1: github-token"])
 
     def test_install_refuses_a_partial_checkout(self):
         self.write(".githooks/pre-commit", "#!/bin/sh\n")

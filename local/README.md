@@ -21,12 +21,12 @@ Use it before publishing a repository or after importing history.
 
 Secret rules: PEM private keys (including encrypted PKCS#8), GitHub tokens
 (classic and fine-grained), AWS access keys, Slack tokens, and quoted credential
-assignments. Placeholder values (`example`, `sample`, `synthetic`, `dummy`,
-`changeme`, `redacted`, `your_token`, `<token>`) and environment references
-(`os.environ`, `getenv`, `process.env`, `secrets.`) are allowed. The exemption
-applies to the matched value, not to the whole line, so a hard-coded fallback
-beside `getenv` is still reported. UTF-16 text is decoded, not treated as
-binary.
+assignments of 16 characters or more. Placeholder and fixture values (`example`,
+`sample`, `synthetic`, `dummy`, `test`, `fake`, `mock`, `fixture`, `changeme`,
+`redacted`, `your_token`, `<token>`) and environment references (`os.environ`,
+`getenv`, `process.env`, `secrets.`) are allowed. The exemption applies to the
+matched value, not to the whole line, so a hard-coded fallback beside `getenv`
+is still reported. UTF-16 text is decoded, not treated as binary.
 
 `audit` reads the committed tree (`HEAD`); `audit --staged` reads the index.
 That keeps a staged deletion from hiding a credential that is still committed.
@@ -78,14 +78,18 @@ The installed snapshot of `.githooks/governance.json` overrides the defaults:
   "max_header": 72,
   "commit_types": ["feat", "fix", "docs", "refactor", "test", "chore",
                    "perf", "ci", "build", "revert"],
-  "ignore_paths": [".githooks/", "tests/"]
+  "ignore_paths": ["tests/fixtures/"]
 }
 ```
 
-`ignore_paths` skips a path in both the hook scan and the publication audit.
-Add `tests/` only when the suite intentionally contains synthetic key material
-that cannot be spelled as a placeholder. Editing `governance.json` on a branch
-has no effect until someone re-installs from a trusted copy.
+`ignore_paths` skips a path in both the hook scan and the publication audit. An
+entry ending in `/` names a directory; anything else must match the whole path,
+so ignoring `governance.json` cannot also hide `governance.json.bak`. The
+vendored hook files need no entry because the runner and shims contain no
+credentials; ignoring all of `.githooks/` would hide a secret added beside them.
+Add a test directory only when the suite intentionally contains synthetic key
+material that cannot be spelled as a placeholder. Editing `governance.json` on a
+branch has no effect until someone re-installs from a trusted copy.
 
 ## Limits
 

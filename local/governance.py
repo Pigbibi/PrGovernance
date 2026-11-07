@@ -26,7 +26,7 @@ DEFAULT_CONFIG = {
     "max_header": 72,
     "commit_types": ["feat", "fix", "docs", "refactor", "test", "chore",
                      "perf", "ci", "build", "revert"],
-    "ignore_paths": [".githooks/"],
+    "ignore_paths": [],
 }
 
 SECRET_RULES = [
@@ -47,10 +47,13 @@ PLACEHOLDER = re.compile(
     r"|\bchangeme\b|\bredacted\b|your[_-]?(?:token|key|secret)|<[^>]+>)")
 SENSITIVE_FILE = re.compile(
     r"(^|/)(?:\.env(?:\.[^/]+)?|id_(?:rsa|dsa|ecdsa|ed25519)|credentials\.json"
-    r"|[^/]+\.(?:pem|key|p12|pfx|keystore))$", re.IGNORECASE)
+    r"|[^/]+\.(?:pem|key|p12|pfx|keystore|jks|bks))$", re.IGNORECASE)
 SENSITIVE_EXEMPT = re.compile(
     r"(?i)(?:^|/)(?:\.env\.(?:example|sample|template)|[^/]+\.example\.[^/]+"
     r"|[^/]*_example\.[^/]+)$")
+TEST_VALUE = re.compile(
+    r"(?i)(?:^|[-_.])(?:test|fake|mock|fixture|dummy|synthetic|example|sample"
+    r"|placeholder|redacted)(?:$|[-_.])")
 ZERO_SHA = re.compile(r"^0+$")
 CONVENTIONAL = r"^(?:%s)(?:\([^)]+\))?!?: .+"
 
@@ -102,10 +105,7 @@ def scan_text(text):
         for rule, pattern in SECRET_RULES:
             for match in pattern.finditer(line):
                 value = match.group("value") if "value" in pattern.groupindex else match.group(0)
-                if "value" in pattern.groupindex and not (
-                        re.search("[A-Za-z]", value) and re.search("[0-9]", value)):
-                    continue
-                if PLACEHOLDER.search(value):
+                if PLACEHOLDER.search(value) or TEST_VALUE.search(value):
                     continue
                 findings.append((number, rule))
                 found = True
@@ -186,11 +186,16 @@ def text_of(content):
     return content.decode("utf-8", errors="replace")
 
 
+def ignored(path, prefixes):
+    return any(path == prefix or (prefix.endswith("/") and path.startswith(prefix))
+               for prefix in prefixes)
+
+
 def audit(root, staged, settings, changed_only=False):
     root = repository_root(root)
     findings = []
     entries = [(path, sha) for path, sha in tracked_entries(root, staged, changed_only)
-               if not any(path.startswith(prefix) for prefix in settings["ignore_paths"])]
+               if not ignored(path, settings["ignore_paths"])]
     sensitive = [(path, sha) for path, sha in entries
                  if SENSITIVE_FILE.search(path) and not SENSITIVE_EXEMPT.search(path)]
     sensitive_paths = {path for path, _sha in sensitive}
