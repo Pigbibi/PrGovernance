@@ -15,7 +15,9 @@ publishes a credential.
 import argparse
 import codecs
 import json
+import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -263,7 +265,20 @@ def hook_pre_push(root, lines):
     return protected_push(lines, settings, is_ancestor)
 
 
+def previous_hooks(root, target):
+    result = git("-C", root, "config", "--path", "--get", "core.hooksPath")
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(root) / path
+    path = path.resolve()
+    return path if path != target.resolve() and path.is_dir() else None
+
+
 def install(root, source=None):
+    root = repository_root(root)
     source = Path(source) if source else Path(root) / ".githooks"
     names = ["governance.py", "pre-commit", "commit-msg", "pre-push"]
     missing = [name for name in names if not (source / name).is_file()]
@@ -271,12 +286,21 @@ def install(root, source=None):
         return [f"missing file {name} in {source}" for name in missing]
     target = Path(git_output(root, "rev-parse", "--path-format=absolute",
                              "--git-common-dir").strip()) / "governance"
+    inherited = previous_hooks(root, target)
     target.mkdir(parents=True, exist_ok=True)
     for name in names:
         shutil.copyfile(source / name, target / name)
         (target / name).chmod(0o755)
     policy = source / "governance.json"
     (target / "governance.json").write_text(policy.read_text() if policy.is_file() else "{}\n")
+    if inherited is not None:
+        for entry in inherited.iterdir():
+            if (entry.is_file() and os.access(entry, os.X_OK)
+                    and entry.name not in names and not entry.name.startswith(".")):
+                shim = target / entry.name
+                if not shim.exists():
+                    shim.write_text(f"#!/bin/sh\nexec {shlex.quote(str(entry))} \"$@\"\n")
+                    shim.chmod(0o755)
     result = git("-C", root, "config", "core.hooksPath", str(target))
     if result.returncode != 0:
         return [f"git config failed: {result.stderr.strip()}"]

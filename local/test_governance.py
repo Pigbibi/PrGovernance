@@ -443,6 +443,20 @@ class RepositoryTests(unittest.TestCase):
             configured = run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip()
             self.assertTrue((Path(configured) / "governance.py").is_file())
 
+    def test_install_forwards_hooks_from_the_previous_path(self):
+        for name in ["governance.py", "pre-commit", "commit-msg", "pre-push"]:
+            self.write(f".githooks/{name}", "#!/bin/sh\n")
+        legacy = self.write("legacy/prepare-commit-msg", "#!/bin/sh\nexit 0\n")
+        legacy.chmod(0o755)
+        self.git("config", "core.hooksPath", "legacy")
+        self.assertEqual(self.cli("install").returncode, 0)
+        git_dir = run("git", "-C", self.root, "rev-parse", "--absolute-git-dir").stdout.strip()
+        shim = Path(git_dir) / "governance" / "prepare-commit-msg"
+        self.assertTrue(os.access(shim, os.X_OK))
+        self.assertIn(str(legacy.resolve()), shim.read_text())
+        self.assertEqual(self.cli("install").returncode, 0)
+        self.assertIn(str(legacy.resolve()), shim.read_text())
+
     def test_utf16_text_is_scanned(self):
         (Path(self.root) / "deploy.ps1").write_bytes(
             f'TOKEN = "{GITHUB_TOKEN}"\n'.encode("utf-16"))

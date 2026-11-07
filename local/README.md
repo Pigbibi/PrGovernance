@@ -50,10 +50,12 @@ A repository that vendors `.githooks/` can instead run
 `install` copies the runner, the shims and a snapshot of `governance.json` into
 the common git directory (`.git/governance/`, shared by linked worktrees), makes
 them executable, and sets `core.hooksPath` to that directory for this clone.
-Checking out a branch cannot replace an installed hook or its policy. Commit
-`.githooks/` so every clone has the source, and re-run `install` from a trusted
-copy whenever the policy or the runner changes. Each developer and each agent
-installs once per clone; CI cannot do it for them.
+Hooks already configured through `core.hooksPath` keep running: `install` adds
+forwarding shims for every hook it does not provide itself, such as a global
+`prepare-commit-msg`. Checking out a branch cannot replace an installed hook or
+its policy. Commit `.githooks/` so every clone has the source, and re-run
+`install` from a trusted copy whenever the policy or the runner changes. Each
+developer and each agent installs once per clone; CI cannot do it for them.
 
 ## Commands
 
