@@ -70,7 +70,7 @@ async function readThreads(github, repo, number) {
     const data = await github.graphql(`query($owner:String!,$repo:String!,$number:Int!,$cursor:String) {
       repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
         reviewThreads(first:100,after:$cursor) {
-          nodes { id isResolved isOutdated comments(first:1) { nodes { author { login databaseId } } } }
+          nodes { id isResolved isOutdated comments(first:1) { nodes { author { login } } } }
           pageInfo { hasNextPage endCursor }
         }
       } }
@@ -80,8 +80,7 @@ async function readThreads(github, repo, number) {
     for (const node of page.nodes) {
       if (!node?.id || typeof node.isResolved !== 'boolean') throw new Error('Invalid review thread');
       threads.push({ id: node.id, isResolved: node.isResolved, isOutdated: node.isOutdated === true,
-        author: { login: node.comments?.nodes?.[0]?.author?.login ?? null,
-          id: node.comments?.nodes?.[0]?.author?.databaseId ?? null } });
+        author: { login: node.comments?.nodes?.[0]?.author?.login ?? null } });
     }
     const next = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
     if (page.pageInfo.hasNextPage && (!next || next === cursor)) throw new Error('Invalid thread page');
