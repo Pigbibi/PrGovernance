@@ -100,6 +100,8 @@ def read_blobs(root, paths, staged):
     specs = "".join(f"{':' + path if staged else 'HEAD:' + path}\n" for path in paths)
     result = subprocess.run(("git", "-C", root, "cat-file", "--batch"),
                             input=specs.encode(), capture_output=True, check=False)
+    if result.returncode != 0:
+        raise SystemExit(f"governance: cannot read tracked objects: {result.stderr.decode(errors='replace').strip()}")
     data = result.stdout
     blobs = {}
     index = 0
@@ -109,12 +111,16 @@ def read_blobs(root, paths, staged):
             break
         header = data[index:end].decode("utf-8", "replace").split()
         index = end + 1
-        if len(header) < 3 or header[1] == "missing":
+        if len(header) < 3:
             blobs[path] = None
             continue
         size = int(header[2])
-        blobs[path] = data[index:index + size].decode("utf-8", errors="replace")
+        content = data[index:index + size]
         index += size + 1
+        if header[1] != "blob":
+            blobs[path] = None
+            continue
+        blobs[path] = content.decode("utf-8", errors="replace")
     return blobs
 
 
