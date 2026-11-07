@@ -53,14 +53,29 @@ async function loadPolicy(github, context, branch) {
 }
 
 async function runGate({ github, context, core }) {
-  // Label evidence must not ride on an evaluation a later event can supersede,
-  // so its own job records it and stops. The evaluate job depends on this one.
-  if (context.eventName === 'pull_request_target' && context.payload?.action === 'labeled') {
+  // Recording and evaluating are separate dispatch paths so the evaluate job
+  // actually runs: a label record is bound to its own delivery, while an
+  // evaluation may be superseded by any later event.
+  if (process.env.GOVERNANCE_RECORD_LABEL === 'true') {
     return recordLabel({ github, context, core });
   }
-  const branch = await defaultBranch(github, context);
-  const { policy, policyCommit, policySha } = await loadPolicy(github, context, branch);
-  return run({ github, context, core, policy, policySha, policyCommit, defaultBranch: branch });
+  const fallback = context.payload?.repository?.default_branch
+    || context.payload?.pull_request?.base?.ref || '';
+  let branch = fallback;
+  let loaded = null;
+  try {
+    branch = await defaultBranch(github, context);
+    loaded = await loadPolicy(github, context, branch);
+  } catch (error) {
+    // A trusted policy that cannot be read must replace stale successes with
+    // blocking statuses instead of leaving the pull request looking green.
+    core?.warning?.(`Governance policy unavailable: ${error?.code || error?.name || 'Error'}`);
+  }
+  if (!loaded) {
+    return run({ github, context, core, policy: null, policySha: null, policyCommit: null,
+      defaultBranch: branch || fallback });
+  }
+  return run({ github, context, core, ...loaded, defaultBranch: branch });
 }
 
 module.exports = { runGate, loadPolicy, defaultBranch };

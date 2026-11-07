@@ -181,12 +181,12 @@ test('a thread author id of another account does not block', () => {
   assert.equal(evaluate(f).allowed, true);
 });
 
-test('R0 prose reports no review requirement even with a stale marker', () => {
+test('R0 prose with a stale marker stays pending', () => {
   const f = receiptMarker(fixture({ path: 'README.md' }), { commit_sha: 'f'.repeat(40) });
   const result = evaluate(f);
   assert.equal(result.tier, 'R0');
-  assert.equal(result.review.reason, 'review_not_required');
-  assert.equal(result.allowed, true);
+  assert.equal(result.review.reason, 'review_stale');
+  assert.equal(result.allowed, false);
 });
 
 test('an unresolved thread still blocks R0 prose', () => {

@@ -327,6 +327,7 @@ class SecretScanTests(unittest.TestCase):
             git('commit', '--quiet', '-m', message)
 
         commit('test: base', 'setting=base\n')
+        base = git('rev-parse', 'HEAD')
         git('checkout', '--quiet', '-b', 'feature')
         commit('test: feature', 'setting=feature\n')
         git('checkout', '--quiet', 'main')
@@ -337,6 +338,9 @@ class SecretScanTests(unittest.TestCase):
         # merge commit, not in either parent.
         commit('test: merge resolution', 'setting=main\npassword=' + fake_value() + '\n')
         with patch.object(SCANNER, 'ROOT', repository):
+            # The pull request range walks the same merge commit, so a credential
+            # that exists only in a conflict resolution must block the scan.
+            self.assertEqual(SCANNER.range_scan(BINARY, base, git('rev-parse', 'HEAD'), root=repository), 1)
             findings = SCANNER.scan(BINARY, 'git', repository, self.output)
         self.assertIn('configuration-secret-value', {row['RuleID'] for row in findings})
 
