@@ -58,17 +58,12 @@ SENSITIVE_FILE = re.compile(
 SENSITIVE_EXEMPT = re.compile(
     r"(?i)(?:^|/)(?:\.env\.(?:example|sample|template)|[^/]+\.example\.[^/]+"
     r"|[^/]*_example\.[^/]+)$")
-TEST_VALUE = re.compile(
-    r"(?i)(?:^|[-_.])(?:test|fake|mock|fixture|dummy|synthetic|example|sample"
-    r"|placeholder|redacted)(?:$|[-_.])")
 SHELL_REFERENCE = re.compile(r'^\$(?:\{[^"\']*\}|[A-Za-z_][A-Za-z0-9_]*)$')
-CONSTANT_NAME = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
 CREDENTIAL_NAME = re.compile(r"(?i)api[_-]?key|secret|token|password|passwd")
 
 
 def exempt(value):
-    return any(pattern.search(value) for pattern in
-               (PLACEHOLDER, TEST_VALUE, CONSTANT_NAME))
+    return bool(PLACEHOLDER.search(value))
 
 
 def shell_fallbacks(text):

@@ -49,7 +49,6 @@ class SecretScanTests(unittest.TestCase):
             'TIKHUB_API_KEY="${TIKHUB_API_KEY:-${FALLBACK_KEY:-}}"',
             'PASSWORD="${PASSWORD-}"',
             'API_KEY="$API_KEY"',
-            'TARGET_SECRET = "CONTACT_PHONE_LIST_JSON"',
             'DEV_SESSION_SECRET = "dev-session-secret-change-me"',
         ]
         self.assertEqual(governance.scan_text("\n".join(lines)), [])
@@ -154,14 +153,20 @@ class SecretScanTests(unittest.TestCase):
         self.assertEqual(governance.scan_text('SLACK = "xapp-1-A123-456-abcdef123456"'),
                          [(1, "slack-token")])
 
-    def test_fixture_words_are_not_credentials(self):
+    def test_fixture_words_are_not_placeholders(self):
         lines = [
             'token = "test-access-token"',
             'token = "fake-session-value"',
             'secret = "mca_gemini_test_key_NOT_FOR_LOG"',
             'main.PASSWORD = "test-password-value"',
         ]
-        self.assertEqual(governance.scan_text("\n".join(lines)), [])
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(number, "credential-assignment") for number in range(1, 5)])
+
+    def test_secret_name_constants_are_credentials(self):
+        self.assertEqual(
+            governance.scan_text('TARGET_SECRET = "CONTACT_PHONE_LIST_JSON"'),
+            [(1, "credential-assignment")])
 
     def test_long_alphabetic_passphrases_are_credentials(self):
         lines = [
