@@ -75,6 +75,25 @@ class SecretScanTests(unittest.TestCase):
         self.assertEqual(governance.scan_text("\n".join(lines)),
                          [(1, "credential-assignment"), (2, "credential-assignment")])
 
+    def test_quoted_values_may_contain_spaces(self):
+        lines = [
+            'password = "correct horse battery staple 2026"',
+            "secret = os.getenv('APP_SECRET', 'correct horse battery staple 2026')",
+            'password = "example pass phrase for local use"',
+            'password = "${SOME_LONG_ENVIRONMENT_VARIABLE}"',
+            'PASSWORD="${DB_PASSWORD:?Missing DB_PASSWORD}"',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)),
+                         [(1, "credential-assignment"), (2, "environment-fallback")])
+
+    def test_prose_values_are_not_credentials(self):
+        lines = [
+            '"BRAVE_SEARCH_API_KEY": "Brave Web Search discovery",',
+            "export IMAP_PASSWORD='邮箱 IMAP 授权码或 App Password'",
+            'if "u_atoken=" in page_url and "u_asig=" in page_url:',
+        ]
+        self.assertEqual(governance.scan_text("\n".join(lines)), [])
+
     def test_prefixed_credential_names_are_detected(self):
         lines = [
             'client_secret = "hunter2hunter2hunter2"',

@@ -43,15 +43,16 @@ SECRET_RULES = [
         r"(?i)(?<![A-Za-z0-9_])[\"']?[A-Za-z0-9_.-]*"
         r"(?:api[_-]?key|secret|token|password|passwd)"
         r"(?:[_-]?(?:access[_-]?key|key[_-]?base|value|hash|token|secret))*"
-        r"[\"']?\s*[:=]\s*(['\"])(?P<value>[^\"'\s]{16,})\1")),
+        r"[\"']?\s*[:=]\s*(['\"])(?P<value>[^\"'\n\s][^\"'\n]{14,}[^\"'\n\s])\1")),
     ("environment-fallback", re.compile(
         r"(?i)(?:os\.)?(?:getenv|environ\.get)\(\s*(['\"])(?P<name>[^'\"]+)\1\s*,\s*"
-        r"(['\"])(?P<value>[^'\"\s]{16,})\3")),
+        r"(['\"])(?P<value>[^'\"\n\s][^'\"\n]{14,}[^'\"\n\s])\3")),
 ]
 
 PLACEHOLDER = re.compile(
     r"(?i)(?:\bexample\b|\bsample\b|\bsynthetic\b|\bdummy\b|\bplaceholder\b"
     r"|\bchange[_-]?me\b|\bredacted\b|your[_-]?(?:token|key|secret)|<[^>]+>)")
+PROSE_VALUE = re.compile(r"[^\W\d_]+(?:[ \t]+[^\W\d_]+)+")
 SENSITIVE_FILE = re.compile(
     r"(^|/)(?:\.env(?:\.[^/]+)?|id_(?:rsa|dsa|ecdsa|ed25519)|credentials\.json"
     r"|[^/]+\.(?:pem|key|p12|pfx|keystore|jks|bks))$", re.IGNORECASE)
@@ -94,7 +95,7 @@ def shell_fallbacks(text):
             inner = text[index + 2:end]
             match = re.match(r"[A-Za-z_][A-Za-z0-9_]*"
                              r"(:-|:=|:\+|:\?|-|=|\+|\?)(.*)$", inner, re.S)
-            if match:
+            if match and match.group(1) not in (":?", "?"):
                 default = match.group(2)
                 if default.startswith("$"):
                     literals.extend(shell_fallbacks(default))
@@ -165,7 +166,9 @@ def scan_text(text):
                 if (rule == "environment-fallback"
                         and not CREDENTIAL_NAME.search(match.group("name"))):
                     continue
-                if exempt(value) or shell_reference_is_safe(value):
+                if exempt(value) or PROSE_VALUE.fullmatch(value):
+                    continue
+                if shell_reference_is_safe(value):
                     continue
                 findings.append((number, rule))
                 found = True
