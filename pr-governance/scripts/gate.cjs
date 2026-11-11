@@ -198,6 +198,16 @@ function pureActionRepin(file) {
     && removed.every((target, index) => target !== null && target === added[index]);
 }
 
+// The files endpoint may omit large text patches. Collection can recover them
+// from an immutable compare diff; classification still requires exact counts.
+function completePatch(file) {
+  const patch = typeof file.patch === 'string' ? file.patch : '';
+  const lines = patch.split('\n');
+  return lines.filter(line => line.startsWith('+')).length === file.additions
+    && lines.filter(line => line.startsWith('-')).length === file.deletions
+    && Boolean(patch || (file.additions === 0 && file.deletions === 0 && file.status === 'renamed'));
+}
+
 function classify(files, expected, policy, options = {}) {
   assert(Array.isArray(files) && files.length > 0 && files.length === expected && files.length < 3000,
     'Incomplete file list');
@@ -217,9 +227,7 @@ function classify(files, expected, policy, options = {}) {
     // Count actual hunk lines: missing or truncated patches cannot attest coverage.
     const patch = file.patch || '';
     const lines = patch.split('\n');
-    assert(lines.filter(line => line.startsWith('+')).length === file.additions
-      && lines.filter(line => line.startsWith('-')).length === file.deletions, 'Incomplete patch');
-    assert(patch || (file.additions === 0 && file.deletions === 0 && file.status === 'renamed'), 'Missing patch');
+    assert(completePatch(file), 'Incomplete patch');
     const changed = lines.filter(line => /^[+-]/.test(line)).map(line => line.slice(1));
     // R0 is deliberately narrow: even inline code, links and HTML need a reviewer.
     if (fileTier === 'R0' && (file.status !== 'modified'
@@ -555,7 +563,7 @@ function completeTemplate(body) {
 module.exports = {
   SCHEMA, MODES, CLEARING_LABELS, MARKER_NAMES, REVIEW_TEXT,
   sha256Hex, canonical, digest, isSha,
-  validatePolicy, pathTier, classify, completeTemplate, binding,
+  validatePolicy, pathTier, completePatch, classify, completeTemplate, binding,
   stableComment, stableThread, matchesReviewer, matchesThreadAuthor, normalizeLogin,
   reviewerEvidence, dependabotEvidence, labelEvidence, templateVerdict, evaluate,
 };

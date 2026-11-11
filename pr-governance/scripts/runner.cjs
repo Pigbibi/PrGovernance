@@ -12,6 +12,59 @@ const DEPENDABOT_POLICY_PATH = '.github/scripts/dependabot-policy.json';
 
 const found = (message, code) => Object.assign(new Error(message), { code });
 
+// Only fixed diagnostic codes leave the evaluator. Error messages, response
+// bodies and arbitrary provider codes may contain private repository content.
+const FAILURE_REASONS = new Map([
+  ['Incomplete patch', 'INCOMPLETE_PATCH'], ['Missing patch', 'INCOMPLETE_PATCH'],
+  ['Incomplete file list', 'INCOMPLETE_FILES'], ['Incomplete commit list', 'INCOMPLETE_COMMITS'],
+  ['Head changed during collection', 'HEAD_CHANGED'], ['Head changed during evaluation', 'HEAD_CHANGED'],
+  ['Trusted base changed during evaluation', 'BASE_CHANGED'],
+  ['Pull request base changed during evaluation', 'BASE_CHANGED'],
+  ['Evidence changed during evaluation', 'EVIDENCE_CHANGED'],
+  ['Decision changed during evaluation', 'DECISION_CHANGED'],
+  ['Incomplete review threads', 'INCOMPLETE_THREADS'], ['Invalid review thread', 'INCOMPLETE_THREADS'],
+  ['Invalid thread page', 'INCOMPLETE_THREADS'], ['Unknown head commit', 'UNKNOWN_HEAD'],
+  ['Only the default branch is governed', 'NON_DEFAULT_BASE'],
+]);
+const FAILURE_CODES = new Set(['SHARED_HEAD', 'STATUS_LIMIT', 'DIFF_EVIDENCE_INVALID']);
+function failureReason(error) {
+  if (FAILURE_CODES.has(error?.code)) return error.code;
+  if (FAILURE_REASONS.has(error?.message)) return FAILURE_REASONS.get(error.message);
+  if (Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599) return `API_HTTP_${error.status}`;
+  return 'EVALUATION_ERROR';
+}
+
+// Unlike the per-file REST patch, the diff media type contains large text
+// hunks. Bind the request to immutable commits, match exact file headers and
+// retain the classifier's count checks. Binary, truncated and ambiguous diffs
+// still block; no PR code is checked out or executed.
+async function completePatches(github, repo, pr, files) {
+  const missing = files.filter(file => !gate.completePatch(file));
+  if (!missing.length) return files;
+  const invalid = () => found('Complete diff evidence is unavailable or inconsistent', 'DIFF_EVIDENCE_INVALID');
+  if (!gate.isSha(pr.base?.sha) || !gate.isSha(pr.head?.sha)) throw invalid();
+  const { data } = await github.rest.repos.compareCommitsWithBasehead({ ...repo,
+    basehead: `${pr.base.sha}...${pr.head.sha}`, headers: { accept: 'application/vnd.github.diff' } });
+  if (typeof data !== 'string' || Buffer.byteLength(data, 'utf8') > 16 * 1024 * 1024) throw invalid();
+  const sections = data.split(/^(?=diff --git )/m).filter(Boolean);
+  const recovered = new Map();
+  for (const file of missing) {
+    const previous = file.previous_filename || file.filename;
+    // Git quotes unusual paths; do not guess which file an encoded header names.
+    if ([previous, file.filename].some(path => typeof path !== 'string' || /[\r\n\t"\\]/.test(path))) throw invalid();
+    const header = `diff --git a/${previous} b/${file.filename}`;
+    const matches = sections.filter(section => section.slice(0, section.indexOf('\n')) === header);
+    if (matches.length !== 1) throw invalid();
+    const lines = matches[0].split('\n');
+    const start = lines.findIndex(line => /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line));
+    if (start < 0) throw invalid();
+    const patch = lines.slice(start).join('\n').replace(/\n$/, '');
+    if (!gate.completePatch({ ...file, patch })) throw invalid();
+    recovered.set(file.filename, patch);
+  }
+  return files.map(file => recovered.has(file.filename) ? { ...file, patch: recovered.get(file.filename) } : file);
+}
+
 async function selectTargets(github, context, defaultBranch) {
   const repo = context.repo;
   const event = context.payload || {};
@@ -119,7 +172,7 @@ async function collect(github, context, number, policyCommit) {
     repository: `${repo.owner}/${repo.repo}`,
     policyCommit,
     pr,
-    files,
+    files: await completePatches(github, repo, pr, files),
     commits,
     comments,
     timeline,
@@ -246,7 +299,7 @@ async function publishUnavailable({ github, context, core, number, mode }) {
     await publishAll({ github, repo: context.repo, head: pull.head.sha, history,
       entries: errorEntries('Governance policy unavailable; rerun required'), mode, target });
   } catch (error) {
-    core?.warning?.(`PR #${number}: ${error.message}`);
+    core?.warning?.(`PR #${number}: status publication failed (${failureReason(error)})`);
   }
 }
 
@@ -324,7 +377,7 @@ async function evaluateOne(options) {
     if (error?.code !== 'STATUS_LIMIT') {
       await Promise.allSettled([publish(errorEntries(error?.code === 'SHARED_HEAD'
         ? 'Another open pull request shares this head'
-        : 'Evaluation failed; rerun required'))]);
+        : `Evaluation failed: ${failureReason(error)}; see run`))]);
     }
     throw error;
   }
@@ -363,8 +416,11 @@ async function run({ github, context, core, policy, policySha, policyCommit, def
       if (outcome.baseOutdated) continue;
       if (!outcome.allowed) failures.push({ number, message: outcome.reason });
     } catch (error) {
-      // Do not print response bodies: they can contain user input.
-      failures.push({ number, message: error?.code || error?.name || 'Error' });
+      const reason = failureReason(error);
+      failures.push({ number, message: reason });
+      outcomes.push({ number, allowed: false, reason,
+        summary: { pr: number, allowed: false, reason, evaluation_error: true } });
+      core?.warning?.(`PR #${number}: evaluation failed (${reason}); evaluation blocked`);
     }
   }
   writeSummary(core, outcomes);

@@ -525,3 +525,157 @@ test('a failing status publication does not abort later pull requests', async ()
   assert.deepEqual([...evaluated].sort(), [42, 43]);
   assert.equal(m.failures.length, 1);
 });
+
+
+// ------------------------------------------------------- complete diff fallback ---
+
+function missingPatch(options = {}) {
+  const f = receiptMarker(fixture(options));
+  const original = f.snapshot.files[0].patch;
+  delete f.snapshot.files[0].patch;
+  const m = mock(f);
+  const file = f.snapshot.files[0];
+  const header = `diff --git a/${file.previous_filename || file.filename} b/${file.filename}`;
+  const diff = `${header}\nindex ${'d'.repeat(7)}..${'e'.repeat(7)} 100644\n`
+    + `--- a/${file.previous_filename || file.filename}\n+++ b/${file.filename}\n${original}\n`;
+  const requests = [];
+  m.github.rest.repos.compareCommitsWithBasehead = async params => {
+    requests.push(params);
+    return { data: diff };
+  };
+  return { f, m, diff, requests };
+}
+
+test('a missing REST patch is recovered from the immutable complete diff', async () => {
+  const { m, requests } = missingPatch();
+  await runMock(m);
+  assert.deepEqual(states(m), [['pr-template', 'success'], ['ai-review', 'success'], ['risk-gate', 'success']]);
+  assert.equal(m.failures.length, 0);
+  assert.equal(requests.length, 2, 'both snapshots must read the complete evidence');
+  for (const request of requests) {
+    assert.equal(request.basehead, `${BASE}...${HEAD}`);
+    assert.equal(request.headers.accept, 'application/vnd.github.diff');
+  }
+});
+
+test('a truncated REST patch is recovered without weakening patch accounting', async () => {
+  const { f, m } = missingPatch();
+  f.snapshot.files[0].patch = '@@ -1 +1 @@\n-before';
+  await runMock(m);
+  assert.equal(m.failures.length, 0);
+  assert.equal(m.statuses.find(status => status.context === 'risk-gate').state, 'success');
+});
+
+test('a stale base with an omitted patch gets its explicit blocking verdict', async () => {
+  const { m } = missingPatch();
+  m.state.pull.base.sha = 'e'.repeat(40);
+  await runMock(m);
+  assert.equal(m.statuses.find(status => status.context === 'ai-review').description, 'base-outdated: rebase to re-evaluate');
+  assert.equal(m.failures.length, 0);
+});
+
+for (const kind of ['missing hunk', 'wrong path', 'duplicate section', 'truncated hunk', 'not text']) {
+  test(`an unusable complete diff (${kind}) fails closed with a safe reason`, async () => {
+    const { m, diff } = missingPatch();
+    const values = {
+      'missing hunk': diff.slice(0, diff.indexOf('@@')),
+      'wrong path': diff.replaceAll('src/view.js', 'src/other.js'),
+      'duplicate section': diff + diff,
+      'truncated hunk': diff.replace('+after\n', ''),
+      'not text': { message: 'PRIVATE-RESPONSE-BODY' },
+    };
+    m.github.rest.repos.compareCommitsWithBasehead = async () => ({ data: values[kind] });
+    const result = await runMock(m);
+    assert.ok(m.statuses.length === 3 && m.statuses.every(status => status.state === 'error'));
+    assert.ok(m.statuses.every(status => /DIFF_EVIDENCE_INVALID/.test(status.description)));
+    assert.equal(result.failures[0].message, 'DIFF_EVIDENCE_INVALID');
+    assert.match(m.summary.join('\n'), /DIFF_EVIDENCE_INVALID/);
+  });
+}
+
+test('complete REST patches need no compare request', async () => {
+  const { f } = missingPatch();
+  f.snapshot.files[0].patch = '@@ -1 +1 @@\n-before\n+after';
+  const m = mock(f);
+  m.github.rest.repos.compareCommitsWithBasehead = async () => { assert.fail('unexpected compare'); };
+  await runMock(m);
+  assert.equal(m.failures.length, 0);
+});
+
+test('a complete diff that changes between snapshots cannot publish success', async () => {
+  const { m, diff } = missingPatch();
+  let reads = 0;
+  m.github.rest.repos.compareCommitsWithBasehead = async () => ({ data: ++reads === 1 ? diff : diff.replace('+after', '+other') });
+  const result = await runMock(m);
+  assert.ok(m.statuses.length === 3 && m.statuses.every(status => status.state === 'error'));
+  assert.equal(result.failures[0].message, 'EVIDENCE_CHANGED');
+  assert.match(m.summary.join('\n'), /EVIDENCE_CHANGED/);
+});
+
+test('typed HTTP failure diagnostics never expose exception text, code or response data', async () => {
+  const { m } = missingPatch();
+  m.github.rest.repos.compareCommitsWithBasehead = async () => {
+    throw Object.assign(new Error('PRIVATE-ERROR-TEXT'), {
+      code: 'PRIVATE-ERROR-CODE', status: 403, response: { data: 'PRIVATE-RESPONSE-BODY' },
+    });
+  };
+  const result = await runMock(m);
+  assert.ok(m.statuses.length === 3 && m.statuses.every(status => status.state === 'error'));
+  assert.equal(result.failures[0].message, 'API_HTTP_403');
+  assert.match(m.warnings.join('\n'), /API_HTTP_403/);
+  assert.match(m.summary.join('\n'), /API_HTTP_403/);
+  assert.doesNotMatch(JSON.stringify([m.statuses, m.summary, m.failures, m.warnings, result]), /PRIVATE-/);
+});
+
+test('an untyped exception stays blocking without disclosing arbitrary values', async () => {
+  const m = mock(receiptMarker(fixture()));
+  m.github.paginate = async () => { throw Object.assign(new Error('PRIVATE-ERROR-TEXT'), { code: 'PRIVATE-CODE', name: 'PRIVATE-NAME' }); };
+  const result = await runMock(m);
+  assert.equal(result.failures[0].message, 'EVALUATION_ERROR');
+  assert.ok(m.statuses.every(status => status.description.includes('EVALUATION_ERROR')));
+  assert.match(m.summary.join('\n'), /EVALUATION_ERROR/);
+  assert.doesNotMatch(JSON.stringify([m.statuses, m.summary, m.failures, m.warnings, result]), /PRIVATE-/);
+});
+
+
+test('large generated lines recover without changing the evaluated binding', async () => {
+  const f = receiptMarker(fixture());
+  const file = f.snapshot.files[0];
+  const patch = `@@ -1 +1 @@\n-${'a'.repeat(100000)}\n+${'b'.repeat(100000)}`;
+  file.patch = patch;
+  const expected = gate.evaluate(f.snapshot, f.policy, POLICY_SHA, NOW);
+  const m = mock(f);
+  delete file.patch;
+  m.github.rest.repos.compareCommitsWithBasehead = async () => ({ data: `diff --git a/src/view.js b/src/view.js\n--- a/src/view.js\n+++ b/src/view.js\n${patch}\n` });
+  await runMock(m);
+  const actual = JSON.parse(m.summary.find(entry => entry.trim().startsWith('{')));
+  assert.equal(actual.evidence_sha256, expected.evidence_sha256);
+  assert.deepEqual(actual.binding, expected.binding);
+});
+
+test('a response over the diff bound stays an explicit blocking error', async () => {
+  const { m } = missingPatch();
+  m.github.rest.repos.compareCommitsWithBasehead = async () => ({ data: 'a'.repeat(16 * 1024 * 1024 + 1) });
+  const result = await runMock(m);
+  assert.equal(result.failures[0].message, 'DIFF_EVIDENCE_INVALID');
+  assert.ok(m.statuses.every(status => status.state === 'error'));
+});
+
+test('a recovered rename retains the old protected path', async () => {
+  const { f, m, diff } = missingPatch({ path: 'src/view.js' });
+  f.snapshot.files[0].status = 'renamed';
+  f.snapshot.files[0].previous_filename = 'config/settings.js';
+  m.github.rest.repos.compareCommitsWithBasehead = async () => ({ data: diff.replaceAll('a/src/view.js', 'a/config/settings.js') });
+  await runMock(m);
+  const actual = JSON.parse(m.summary.find(entry => entry.trim().startsWith('{')));
+  assert.equal(actual.tier, 'R2');
+  assert.equal(actual.allowed, false);
+  assert.equal(actual.reason, 'clearing_label_required');
+});
+
+test('an encoded path without an exact header is refused instead of guessed', async () => {
+  const { m } = missingPatch({ path: 'src/quoted"name.js' });
+  const result = await runMock(m);
+  assert.equal(result.failures[0].message, 'DIFF_EVIDENCE_INVALID');
+  assert.ok(m.statuses.every(status => status.state === 'error'));
+});
