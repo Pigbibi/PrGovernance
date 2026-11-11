@@ -12,6 +12,10 @@ inputs:
     description: "Artifact name for the aggregate-only history summary"
     required: false
     default: "secret-scan-summary"
+  record-label:
+    description: "Record the head a clearing label was added to instead of evaluating"
+    required: false
+    default: "false"
 outputs: {}
 runs:
   using: composite
@@ -21,6 +25,7 @@ runs:
       uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
       env:
         GOVERNANCE_ACTION_PATH: ${{ github.action_path }}
+        GOVERNANCE_RECORD_LABEL: ${{ inputs.record-label }}
       with:
         script: |
           const path = require('node:path');

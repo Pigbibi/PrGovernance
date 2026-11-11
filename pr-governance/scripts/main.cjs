@@ -19,6 +19,23 @@ function configuredOwner() {
   return { user_id: id, login };
 }
 
+// The reviewer is the same kind of account identity, so a repository that keeps
+// accounts out of public source can configure it the same way. A partial set
+// fails closed instead of falling back to a committed identity.
+function configuredReviewer() {
+  const appId = process.env.GOVERNANCE_REVIEWER_APP_ID;
+  const userId = process.env.GOVERNANCE_REVIEWER_USER_ID;
+  const login = process.env.GOVERNANCE_REVIEWER_LOGIN;
+  if (!appId && !userId && !login) return null;
+  const app = Number(appId);
+  const user = Number(userId);
+  if (!Number.isSafeInteger(app) || app < 1 || !Number.isSafeInteger(user) || user < 1
+    || typeof login !== 'string' || !login) {
+    throw new Error('Incomplete reviewer configuration');
+  }
+  return { provider: process.env.GOVERNANCE_REVIEWER_PROVIDER || 'codex', app_id: app, user_id: user, login };
+}
+
 async function defaultBranch(github, context) {
   const known = context.payload?.repository?.default_branch
     || context.payload?.pull_request?.base?.ref;
@@ -45,6 +62,8 @@ async function loadPolicy(github, context, branch) {
   }
   const owner = configuredOwner();
   if (owner) policy.owner = owner;
+  const reviewer = configuredReviewer();
+  if (reviewer) policy.reviewer = reviewer;
   gate.validatePolicy(policy);
   // Without an owner nobody can ever satisfy owner-approved, so a missing
   // configuration must fail the check instead of silently downgrading it.
@@ -53,14 +72,29 @@ async function loadPolicy(github, context, branch) {
 }
 
 async function runGate({ github, context, core }) {
-  // Label evidence must not ride on an evaluation a later event can supersede,
-  // so its own job records it and stops. The evaluate job depends on this one.
-  if (context.eventName === 'pull_request_target' && context.payload?.action === 'labeled') {
+  // Recording and evaluating are separate dispatch paths so the evaluate job
+  // actually runs: a label record is bound to its own delivery, while an
+  // evaluation may be superseded by any later event.
+  if (process.env.GOVERNANCE_RECORD_LABEL === 'true') {
     return recordLabel({ github, context, core });
   }
-  const branch = await defaultBranch(github, context);
-  const { policy, policyCommit, policySha } = await loadPolicy(github, context, branch);
-  return run({ github, context, core, policy, policySha, policyCommit, defaultBranch: branch });
+  const fallback = context.payload?.repository?.default_branch
+    || context.payload?.pull_request?.base?.ref || '';
+  let branch = fallback;
+  let loaded = null;
+  try {
+    branch = await defaultBranch(github, context);
+    loaded = await loadPolicy(github, context, branch);
+  } catch (error) {
+    // A trusted policy that cannot be read must replace stale successes with
+    // blocking statuses instead of leaving the pull request looking green.
+    core?.warning?.(`Governance policy unavailable: ${error?.code || error?.name || 'Error'}`);
+  }
+  if (!loaded) {
+    return run({ github, context, core, policy: null, policySha: null, policyCommit: null,
+      defaultBranch: branch || fallback });
+  }
+  return run({ github, context, core, ...loaded, defaultBranch: branch });
 }
 
 module.exports = { runGate, loadPolicy, defaultBranch };

@@ -23,6 +23,10 @@ A pull request may merge when all of these hold:
 Branch protection, not this action, is the merge constraint. The action only
 publishes evidence; it cannot merge, label, or write repository contents.
 
+The gate applies to repositories that build, deploy or run code. A repository
+that only publishes a static site through a `pages` workflow keeps that
+deployment workflow and is exempt from the gate.
+
 ## Risk tiers
 
 | Tier | Typical paths | Requirement |
@@ -64,7 +68,10 @@ organization community-health files.
    `reviewer` and repository-specific `r2_paths`. Leave `owner` out: account
    identities belong in protected configuration, so the action reads
    `RISK_GATE_OWNER_ID` and `RISK_GATE_OWNER` from repository or organization
-   variables and replaces `owner` when they are set.
+   variables and replaces `owner` when they are set. A repository whose content
+   rules keep accounts out of public source may also leave `reviewer` out and
+   set `RISK_GATE_REVIEWER_APP_ID`, `RISK_GATE_REVIEWER_USER_ID` and
+   `RISK_GATE_REVIEWER_LOGIN` instead; a partial set fails closed.
 2. Copy `templates/risk-gate.yml`, `templates/codex-nudge.yml`,
    `templates/gitleaks.yml` and `templates/weekly-secret-scan.yml` into
    `.github/workflows/`, replacing `__GOVERNANCE_REPO__` with the
@@ -82,7 +89,8 @@ organization community-health files.
 
 The owner identity comes from the `RISK_GATE_OWNER_ID` and `RISK_GATE_OWNER`
 variables. A policy that still carries `owner` keeps working until the
-variables are set, but no account identity is required in the file.
+variables are set, but no account identity is required in the file. The
+reviewer follows the same rule through the `RISK_GATE_REVIEWER_*` variables.
 
 ## Trust model
 
@@ -98,6 +106,21 @@ variables are set, but no account identity is required in the file.
 - Status writes stop before GitHub's 1000-per-context limit; the last slot is
   reserved for a blocking state, so a head that runs out of slots stays blocked
   instead of silently passing.
+
+## Incomplete diff evidence
+
+GitHub's files endpoint can omit or truncate patches for large text files. The
+collector recovers those patches from the diff media type of an immutable
+`base...head` comparison. It matches each file header and verifies the exact
+addition and deletion counts before evaluating, then repeats collection for
+the normal evidence readback. No pull request code is checked out or executed.
+Binary files, unreadable responses, unrecognised quoted paths, inconsistent
+counts and diffs over 16 MiB remain blocking errors.
+
+Evaluation errors publish a fixed reason code in all three required statuses,
+a warning and the job summary. Arbitrary exception text and API response bodies
+are never included. A rerun cannot repair missing evidence or change a pinned
+action: the consumer must first adopt the reviewed fixed action revision.
 
 ## Modes
 
@@ -120,6 +143,15 @@ a fresh review instead of silently reusing one.
 ## Private repositories
 
 GitHub Free does not provide branch protection or secret scanning for private
-repositories, and hosted Actions may be billing-blocked. Use the local track:
-the same policy file, a pre-push hook and `scripts/local` commands recording
-the same receipt and scan results locally. See `docs/private-repositories.md`.
+repositories, and hosted Actions may be billing-blocked. Private repositories
+use a local enforcement track instead: Git hooks that reject staged credentials,
+unconventional commit headers, direct pushes to a protected branch, and
+non-fast-forward pushes, plus an audit over the tracked tree.
+
+
+## Twin repositories
+
+`pr-governance/` is byte-identical in `Pigbibi/PrGovernance`, `GdeiAssistant/.github`
+and `QuantStrategyLab/.github`; `VERSION` names the shared revision. Each
+repository runs `scripts/check-twin-drift.sh` weekly and on demand. A change to
+any shared file is applied to all three before the drift check can pass.

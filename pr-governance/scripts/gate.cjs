@@ -198,6 +198,16 @@ function pureActionRepin(file) {
     && removed.every((target, index) => target !== null && target === added[index]);
 }
 
+// The files endpoint may omit large text patches. Collection can recover them
+// from an immutable compare diff; classification still requires exact counts.
+function completePatch(file) {
+  const patch = typeof file.patch === 'string' ? file.patch : '';
+  const lines = patch.split('\n');
+  return lines.filter(line => line.startsWith('+')).length === file.additions
+    && lines.filter(line => line.startsWith('-')).length === file.deletions
+    && Boolean(patch || (file.additions === 0 && file.deletions === 0 && file.status === 'renamed'));
+}
+
 function classify(files, expected, policy, options = {}) {
   assert(Array.isArray(files) && files.length > 0 && files.length === expected && files.length < 3000,
     'Incomplete file list');
@@ -217,9 +227,7 @@ function classify(files, expected, policy, options = {}) {
     // Count actual hunk lines: missing or truncated patches cannot attest coverage.
     const patch = file.patch || '';
     const lines = patch.split('\n');
-    assert(lines.filter(line => line.startsWith('+')).length === file.additions
-      && lines.filter(line => line.startsWith('-')).length === file.deletions, 'Incomplete patch');
-    assert(patch || (file.additions === 0 && file.deletions === 0 && file.status === 'renamed'), 'Missing patch');
+    assert(completePatch(file), 'Incomplete patch');
     const changed = lines.filter(line => /^[+-]/.test(line)).map(line => line.slice(1));
     // R0 is deliberately narrow: even inline code, links and HTML need a reviewer.
     if (fileTier === 'R0' && (file.status !== 'modified'
@@ -310,7 +318,6 @@ function markerPayloads(body, name) {
 const carriesMarker = body => MARKER_NAMES.some(name => markerPayloads(body, name).length > 0);
 
 const REVIEW_TEXT = {
-  review_not_required: 'Low-risk prose: reviewer evidence not required',
   review_complete: 'Reviewer evidence covers this head',
   review_pending: 'Waiting for reviewer evidence on this head',
   review_running: 'Reviewer review is still running on this head',
@@ -471,10 +478,9 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
   const template = templateVerdict(snapshot, policy, dependabot);
   const labels = labelEvidence(snapshot, policy);
   const threads = unresolvedReviewerThreads(snapshot, policy);
-  let review = risk.tier === 'R0'
-    ? { provider: policy.reviewer.provider, state: 'success', reason: 'review_not_required', comment_id: null,
-      format: null, commit_sha: null, coverage: null, unresolved: null }
-    : reviewerEvidence(snapshot, policy, now);
+  // Reviewer evidence is required at every tier: a prose-only change can still
+  // introduce a misleading claim, so R0 only lowers the label requirement.
+  let review = reviewerEvidence(snapshot, policy, now);
   // Thread state comes from GitHub, the marker from the provider. The stricter
   // reading wins, and a resolved-or-missing thread never proves a clean review.
   if (threads.length && review.state !== 'failure') review = { ...review, state: 'failure', reason: 'review_threads' };
@@ -496,7 +502,7 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
   const cleared = labels.applied === 'owner' ? 'cleared by owner-approved'
     : labels.applied === 'agent' ? 'cleared by agent-approved, NOT confirmed by the owner' : null;
   const gateDescription = gateState === 'success'
-    ? `${risk.tier}: ${cleared || (review.reason === 'review_not_required' ? 'low-risk prose' : 'review verified')}`
+    ? `${risk.tier}: ${cleared || 'review verified'}`
     : gateState === 'pending' ? `${risk.tier}: waiting for reviewer`
       : `${risk.tier}: ${GATE_TEXT[reason] || REVIEW_TEXT[reason] || reason}`;
   const evidenceSha = digest({
@@ -557,7 +563,7 @@ function completeTemplate(body) {
 module.exports = {
   SCHEMA, MODES, CLEARING_LABELS, MARKER_NAMES, REVIEW_TEXT,
   sha256Hex, canonical, digest, isSha,
-  validatePolicy, pathTier, classify, completeTemplate, binding,
+  validatePolicy, pathTier, completePatch, classify, completeTemplate, binding,
   stableComment, stableThread, matchesReviewer, matchesThreadAuthor, normalizeLogin,
   reviewerEvidence, dependabotEvidence, labelEvidence, templateVerdict, evaluate,
 };

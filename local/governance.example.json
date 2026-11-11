@@ -1,0 +1,6 @@
+{
+  "protected_branches": ["main", "master"],
+  "max_header": 72,
+  "ignore_paths": [],
+  "allow_values": []
+}

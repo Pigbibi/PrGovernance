@@ -36,6 +36,9 @@ async function load(policy, environment) {
   } finally {
     delete process.env.GOVERNANCE_OWNER_ID;
     delete process.env.GOVERNANCE_OWNER_LOGIN;
+    delete process.env.GOVERNANCE_REVIEWER_APP_ID;
+    delete process.env.GOVERNANCE_REVIEWER_USER_ID;
+    delete process.env.GOVERNANCE_REVIEWER_LOGIN;
     Object.assign(process.env, saved);
   }
 }
@@ -57,8 +60,102 @@ test('a policy without owner and without variables fails closed', async () => {
   await assert.rejects(load(POLICY, {}));
 });
 
+const OWNER_ENV = { GOVERNANCE_OWNER_ID: '42', GOVERNANCE_OWNER_LOGIN: 'owner' };
+const REVIEWER_ENV = { ...OWNER_ENV, GOVERNANCE_REVIEWER_APP_ID: '7',
+  GOVERNANCE_REVIEWER_USER_ID: '8', GOVERNANCE_REVIEWER_LOGIN: 'reviewer[bot]' };
+
+test('reviewer configuration replaces a committed reviewer', async () => {
+  const { policy } = await load(POLICY, REVIEWER_ENV);
+  assert.deepEqual(policy.reviewer, { provider: 'codex', app_id: 7, user_id: 8, login: 'reviewer[bot]' });
+});
+
+test('a policy without reviewer is valid when the variables are set', async () => {
+  const { reviewer, ...rest } = POLICY;
+  const { policy } = await load(rest, REVIEWER_ENV);
+  assert.deepEqual(policy.reviewer, { provider: 'codex', app_id: 7, user_id: 8, login: 'reviewer[bot]' });
+});
+
+test('an incomplete reviewer configuration fails closed', async () => {
+  await assert.rejects(load(POLICY, { GOVERNANCE_REVIEWER_APP_ID: '7' }), /reviewer configuration/);
+  await assert.rejects(load(POLICY, { ...REVIEWER_ENV, GOVERNANCE_REVIEWER_USER_ID: '0' }),
+    /reviewer configuration/);
+});
+
 test('an incomplete owner configuration fails closed', async () => {
   await assert.rejects(load(POLICY, { GOVERNANCE_OWNER_ID: '42' }), /owner configuration/);
   await assert.rejects(load(POLICY,
     { GOVERNANCE_OWNER_ID: '0', GOVERNANCE_OWNER_LOGIN: 'owner' }), /owner configuration/);
 });
+
+async function withEnvironment(environment, action) {
+  const saved = { ...process.env };
+  delete process.env.GOVERNANCE_RECORD_LABEL;
+  Object.assign(process.env, environment);
+  try {
+    return await action();
+  } finally {
+    delete process.env.GOVERNANCE_RECORD_LABEL;
+    Object.assign(process.env, saved);
+  }
+}
+
+test('recording a label is a separate dispatch path', async () => {
+  const written = [];
+  const labeled = {
+    action: 'labeled',
+    label: { name: 'agent-approved' },
+    pull_request: { number: 7, state: 'open', updated_at: '2026-01-01T00:00:00Z',
+      head: { sha: 'b'.repeat(40) }, base: { ref: 'main' } },
+  };
+  const github = {
+    paginate: async () => [{ id: 11, event: 'labeled', created_at: '2026-01-01T00:00:00Z',
+      label: { name: 'agent-approved' }, actor: { id: 42, login: 'agent' } }],
+    rest: {
+      issues: { listEvents: async () => ({ data: [] }) },
+      repos: {
+        // Evaluation would need this; the record path must never get here.
+        get: async () => { throw new Error('recording must not read the repository'); },
+        createCommitStatus: async params => { written.push(params); return { data: params }; },
+      },
+    },
+  };
+  const result = await withEnvironment({ GOVERNANCE_RECORD_LABEL: 'true' }, () => main.runGate({
+    github, core: { info() {} },
+    context: { eventName: 'pull_request_target', repo: { owner: 'example-org', repo: 'example-repo' },
+      payload: labeled, serverUrl: 'https://github.example', runId: 9 },
+  }));
+  assert.equal(result.event_id, 11);
+  assert.deepEqual(written.map(item => [item.context, item.state]), [['clearing-label', 'success']]);
+});
+
+test('an unreadable policy publishes blocking statuses instead of stale successes', async () => {
+  const written = [];
+  const failed = [];
+  const github = {
+    paginate: async (method, params) => (await method(params)).data,
+    rest: {
+      repos: {
+        get: async () => { throw new Error('network'); },
+        listCommitStatusesForRef: async () => ({ data: [] }),
+        createCommitStatus: async params => { written.push(params); return { data: params }; },
+      },
+      pulls: {
+        get: async () => ({ data: { number: 7, state: 'open', head: { sha: 'b'.repeat(40) },
+          base: { ref: 'main' } } }),
+        list: async () => ({ data: [] }),
+      },
+    },
+  };
+  const result = await withEnvironment({ GOVERNANCE_RECORD_LABEL: 'false' }, () => main.runGate({
+    github, core: { warning() {}, setFailed: message => failed.push(message) },
+    context: { eventName: 'pull_request_target', repo: { owner: 'example-org', repo: 'example-repo' },
+      payload: { action: 'labeled', label: { name: 'agent-approved' },
+        pull_request: { number: 7, state: 'open', head: { sha: 'b'.repeat(40) }, base: { ref: 'main' } } },
+      serverUrl: 'https://github.example', runId: 9 },
+  }));
+  assert.deepEqual(result.failures, [{ number: 7, message: 'policy unavailable' }]);
+  assert.deepEqual(written.map(item => [item.context, item.state]),
+    [['pr-template', 'error'], ['ai-review', 'error'], ['risk-gate', 'error']]);
+  assert.equal(failed.length, 1);
+});
+

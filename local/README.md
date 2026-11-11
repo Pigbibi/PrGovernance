@@ -1,0 +1,136 @@
+# Local governance for private repositories
+
+The private repositories are on a plan without protected branches or secret
+scanning for private code, and hosted Actions are billing-blocked. The checks
+that public repositories get from Actions and branch protection run here as Git
+hooks instead.
+
+Nothing in this directory identifies an agent. Any agent or person with a clone
+gets the same rules.
+
+## What is checked
+
+| Hook | Refuses |
+| --- | --- |
+| `pre-commit` | staged credentials, tracked `.env`/key/keystore files |
+| `commit-msg` | headers that are not conventional, or longer than 72 characters |
+| `pre-push` | direct pushes to `main`/`master`, non-fast-forward pushes, moving or deleting an existing tag |
+
+`audit` runs the same secret and sensitive-file scan over the whole tracked tree.
+Use it before publishing a repository or after importing history.
+
+Secret rules: PEM private keys (including encrypted PKCS#8), GitHub tokens
+(classic and fine-grained), AWS access keys, Slack tokens, and quoted credential
+assignments of 16 characters or more. Quoted values may contain spaces and
+punctuation, so a word-only passphrase is reported. Placeholder values
+(`example`, `sample`, `synthetic`, `dummy`, `changeme`, `change-me`, `redacted`,
+`your_token`, `<token>`), environment references (`os.environ`, `getenv`,
+`process.env`, `secrets.`, shell `${NAME:-}` and `${NAME-word}`), shell fallbacks
+that are themselves placeholders, and `${NAME:?message}` guards are allowed. The
+exemption applies to the matched value, not to the whole line, so a hard-coded
+fallback beside `getenv` or inside a shell parameter expansion is still
+reported. Test fixtures that spell a credential generically are not exempt;
+list the test file in `ignore_paths` instead. Documentation that must quote a
+full literal lists that exact value in `allow_values`. UTF-16 text is decoded.
+A stray NUL byte does not hide a text file; dense binary content is still
+skipped.
+
+`audit` reads the committed tree (`HEAD`); `audit --staged` reads the index.
+That keeps a staged deletion from hiding a credential that is still committed.
+
+## Install in a repository
+
+Install from a trusted checkout of this repository, not from the branch being
+reviewed:
+
+```sh
+git clone https://github.com/Pigbibi/PrGovernance
+python3 PrGovernance/local/governance.py install --root <repository> \
+  --source PrGovernance/local
+```
+
+A repository that vendors `.githooks/` can instead run
+`python3 .githooks/governance.py install` once from the reviewed default branch.
+
+`install` copies the runner, the shims and a snapshot of `governance.json` into
+the common git directory (`.git/governance/`, shared by linked worktrees), makes
+them executable, and sets `core.hooksPath` to that directory for this clone.
+Hooks already configured through `core.hooksPath`, and executable hooks in the
+default hooks directory, keep running: `install` adds forwarding shims for every
+hook it does not provide itself, such as a global `prepare-commit-msg`. Only
+files named after a hook git actually runs are forwarded, so helpers kept beside
+a hook (for example `json.py`) are not copied into the hook directory, where they
+would shadow the runner's imports. Every
+linked worktree contributes its own configured hooks; if two worktrees resolve
+the same hook name to different files, `install` stops and asks for a single
+hook directory instead of dropping one. Nothing inside a worktree is forwarded,
+including symlinks that resolve there, because a contributor branch could
+replace those scripts. When `extensions.worktreeConfig` sets a per-worktree
+`core.hooksPath`, `install` updates that value too. Checking out a branch cannot
+replace an installed hook or its policy. Commit `.githooks/` so every clone has
+the source, and re-run `install` from a trusted copy whenever the policy or the
+runner changes. Each developer and each agent installs once per clone; CI cannot
+do it for them.
+
+## Commands
+
+Use the installed copy, so an untrusted branch cannot substitute its own runner:
+
+```sh
+hooks=$(git rev-parse --path-format=absolute --git-common-dir)/governance
+python3 "$hooks/governance.py" audit              # committed tree
+python3 "$hooks/governance.py" audit --staged     # whole index
+python3 "$hooks/governance.py" pre-commit
+python3 "$hooks/governance.py" commit-msg FILE
+python3 "$hooks/governance.py" pre-push           # reads ref updates on stdin
+python3 "$hooks/governance.py" verify             # installed copy matches .githooks
+```
+
+Every command exits non-zero and prints `governance: <finding>` on failure.
+
+`verify` compares the installed copy in the common git directory with the
+committed `.githooks/` source, checks that the hook scripts are executable, and
+checks that every worktree still resolves `core.hooksPath` there. A source
+without `governance.json` compares against the default policy `install` writes,
+so an optional policy file never makes a clone unverifiable. Run it after pulling a change to the
+vendored hooks, and before trusting a clone that was installed by someone else;
+a non-empty result means `install` must run again from a trusted copy.
+
+## Configuration
+
+The installed snapshot of `.githooks/governance.json` overrides the defaults:
+
+```json
+{
+  "protected_branches": ["main"],
+  "max_header": 72,
+  "commit_types": ["feat", "fix", "docs", "refactor", "test", "chore",
+                   "perf", "ci", "build", "revert"],
+  "ignore_paths": ["tests/fixtures/"],
+  "allow_values": ["Brave Web Search discovery"]
+}
+```
+
+`ignore_paths` skips a path in both the hook scan and the publication audit. An
+entry ending in `/` names a directory; anything else must match the whole path,
+so ignoring `governance.json` cannot also hide `governance.json.bak`. The
+vendored hook files need no entry because the runner and shims contain no
+credentials; ignoring all of `.githooks/` would hide a secret added beside them.
+Add a test directory only when the suite intentionally contains synthetic key
+material that cannot be spelled as a placeholder. `allow_values` exempts a
+scanned value only when the quoted literal matches it in full; it is meant for
+documentation that describes a setting, not for passphrases. Editing
+`governance.json` on a branch has no effect until someone re-installs from a
+trusted copy.
+
+## Limits
+
+- Hooks are local. `git commit --no-verify` and `git push --no-verify` skip
+  them, and a clone that never ran `install` has no hooks. The control is
+  discipline plus the publication audit, not enforcement.
+- The audit scans the current tree, not history. A credential removed from a
+  file is still in the objects; rotate it if it ever appears in a finding.
+- Review before merge still applies: open a pull request, run `audit` from the
+  installed copy on the branch, and merge only after it passes. The reviewer
+  identity rules of the public track apply unchanged; only the enforcement point
+  is local.

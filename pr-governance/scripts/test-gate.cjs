@@ -189,13 +189,15 @@ test('a clean receipt passes R1 and publishes three success statuses', () => {
   assert.match(result.evidence_sha256, /^[a-f0-9]{64}$/);
 });
 
-test('R0 prose needs no reviewer evidence but still reports a verdict', () => {
-  const result = evaluate(fixture({ path: 'README.md' }));
-  assert.equal(result.tier, 'R0');
-  assert.equal(result.allowed, true);
-  assert.equal(result.reason, 'review_not_required');
-  assert.equal(result.review.state, 'success');
-  assert.deepEqual(result.statuses.map(entry => entry.context), ['pr-template', 'ai-review', 'risk-gate']);
+test('R0 prose still needs the current-head reviewer receipt', () => {
+  const missing = evaluate(fixture({ path: 'README.md' }));
+  assert.equal(missing.tier, 'R0');
+  assert.equal(missing.allowed, false);
+  assert.equal(missing.reason, 'ai_review_pending');
+  const reviewed = evaluate(receiptMarker(fixture({ path: 'README.md' })));
+  assert.equal(reviewed.allowed, true);
+  assert.equal(reviewed.review.state, 'success');
+  assert.deepEqual(reviewed.statuses.map(entry => entry.context), ['pr-template', 'ai-review', 'risk-gate']);
 });
 
 test('R1 without any reviewer marker stays pending', () => {
