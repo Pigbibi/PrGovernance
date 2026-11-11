@@ -44,9 +44,9 @@ Install from a trusted checkout of this repository, not from the branch being
 reviewed:
 
 ```sh
-git clone https://github.com/Pigbibi/governance
-python3 governance/local/governance.py install --root <repository> \
-  --source governance/local
+git clone https://github.com/Pigbibi/PrGovernance
+python3 PrGovernance/local/governance.py install --root <repository> \
+  --source PrGovernance/local
 ```
 
 A repository that vendors `.githooks/` can instead run

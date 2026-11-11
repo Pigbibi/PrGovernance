@@ -1,7 +1,7 @@
 name: PR risk gate
 
 # Copy to .github/workflows/risk-gate.yml and replace __GOVERNANCE_REPO__ with
-# the organization's governance repository (for example Pigbibi/governance).
+# the owner's governance repository (for example Pigbibi/PrGovernance).
 # The job names in this file are the required status check contexts; keep them.
 
 on:

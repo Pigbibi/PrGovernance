@@ -2,7 +2,7 @@
 # Compare the shared governance content across the three twin repositories.
 set -eu
 
-REPOS="Pigbibi/governance GdeiAssistant/.github QuantStrategyLab/.github"
+REPOS="Pigbibi/PrGovernance GdeiAssistant/.github QuantStrategyLab/.github"
 base=$(cd "$(dirname "$0")/../.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
