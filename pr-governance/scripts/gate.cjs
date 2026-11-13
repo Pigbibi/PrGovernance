@@ -378,7 +378,12 @@ function normalizeMarker(format, payload) {
     if (typeof unresolved === 'boolean') flagged = unresolved;
     else if (Number.isSafeInteger(unresolved) && unresolved >= 0) flagged = unresolved > 0;
     const coverage = typeof review.coverage === 'string' ? review.coverage.trim().toLowerCase() : '';
-    return { commit_sha: review.commit_sha, status: 'completed', unresolved: flagged,
+    // Legacy codex-review-receipt:v1 often omits status and means completed; an
+    // explicit non-completed status must stay pending/running instead of passing.
+    const status = typeof review.status === 'string' && review.status
+      ? review.status
+      : 'completed';
+    return { commit_sha: review.commit_sha, status, unresolved: flagged,
       coverage: COMPLETE_COVERAGE.includes(coverage) ? 'complete' : 'partial', coverage_raw: coverage || null };
   }
   const unresolved = review.has_unresolved_findings;
