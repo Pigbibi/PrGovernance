@@ -1,20 +1,40 @@
 'use strict';
 
-// Posts one review request per head when the reviewer has published no receipt
-// for it. The marker is keyed to the head, so a later push gets its own request
-// without repeating this one, and a receipt already present is never overridden.
+// Posts one review request per head when no configured reviewer has published a
+// receipt for it. Dispatch mentions follow policy.review_routing; any listed
+// reviewer may still satisfy ai-review when it posts a supported marker.
 
-const CODEX_LOGIN = /^chatgpt-codex-connector(?:\[bot\])?$/;
-const RECEIPT_MARKERS = ['codex-review-state:v1', 'codex-review-receipt:v1'];
+const gate = require('./gate.cjs');
+const defaults = require('../policy.default.json');
+
 const MIN_HEAD_AGE_MS = 10 * 60 * 1000;
 const MAX_PULL_REQUESTS = 100;
 
 const marker = head => `<!-- governance-nudge:${head} -->`;
 
-function receiptFor(comments, head) {
-  return comments.some(comment => CODEX_LOGIN.test(comment.user?.login || '')
+function reviewerConfig() {
+  const raw = process.env.GOVERNANCE_REVIEWERS_JSON;
+  if (raw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('GOVERNANCE_REVIEWERS_JSON is not valid JSON');
+    }
+    if (!Array.isArray(parsed) || !parsed.length) throw new Error('GOVERNANCE_REVIEWERS_JSON must be a non-empty array');
+    const policy = { ...defaults, reviewers: parsed, reviewer: parsed[0] };
+    gate.validatePolicy(policy);
+    return { chain: gate.reviewerChain(policy), mentions: policy.review_routing?.dispatch_mentions
+      ?? defaults.review_routing?.dispatch_mentions ?? ['@codex review', '@claude review'] };
+  }
+  const policy = gate.validatePolicy(defaults);
+  return { chain: gate.reviewerChain(policy), mentions: policy.review_routing.dispatch_mentions };
+}
+
+function receiptFor(comments, head, chain) {
+  return comments.some(comment => gate.matchesAnyReviewer(comment.user, chain)
     && typeof comment.body === 'string'
-    && RECEIPT_MARKERS.some(name => comment.body.includes(name))
+    && gate.MARKER_NAMES.some(name => comment.body.includes(name))
     && comment.body.includes(head));
 }
 
@@ -33,26 +53,42 @@ async function headAge(github, repo, head) {
   }
 }
 
-async function reviewRequested(github, repo, pr, core) {
+function nudgeBody(head, mentions) {
+  const lines = [
+    ...mentions,
+    '',
+    marker(head),
+    '',
+    'This head has no AI review receipt after 10 minutes.',
+    'Dispatch order: Codex → Claude → Cursor.',
+    'If both above are unavailable, a human should comment `cursor review` or `bugbot run`',
+    '(Bugbot ignores those commands when posted by a bot or GitHub App).',
+    'Acceptable markers: `ai-review-receipt:v1`, `codex-review-state:v1`, `codex-review-receipt:v1`.',
+  ];
+  return lines.join('\n');
+}
+
+async function reviewRequested(github, repo, pr, core, config) {
   const head = pr.head?.sha;
   if (!head || pr.draft || pr.state !== 'open') return 'skipped';
   const comments = await github.paginate(github.rest.issues.listComments, {
     ...repo, issue_number: pr.number, per_page: 100,
   });
-  if (receiptFor(comments, head)) return 'reviewed';
+  if (receiptFor(comments, head, config.chain)) return 'reviewed';
   if (alreadyNudged(comments, head)) return 'nudged';
   const age = await headAge(github, repo, head);
   if (age === null || age < MIN_HEAD_AGE_MS) return 'too-new';
   await github.rest.issues.createComment({
     ...repo,
     issue_number: pr.number,
-    body: `@codex review\n\n${marker(head)}\n\nThis head has no review receipt after 10 minutes.`,
+    body: nudgeBody(head, config.mentions),
   });
   core.info(`Requested a review for #${pr.number} at ${head.slice(0, 7)}`);
   return 'requested';
 }
 
 async function run({ github, context, core }) {
+  const config = reviewerConfig();
   const repo = { owner: context.repo.owner, repo: context.repo.repo };
   let pulls;
   if (context.payload.pull_request) {
@@ -69,10 +105,10 @@ async function run({ github, context, core }) {
 
   const counts = {};
   for (const pr of pulls) {
-    const outcome = await reviewRequested(github, repo, pr, core);
+    const outcome = await reviewRequested(github, repo, pr, core, config);
     counts[outcome] = (counts[outcome] || 0) + 1;
   }
   core.info(`Review requests: ${Object.entries(counts).map(([key, value]) => `${key}=${value}`).join(' ') || 'none'}`);
 }
 
-module.exports = { run, receiptFor, alreadyNudged, marker };
+module.exports = { run, receiptFor, alreadyNudged, marker, reviewerConfig, nudgeBody };

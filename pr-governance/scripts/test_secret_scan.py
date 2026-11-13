@@ -226,6 +226,17 @@ class SecretScanTests(unittest.TestCase):
                 findings = self.detect(assignment + fake_value() + '"', filename)
                 self.assertIn('configuration-secret-value', {row['RuleID'] for row in findings})
 
+    def test_i18n_message_catalog_keys_are_not_credentials(self):
+        # Message-catalog values exceed the rule length floor and use token.* keys.
+        message = 'token.expired=登录凭证已过期，请重新登录\n'
+        for path in ('src/main/resources/i18n/messages.properties',
+                     'src/test/resources/i18n/messages.properties'):
+            with self.subTest(path=path):
+                (self.source / path).parent.mkdir(parents=True)
+                self.assertEqual(self.detect(message, path), [])
+        findings = self.detect(message, 'credentials.properties')
+        self.assertIn('configuration-secret-value', {row['RuleID'] for row in findings})
+
     def test_clean_placeholders_pass(self):
         self.assertEqual(self.detect('jwt.secret=${JWT_SECRET}\npassword=\n'
                                      'token=${LONG_TOKEN_VARIABLE}\ntoken=${_TOKEN_1}\n'

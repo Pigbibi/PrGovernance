@@ -1,8 +1,9 @@
 name: Review request
 
 # Copy to .github/workflows/codex-nudge.yml and replace __GOVERNANCE_REPO__.
-# Asks the reviewer for one review per head that has no receipt yet. It does
-# not judge the review; the risk gate remains the only pass/fail authority.
+# Nudges Codex then Claude (see policy.review_routing). Cursor Bugbot must be
+# triggered by a human (`cursor review` / `bugbot run`); bot-posted triggers are ignored.
+# Optional org var GOVERNANCE_REVIEWERS_JSON overrides reviewer identities.
 
 on:
   schedule:
@@ -26,5 +27,7 @@ jobs:
     steps:
       - name: Request
         uses: __GOVERNANCE_REPO__/pr-governance@__GOVERNANCE_SHA__
+        env:
+          GOVERNANCE_REVIEWERS_JSON: ${{ vars.GOVERNANCE_REVIEWERS_JSON }}
         with:
           mode: nudge
