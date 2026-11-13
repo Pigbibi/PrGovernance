@@ -36,6 +36,19 @@ function configuredReviewer() {
   return { provider: process.env.GOVERNANCE_REVIEWER_PROVIDER || 'codex', app_id: app, user_id: user, login };
 }
 
+function configuredReviewers() {
+  const raw = process.env.GOVERNANCE_REVIEWERS_JSON;
+  if (!raw) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('GOVERNANCE_REVIEWERS_JSON is not valid JSON');
+  }
+  if (!Array.isArray(parsed) || !parsed.length) throw new Error('GOVERNANCE_REVIEWERS_JSON must be a non-empty array');
+  return parsed;
+}
+
 async function defaultBranch(github, context) {
   const known = context.payload?.repository?.default_branch
     || context.payload?.pull_request?.base?.ref;
@@ -62,8 +75,17 @@ async function loadPolicy(github, context, branch) {
   }
   const owner = configuredOwner();
   if (owner) policy.owner = owner;
-  const reviewer = configuredReviewer();
-  if (reviewer) policy.reviewer = reviewer;
+  const reviewers = configuredReviewers();
+  if (reviewers) {
+    policy.reviewers = reviewers;
+    policy.reviewer = reviewers[0];
+  } else {
+    const reviewer = configuredReviewer();
+    if (reviewer) {
+      policy.reviewer = reviewer;
+      policy.reviewers = [reviewer];
+    }
+  }
   gate.validatePolicy(policy);
   // Without an owner nobody can ever satisfy owner-approved, so a missing
   // configuration must fail the check instead of silently downgrading it.

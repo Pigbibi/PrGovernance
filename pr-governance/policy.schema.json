@@ -39,7 +39,9 @@
       "properties": {
         "provider": {
           "enum": [
-            "codex"
+            "claude",
+            "codex",
+            "cursor"
           ]
         },
         "app_id": {
@@ -53,6 +55,61 @@
         "login": {
           "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\[bot\\]$"
+        }
+      }
+    },
+    "reviewers": {
+      "description": "Ordered reviewer identities. reviewers[0] must match reviewer. Any listed identity may satisfy ai-review on the current head.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "app_id",
+          "user_id",
+          "login"
+        ],
+        "properties": {
+          "provider": {
+            "enum": [
+              "claude",
+              "codex",
+              "cursor"
+            ]
+          },
+          "app_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "user_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "login": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\[bot\\]$"
+          }
+        }
+      }
+    },
+    "review_routing": {
+      "description": "Dispatch-only hints for the scheduled review nudge; they do not weaken ai-review evidence rules.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dispatch_mentions"
+      ],
+      "properties": {
+        "dispatch_mentions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },

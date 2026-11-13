@@ -1,8 +1,9 @@
 # Organization PR governance
 
 One action and four caller workflows shared by every public repository in the
-organization. The reviewer is Codex; the coding agent may be anything. No
-workflow identifies or depends on the agent that wrote a pull request.
+organization. AI review accepts receipts from **Codex → Claude → Cursor** (in
+dispatch order); the coding agent may be anything. No workflow identifies or
+depends on the agent that wrote a pull request.
 
 ## What is enforced
 
@@ -10,9 +11,10 @@ A pull request may merge when all of these hold:
 
 - `pr-template` — the body fills the AI assistance, what changed and how
   verified sections.
-- `ai-review` — the newest Codex receipt names the current head, reports a
-  completed review, has no unresolved finding, and the head contains the
-  current base head.
+- `ai-review` — the newest receipt from a configured reviewer bot names the
+  current head, reports a completed review, has no unresolved finding, and the
+  head contains the current base head. Supported markers:
+  `ai-review-receipt:v1`, `codex-review-receipt:v1`, `codex-review-state:v1`.
 - `risk-gate` — the resolved risk tier allows the path. Low risk passes on the
   reviewer receipt. High risk also needs one clearing label that was recorded
   on this exact head.
@@ -71,7 +73,9 @@ organization community-health files.
    variables and replaces `owner` when they are set. A repository whose content
    rules keep accounts out of public source may also leave `reviewer` out and
    set `RISK_GATE_REVIEWER_APP_ID`, `RISK_GATE_REVIEWER_USER_ID` and
-   `RISK_GATE_REVIEWER_LOGIN` instead; a partial set fails closed.
+   `RISK_GATE_REVIEWER_LOGIN` instead; or set organization variable
+   `GOVERNANCE_REVIEWERS_JSON` to the full ordered chain (see
+   `reviewers.example.json`). A partial set fails closed.
 2. Copy `templates/risk-gate.yml`, `templates/codex-nudge.yml`,
    `templates/gitleaks.yml` and `templates/weekly-secret-scan.yml` into
    `.github/workflows/`, replacing `__GOVERNANCE_REPO__` with the
