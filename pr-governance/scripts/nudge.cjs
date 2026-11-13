@@ -12,6 +12,25 @@ const MAX_PULL_REQUESTS = 100;
 
 const marker = head => `<!-- governance-nudge:${head} -->`;
 
+function dispatchMentions(policy) {
+  const raw = process.env.GOVERNANCE_DISPATCH_MENTIONS_JSON;
+  if (raw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('GOVERNANCE_DISPATCH_MENTIONS_JSON is not valid JSON');
+    }
+    if (!Array.isArray(parsed) || !parsed.length || parsed.some(item => typeof item !== 'string' || !item)) {
+      throw new Error('GOVERNANCE_DISPATCH_MENTIONS_JSON must be a non-empty string array');
+    }
+    return parsed;
+  }
+  return policy.review_routing?.dispatch_mentions
+    ?? defaults.review_routing?.dispatch_mentions
+    ?? ['@codex review', '@claude review'];
+}
+
 function reviewerConfig() {
   const raw = process.env.GOVERNANCE_REVIEWERS_JSON;
   if (raw) {
@@ -24,11 +43,10 @@ function reviewerConfig() {
     if (!Array.isArray(parsed) || !parsed.length) throw new Error('GOVERNANCE_REVIEWERS_JSON must be a non-empty array');
     const policy = { ...defaults, reviewers: parsed, reviewer: parsed[0] };
     gate.validatePolicy(policy);
-    return { chain: gate.reviewerChain(policy), mentions: policy.review_routing?.dispatch_mentions
-      ?? defaults.review_routing?.dispatch_mentions ?? ['@codex review', '@claude review'] };
+    return { chain: gate.reviewerChain(policy), mentions: dispatchMentions(policy) };
   }
   const policy = gate.validatePolicy(defaults);
-  return { chain: gate.reviewerChain(policy), mentions: policy.review_routing.dispatch_mentions };
+  return { chain: gate.reviewerChain(policy), mentions: dispatchMentions(policy) };
 }
 
 function receiptFor(comments, head, chain) {
@@ -111,4 +129,4 @@ async function run({ github, context, core }) {
   core.info(`Review requests: ${Object.entries(counts).map(([key, value]) => `${key}=${value}`).join(' ') || 'none'}`);
 }
 
-module.exports = { run, receiptFor, alreadyNudged, marker, reviewerConfig, nudgeBody };
+module.exports = { run, receiptFor, alreadyNudged, marker, reviewerConfig, nudgeBody, dispatchMentions };

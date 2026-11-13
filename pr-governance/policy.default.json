@@ -7,26 +7,6 @@
     "user_id": 199175422,
     "login": "chatgpt-codex-connector[bot]"
   },
-  "reviewers": [
-    {
-      "provider": "codex",
-      "app_id": 1144995,
-      "user_id": 199175422,
-      "login": "chatgpt-codex-connector[bot]"
-    },
-    {
-      "provider": "claude",
-      "app_id": 1236702,
-      "user_id": 209825114,
-      "login": "claude[bot]"
-    },
-    {
-      "provider": "cursor",
-      "app_id": 1210556,
-      "user_id": 206951365,
-      "login": "cursor[bot]"
-    }
-  ],
   "review_routing": {
     "dispatch_mentions": [
       "@codex review",

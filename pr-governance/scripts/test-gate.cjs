@@ -31,7 +31,8 @@ test('the shipped default policy validates', () => {
   assert.equal(shipped.version, 'pr-governance/v3');
   assert.equal(shipped.mode, 'enforce');
   assert.equal(shipped.reviewer.provider, 'codex');
-  assert.equal(shipped.reviewers.length, 3);
+  assert.equal(shipped.reviewers, undefined);
+  assert.equal(shipped.review_routing.dispatch_mentions[0], '@codex review');
 });
 
 test('the owner is optional and resolved from protected variables', () => {
@@ -386,21 +387,23 @@ test('the mode is carried into the result without changing the verdict', () => {
   }
 });
 
-test('a fallback codex receipt satisfies ai-review', () => {
+test('a fallback claude receipt satisfies ai-review when configured', () => {
   const f = fixture();
-  const codex = f.policy.reviewers.find(entry => entry.provider === 'codex');
+  const claude = { provider: 'claude', app_id: 1236702, user_id: 209825114, login: 'claude[bot]' };
+  f.policy.reviewers = [f.policy.reviewer, claude];
   rawComment(f, `<!-- codex-review-state:v1 ${JSON.stringify({
     code_review: { commit_sha: HEAD, status: 'completed', has_unresolved_findings: false },
     security_review: {},
-  })} -->`, { user: { id: codex.user_id, login: codex.login, type: 'Bot' } });
+  })} -->`, { user: { id: claude.user_id, login: claude.login, type: 'Bot' } });
   const result = evaluate(f);
   assert.equal(result.review.state, 'success');
-  assert.equal(result.review.provider, 'codex');
+  assert.equal(result.review.provider, 'claude');
 });
 
 test('ai-review-receipt is accepted from any configured reviewer', () => {
   const f = fixture();
-  const cursor = f.policy.reviewers.find(entry => entry.provider === 'cursor');
+  const cursor = { provider: 'cursor', app_id: 1210556, user_id: 206951365, login: 'cursor[bot]' };
+  f.policy.reviewers = [f.policy.reviewer, cursor];
   rawComment(f, `<!-- ai-review-receipt:v1 ${JSON.stringify({
     review: { provider: 'cursor', commit_sha: HEAD, coverage: 'complete', unresolved_findings: false },
   })} -->`, { user: { id: cursor.user_id, login: cursor.login, type: 'Bot' } });
