@@ -400,6 +400,19 @@ test('a fallback claude receipt satisfies ai-review when configured', () => {
   assert.equal(result.review.provider, 'claude');
 });
 
+
+test('an in-progress ai-review-receipt stays pending', () => {
+  const f = fixture();
+  const cursor = { provider: 'cursor', app_id: 1210556, user_id: 206951365, login: 'cursor[bot]' };
+  f.policy.reviewers = [f.policy.reviewer, cursor];
+  rawComment(f, `<!-- ai-review-receipt:v1 ${JSON.stringify({
+    review: { provider: 'cursor', commit_sha: HEAD, coverage: 'complete', unresolved_findings: false, status: 'in_progress' },
+  })} -->`, { user: { id: cursor.user_id, login: cursor.login, type: 'Bot' } });
+  const result = evaluate(f);
+  assert.equal(result.review.state, 'pending');
+  assert.equal(result.review.reason, 'review_running');
+});
+
 test('ai-review-receipt is accepted from any configured reviewer', () => {
   const f = fixture();
   const cursor = { provider: 'cursor', app_id: 1210556, user_id: 206951365, login: 'cursor[bot]' };
