@@ -47,7 +47,8 @@ for name in $repos; do
   fi
   merged=$(printf '%s\n%s\n' "$existing" "$BASE_CONTEXTS" | awk 'NF && !seen[$0]++')
   contexts_json=$(printf '%s\n' "$merged" | jq -R . | jq -s .)
-  strict=$(gh api "repos/$full/branches/$default/protection/required_status_checks" --jq '.strict // true')
+  strict=$(gh api "repos/$full/branches/$default/protection/required_status_checks" \
+    --jq 'if .strict == null then true else .strict end')
   payload=$(jq -nc --argjson contexts "$contexts_json" --argjson strict "$strict" \
     '{strict:$strict, contexts:$contexts}')
   # Status-checks endpoint only: leave required reviews and restrictions untouched.
