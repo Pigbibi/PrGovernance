@@ -6,7 +6,7 @@ const { run, marker } = require('./nudge.cjs');
 const defaults = require('../policy.default.json');
 
 const HEAD = 'a'.repeat(40);
-const codex = defaults.reviewers.find(entry => entry.provider === 'codex');
+const codex = defaults.reviewer;
 const OLD = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 const core = { info() {} };
 
