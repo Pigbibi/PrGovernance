@@ -11,6 +11,11 @@ ai-review'
 repos=$(gh api 'users/Pigbibi/repos?per_page=100&type=owner' --jq '.[] | select(.private==false and .archived==false) | .name')
 
 for name in $repos; do
+  # Hub repos only publish governance unit tests, not consumer risk-gate statuses.
+  if [ "$name" = "PrGovernance" ]; then
+    echo "skip (hub): Pigbibi/$name"
+    continue
+  fi
   full="Pigbibi/$name"
   default=$(gh api "repos/$full" --jq .default_branch)
   if ! gh api "repos/$full/branches/$default/protection" &>/dev/null; then
