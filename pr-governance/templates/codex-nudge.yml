@@ -29,5 +29,6 @@ jobs:
         uses: __GOVERNANCE_REPO__/pr-governance@__GOVERNANCE_SHA__
         env:
           GOVERNANCE_REVIEWERS_JSON: ${{ vars.GOVERNANCE_REVIEWERS_JSON }}
+          GOVERNANCE_DISPATCH_MENTIONS_JSON: ${{ vars.GOVERNANCE_DISPATCH_MENTIONS_JSON }}
         with:
           mode: nudge

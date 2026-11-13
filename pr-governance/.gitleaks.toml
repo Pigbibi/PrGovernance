@@ -51,9 +51,14 @@ paths = ['''^tests/''']
 regexes = ['''(?i)^(?:test|fake|dummy|example)[_.-][a-z0-9_.-]+$''']
 
 [[rules.allowlists]]
-description = "i18n message catalogs only: keys may use token/password wording for UX copy, not credentials"
+description = "i18n message catalogs only: localization keys may use token/password wording for UX copy"
+condition = "AND"
+regexTarget = "secret"
 paths = [
   '''(?:^|/)src/(?:main|test)/resources/i18n/''',
+]
+regexes = [
+  '''(?i)^[a-z0-9_.-]*(?:token|password|secret|credential)[a-z0-9_.-]*$''',
 ]
 
 [[allowlists]]
