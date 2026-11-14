@@ -200,8 +200,26 @@ class SecretTests(unittest.TestCase):
         files = [changed("app.py", '+key = "ghp_' + "x" * 36 + '"\n')]
         self.assertEqual(gate.scan_secrets(files), [])
 
+    def test_triple_plus_added_line_is_still_scanned(self):
+        files = [changed("app.py", '+++key = "ghp_' + "a" * 36 + '"\n')]
+        self.assertTrue(gate.scan_secrets(files))
+
 
 class DiffCompletenessTests(unittest.TestCase):
+    def test_complete_patch_validates_line_counts_and_types(self):
+        valid = {"filename": "a.py", "status": "modified", "additions": 1, "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"}
+        self.assertTrue(gate.complete_patch(valid))
+        renamed = {"filename": "b.py", "status": "renamed", "additions": 0, "deletions": 0, "patch": ""}
+        self.assertTrue(gate.complete_patch(renamed))
+        for bad in (
+            {"filename": "a.py", "status": "modified", "additions": 2, "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"},
+            {"filename": "a.py", "status": "modified", "additions": 0, "deletions": 0, "patch": ""},
+            {"filename": "a.py", "status": "modified", "additions": True, "deletions": 0, "patch": "@@ -1 +1 @@\n"},
+            {"filename": "a.py", "status": "modified", "additions": -1, "deletions": 0, "patch": "+x\n"},
+        ):
+            with self.subTest(bad=bad):
+                self.assertFalse(gate.complete_patch(bad))
+                self.assertEqual(gate.unscanned_text([bad]), ["a.py"])
     def test_text_change_without_a_patch_is_refused(self):
         files = [changed("sources/wechat/reader.py")]
         self.assertEqual(gate.unscanned_text(files), ["sources/wechat/reader.py"])
@@ -559,7 +577,7 @@ class DirectPushAuditTests(unittest.TestCase):
         return {"user": {"login": "synthetic-owner"},
                 "body": "<!-- governance-verdict:v1 " + json.dumps(verdict) + " -->"}
 
-    def run_audit(self, chain, policy=None, strict_direct=False, details=None, attributed=()):
+    def run_audit(self, chain, policy=None, strict_direct=False, details=None, attributed=(), related_pulls=None):
         base = {"owner_login": "synthetic-owner", "audit_since": "", "audit_ignore_prs": []}
         base.update(policy or {})
         pull = {
@@ -570,6 +588,7 @@ class DirectPushAuditTests(unittest.TestCase):
         }
         details = details or {}
         attributed = set(attributed)
+        related_pulls = related_pulls or {}
 
         def fake_request(method, path, body=None, params=None, allow=()):
             if path == "/repos/o/r":
@@ -580,9 +599,11 @@ class DirectPushAuditTests(unittest.TestCase):
                 return chain
             if path.startswith("/repos/o/r/commits/") and path.endswith("/pulls"):
                 sha = path.rsplit("/", 2)[-2]
+                if sha in related_pulls:
+                    return related_pulls[sha]
                 # Only the shas named here have a merged pull request attached;
                 # everything else asks the entry and gets nothing back.
-                return [{"merged_at": self.DATE}] if sha in attributed else []
+                return [{"merged_at": self.DATE, "base": {"ref": "main"}}] if sha in attributed else []
             if path.startswith("/repos/o/r/commits/"):
                 return details.get(path.rsplit("/", 1)[-1])
             return []
@@ -608,6 +629,14 @@ class DirectPushAuditTests(unittest.TestCase):
                  self.commit(self.PREV, (), "docs: earlier merged pull request")]
         code, _ = self.run_audit(chain, attributed={self.PREV})
         self.assertEqual(code, 0)
+
+    def test_pull_merged_to_non_default_branch_does_not_exempt_direct_push(self):
+        chain = [self.commit(self.TIP, (self.PREV,), "feat: via pull request"),
+                 self.commit(self.PREV, (), "docs: merged onto release branch only")]
+        related = {self.PREV: [{"merged_at": self.DATE, "base": {"ref": "release"}}]}
+        code, output = self.run_audit(chain, related_pulls=related)
+        self.assertEqual(code, 2)
+        self.assertIn(f"violation: {self.PREV[:7]} on main is not associated", output)
 
     def test_commits_outside_the_first_parent_chain_are_not_audited(self):
         chain = [self.commit(self.TIP, (self.DIRECT,), "feat: via pull request"),
@@ -995,6 +1024,489 @@ class AiReviewReceiptTests(unittest.TestCase):
             updated_at="2026-11-14T10:00:00Z",
         )
         self.assertEqual(self.verdict([newer_good, newer_bad])[0], "failure")
+
+    def test_receipt_markers_require_explicit_complete_coverage(self):
+        for marker, login, provider in (
+            ("ai-review-receipt:v1", "claude[bot]", "claude"),
+            ("codex-review-receipt:v1", "chatgpt-codex-connector[bot]", "codex"),
+        ):
+            for bad_cov in ("__ABSENT__", None, "", "   ", 123, True, "partial"):
+                with self.subTest(marker=marker, coverage=bad_cov):
+                    review = {
+                        "provider": provider,
+                        "commit_sha": self.HEAD,
+                        "status": "completed",
+                        "unresolved_findings": 0,
+                    }
+                    if bad_cov != "__ABSENT__":
+                        review["coverage"] = bad_cov
+                    comment = self.comment(login, marker, {"review": review})
+                    state, note = self.verdict([comment])
+                    self.assertEqual(state, "failure")
+                    self.assertIn("coverage", note)
+
+    def test_legacy_codex_state_v1_defaults_missing_or_null_coverage_only(self):
+        for cov in ("__ABSENT__", None, "complete"):
+            with self.subTest(cov=cov):
+                code_review = {
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "has_unresolved_findings": False,
+                }
+                if cov != "__ABSENT__":
+                    code_review["coverage"] = cov
+                comment = self.comment(
+                    "chatgpt-codex-connector[bot]",
+                    "codex-review-state:v1",
+                    {"code_review": code_review},
+                )
+                self.assertEqual(self.verdict([comment])[0], "success")
+        for bad_cov in ("", "partial", 1):
+            with self.subTest(bad_cov=bad_cov):
+                comment = self.comment(
+                    "chatgpt-codex-connector[bot]",
+                    "codex-review-state:v1",
+                    {
+                        "code_review": {
+                            "commit_sha": self.HEAD,
+                            "status": "completed",
+                            "has_unresolved_findings": False,
+                            "coverage": bad_cov,
+                        }
+                    },
+                )
+                self.assertEqual(self.verdict([comment])[0], "failure")
+
+    def test_unresolved_rejects_malformed_booleans_and_disagreements(self):
+        for bad_review in (
+            {"has_unresolved_findings": "false"},
+            {"has_unresolved_findings": 0},
+            {"has_unresolved_findings": 1},
+            {"unresolved_findings": 1.5},
+            {"has_unresolved_findings": False, "unresolved_findings": 1},
+            {"has_unresolved_findings": True, "unresolved_findings": 0},
+            {"has_unresolved_findings": False, "unresolved_findings": "0"},
+        ):
+            with self.subTest(bad_review=bad_review):
+                self.assertIsNone(gate._receipt_unresolved(bad_review))
+                comment = self.comment(
+                    "claude[bot]",
+                    "ai-review-receipt:v1",
+                    {
+                        "review": {
+                            "provider": "claude",
+                            "commit_sha": self.HEAD,
+                            "status": "completed",
+                            "coverage": "complete",
+                            **bad_review,
+                        }
+                    },
+                )
+                state, note = self.verdict([comment])
+                self.assertEqual(state, "failure")
+                self.assertIn("findings state", note)
+        self.assertFalse(gate._receipt_unresolved({"has_unresolved_findings": False, "unresolved_findings": 0}))
+        self.assertTrue(gate._receipt_unresolved({"has_unresolved_findings": True, "unresolved_findings": 2}))
+
+    def test_provider_login_and_marker_binding(self):
+        wrong_marker = self.comment(
+            "claude[bot]",
+            "codex-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+        )
+        self.assertEqual(self.verdict([wrong_marker])[0], "pending")
+
+        mismatched_provider = self.comment(
+            "claude[bot]",
+            "ai-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "codex",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+        )
+        state, note = self.verdict([mismatched_provider])
+        self.assertEqual(state, "failure")
+        self.assertIn("match", note)
+
+        codex_user_login = self.comment(
+            "chatgpt-codex-connector",
+            "codex-review-state:v1",
+            {
+                "code_review": {
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "has_unresolved_findings": False,
+                }
+            },
+        )
+        with mock.patch.object(gate, "paginate", return_value=[codex_user_login]):
+            self.assertEqual(gate.codex_verdict("o/r", 7, self.HEAD)[0], "success")
+
+    def test_codex_verdict_enforces_codex_only_when_other_providers_approve(self):
+        claude_only = self.comment(
+            "claude[bot]",
+            "ai-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+        )
+        with mock.patch.object(gate, "paginate", return_value=[claude_only]):
+            self.assertEqual(gate.codex_verdict("o/r", 7, self.HEAD)[0], "pending")
+            self.assertEqual(
+                gate.ai_review_verdict("o/r", 7, self.HEAD, allowed_providers={"codex", "claude"})[0],
+                "success",
+            )
+
+    def test_unresolved_finding_on_head_cannot_be_masked_by_newer_clean_provider(self):
+        codex_bad = self.comment(
+            "chatgpt-codex-connector[bot]",
+            "codex-review-state:v1",
+            {
+                "code_review": {
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "has_unresolved_findings": True,
+                }
+            },
+            updated_at="2026-11-14T08:00:00Z",
+        )
+        claude_good = self.comment(
+            "claude[bot]",
+            "ai-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+            updated_at="2026-11-14T09:00:00Z",
+        )
+        with mock.patch.object(gate, "paginate", return_value=[codex_bad, claude_good]):
+            state, note = gate.ai_review_verdict(
+                "o/r", 7, self.HEAD, allowed_providers={"codex", "claude", "cursor"}
+            )
+        self.assertEqual(state, "failure")
+        self.assertIn("unresolved findings", note)
+
+        cursor_malformed = self.comment(
+            "cursor[bot]",
+            "ai-review-receipt:v1",
+            "{not valid json}",
+            updated_at="2026-11-14T10:00:00Z",
+        )
+        with mock.patch.object(gate, "paginate", return_value=[claude_good, cursor_malformed]):
+            self.assertEqual(
+                gate.ai_review_verdict(
+                    "o/r", 7, self.HEAD, allowed_providers={"codex", "claude", "cursor"}
+                )[0],
+                "error",
+            )
+
+        older_malformed = self.comment(
+            "cursor[bot]",
+            "ai-review-receipt:v1",
+            "{not valid json}",
+            updated_at="2026-11-14T07:00:00Z",
+        )
+        with mock.patch.object(gate, "paginate", return_value=[older_malformed, claude_good]):
+            self.assertEqual(
+                gate.ai_review_verdict(
+                    "o/r", 7, self.HEAD, allowed_providers={"codex", "claude", "cursor"}
+                )[0],
+                "success",
+            )
+
+    def test_old_commit_incomplete_receipt_does_not_block_newer_clean_head_receipt(self):
+        old_pending = self.comment(
+            "chatgpt-codex-connector[bot]",
+            "codex-review-state:v1",
+            {
+                "code_review": {
+                    "commit_sha": "e" * 40,
+                    "status": "in_progress",
+                    "has_unresolved_findings": False,
+                }
+            },
+            updated_at="2026-11-14T08:00:00Z",
+        )
+        claude_good = self.comment(
+            "claude[bot]",
+            "ai-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+            updated_at="2026-11-14T09:00:00Z",
+        )
+        with mock.patch.object(gate, "paginate", return_value=[old_pending, claude_good]):
+            self.assertEqual(
+                gate.ai_review_verdict(
+                    "o/r", 7, self.HEAD, allowed_providers={"codex", "claude"}
+                )[0],
+                "success",
+            )
+
+    def test_policy_review_providers_preserves_codex_required_contract(self):
+        self.assertEqual(gate.policy_review_providers({}), {"codex"})
+        self.assertEqual(
+            gate.policy_review_providers({"codex_required": True, "ai_review_providers": ["claude"]}),
+            {"codex"},
+        )
+        self.assertEqual(gate.policy_review_providers({"codex_required": False}), set())
+        self.assertEqual(
+            gate.policy_review_providers(
+                {"codex_required": False, "ai_review_providers": ["codex", "Claude", "cursor", "unknown"]}
+            ),
+            {"codex", "claude", "cursor"},
+        )
+
+
+class ClearingLabelTests(unittest.TestCase):
+    HEAD = "a" * 40
+
+    def pull(self, labels, head_repo="o/r"):
+        return {
+            "number": 7,
+            "labels": [{"name": name} for name in labels],
+            "head": {"sha": self.HEAD, "ref": "feat/test", "repo": {"full_name": head_repo}},
+        }
+
+    def test_legacy_three_arg_live_label_allows_non_owner_agent_only(self):
+        events = [
+            {"event": "labeled", "label": {"name": "owner-approved"}, "actor": {"login": "intruder"}},
+            {"event": "labeled", "label": {"name": "agent-approved"}, "actor": {"login": "codex-bot"}},
+        ]
+        with mock.patch.object(gate, "paginate", return_value=events):
+            self.assertEqual(gate.live_label("o/r", 7, "owner-login"), "agent-approved")
+
+        both_valid = [
+            {"event": "labeled", "label": {"name": "agent-approved"}, "actor": {"login": "codex-bot"}},
+            {"event": "labeled", "label": {"name": "owner-approved"}, "actor": {"login": "owner-login"}},
+        ]
+        with mock.patch.object(gate, "paginate", return_value=both_valid):
+            self.assertEqual(gate.live_label("o/r", 7, "owner-login"), "owner-approved")
+
+    def test_timeline_commit_or_push_clears_earlier_clearing_labels(self):
+        pull = self.pull(["owner-approved"])
+        timeline = [
+            {
+                "id": 101,
+                "event": "labeled",
+                "label": {"name": "owner-approved"},
+                "actor": {"login": "owner-login"},
+                "created_at": "2026-11-14T08:00:00Z",
+            },
+            {"event": "committed", "created_at": "2026-11-14T08:05:00Z"},
+        ]
+        with mock.patch.object(gate, "paginate", return_value=timeline):
+            self.assertIsNone(gate.live_label("o/r", 7, "owner-login", pull=pull))
+
+    def test_clearing_label_status_accepts_non_owner_agent_on_exact_head(self):
+        pull = self.pull(["agent-approved"])
+        timeline = [
+            {
+                "id": 202,
+                "event": "labeled",
+                "label": {"name": "agent-approved"},
+                "actor": {"login": "review-agent"},
+                "created_at": "2026-11-14T08:10:00Z",
+            }
+        ]
+        statuses = [
+            {
+                "context": "clearing-label",
+                "state": "success",
+                "creator": {"login": gate.ACTIONS_BOT},
+                "description": "agent-approved for PR 7 at event 202 on this head",
+            }
+        ]
+
+        def fake_paginate(path, params=None):
+            if path.endswith("/timeline"):
+                return timeline
+            if path.endswith("/statuses"):
+                return statuses
+            raise AssertionError(f"Unexpected paginate call: {path}")
+
+        with mock.patch.object(gate, "paginate", fake_paginate):
+            self.assertEqual(gate.live_label("o/r", 7, "owner-login", pull=pull), "agent-approved")
+
+    def test_activity_fallback_verifies_head_and_rejects_push_after_label_or_fork(self):
+        pull = self.pull(["agent-approved"])
+        timeline = [
+            {
+                "id": 303,
+                "event": "labeled",
+                "label": {"name": "agent-approved"},
+                "actor": {"login": "review-agent"},
+                "created_at": "2026-11-14T08:10:00Z",
+            }
+        ]
+
+        def run_with_activity(activity_list, test_pull=pull):
+            def fake_paginate(path, params=None):
+                if path.endswith("/timeline"):
+                    return timeline
+                if path.endswith("/statuses"):
+                    return []
+                if path.endswith("/activity"):
+                    return activity_list
+                raise AssertionError(f"Unexpected paginate call: {path}")
+
+            with mock.patch.object(gate, "paginate", fake_paginate):
+                return gate.live_label("o/r", 7, "owner-login", pull=test_pull)
+
+        self.assertEqual(
+            run_with_activity(
+                [
+                    {"activity_type": "push", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00+00:00"},
+                    {"activity_type": "push", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00Z"},
+                ]
+            ),
+            "agent-approved",
+        )
+        self.assertIsNone(
+            run_with_activity(
+                [{"activity_type": "force_push", "after": self.HEAD, "timestamp": "2026-11-14T08:12:00Z"}]
+            )
+        )
+        self.assertIsNone(
+            run_with_activity(
+                [{"activity_type": "push", "after": "b" * 40, "timestamp": "2026-11-14T08:05:00Z"}]
+            )
+        )
+        self.assertIsNone(
+            run_with_activity(
+                [{"activity_type": "push", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00Z"}],
+                test_pull=self.pull(["agent-approved"], head_repo="fork/r"),
+            )
+        )
+
+
+class EvaluatePolicyTests(unittest.TestCase):
+    HEAD = "a" * 40
+    BASE = "c" * 40
+
+    def test_evaluate_and_revalidate_respect_codex_required_and_ai_review_providers(self):
+        pull = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": self.HEAD, "ref": "feat/x", "repo": {"full_name": "o/r"}},
+            "base": {"ref": "main"},
+            "user": {"login": "contributor"},
+            "changed_files": 1,
+            "body": "",
+            "labels": [],
+        }
+        truncated = {
+            "filename": "app.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "patch": "@@ -1 +1 @@\n+one\n",
+        }
+        claude_comment = {
+            "user": {"login": "claude[bot]"},
+            "updated_at": "2026-11-14T09:00:00Z",
+            "body": '<!-- ai-review-receipt:v1 {"review":{"provider":"claude","commit_sha":"'
+            + self.HEAD
+            + '","status":"completed","unresolved_findings":0,"coverage":"complete"}} -->',
+        }
+
+        def run_eval(policy, file_entry):
+            with mock.patch.object(gate, "request", side_effect=lambda m, p, **k: (
+                pull if p == "/repos/o/r/pulls/7" else {"default_branch": "main"} if p == "/repos/o/r" else None
+            )), \
+                 mock.patch.object(gate, "load_policy", return_value=policy), \
+                 mock.patch.object(gate, "verify_script", return_value=None), \
+                 mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
+                 mock.patch.object(gate, "shared_head", return_value=False), \
+                 mock.patch.object(gate, "base_action_files", return_value=set()), \
+                 mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: (
+                     [file_entry] if p.endswith("/files") else [claude_comment] if p.endswith("/comments") else []
+                 )), \
+                 mock.patch.object(gate, "check_results", return_value=([], [], [], [])):
+                return gate.evaluate("o/r", 7)
+
+        strict_policy = {
+            "codex_required": True,
+            "ai_review_providers": ["claude"],
+            "required_checks": ["test"],
+            "_source": "main",
+            "_sha256": "p1",
+        }
+        complete_file = {**truncated, "additions": 1, "changes": 1}
+        strict_verdict, _ = run_eval(strict_policy, complete_file)
+        self.assertEqual(strict_verdict["verdict"], "fail")
+        self.assertEqual(strict_verdict["review_providers"], ["codex"])
+
+        multi_policy = {
+            "codex_required": False,
+            "ai_review_providers": ["codex", "claude"],
+            "required_checks": ["test"],
+            "_source": "main",
+            "_sha256": "p2",
+        }
+        multi_verdict, _ = run_eval(multi_policy, complete_file)
+        self.assertEqual(multi_verdict["verdict"], "pass")
+        self.assertEqual(multi_verdict["review_providers"], ["claude", "codex"])
+
+        trunc_verdict, _ = run_eval(multi_policy, truncated)
+        self.assertEqual(trunc_verdict["verdict"], "fail")
+        self.assertEqual(trunc_verdict["unscanned"], ["app.py"])
+
+        with mock.patch.object(gate, "request", return_value=pull), \
+             mock.patch.object(gate, "load_policy", return_value=multi_policy), \
+             mock.patch.object(gate, "verify_script", return_value=None), \
+             mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
+             mock.patch.object(gate, "shared_head", return_value=False), \
+             mock.patch.object(gate, "paginate", return_value=[claude_comment]), \
+             mock.patch.object(gate, "check_results", return_value=([], [], [], [])):
+            reval = {
+                "repo": "o/r",
+                "pr": 7,
+                "head_sha": self.HEAD,
+                "base_ref": "main",
+                "policy_ref": "main",
+                "base_sha": self.BASE,
+                "tier": "T1",
+                "codex": "success",
+                "review_providers": ["claude", "codex"],
+                "required_checks": ["test"],
+                "bootstrap": False,
+                "body_sha256": gate.hashlib.sha256(b"").hexdigest(),
+                "policy_sha256": "p2",
+            }
+            gate.revalidate("o/r", reval)
 
 
 if __name__ == "__main__":

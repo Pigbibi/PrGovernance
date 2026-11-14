@@ -48,9 +48,14 @@ RECEIPT_MARKERS = (
     re.compile(r"<!--\s*codex-review-receipt:v1\s*(\{(?:(?!-->)[\s\S])*\})\s*-->"),
     re.compile(r"<!--\s*codex-review-state:v1\s*(\{(?:(?!-->)[\s\S])*\})\s*-->"),
 )
-REVIEWER_LOGINS = re.compile(
-    r"^(?:claude\[bot\]|chatgpt-codex-connector(?:\[bot\])?|cursor\[bot\])$"
-)
+COMPLETE_COVERAGE = {"complete", "completed", "full", "reported_complete", "all"}
+ALL_REVIEW_PROVIDERS = {"codex", "claude", "cursor"}
+REVIEWER_PROVIDERS: dict[str, tuple[str, tuple[int, ...]]] = {
+    "chatgpt-codex-connector": ("codex", (0, 1, 2)),
+    "chatgpt-codex-connector[bot]": ("codex", (0, 1, 2)),
+    "claude[bot]": ("claude", (0,)),
+    "cursor[bot]": ("cursor", (0,)),
+}
 ACTION_PIN = re.compile(r"^\s*-?\s*uses\s*:")
 ACTION_TARGET = re.compile(
     r"^\s*-?\s*uses\s*:\s*[\"']?([^@\"'\s]+)@([0-9a-f]{40})[\"']?\s*(?:#.*)?$"
@@ -363,7 +368,9 @@ def scan_secrets(files: list[dict[str, Any]]) -> list[str]:
         if not isinstance(patch, str):
             continue
         for line in patch.splitlines():
-            if not line.startswith("+") or line.startswith("+++"):
+            # GitHub's files endpoint omits ---/+++ diff headers, so a line
+            # starting with +++ is an added line beginning with ++.
+            if not line.startswith("+"):
                 continue
             text = line[1:]
             for pattern in SECRET_PATTERNS:
@@ -377,10 +384,32 @@ def scan_secrets(files: list[dict[str, Any]]) -> list[str]:
     return hits
 
 
+def complete_patch(file: dict[str, Any]) -> bool:
+    patch = file.get("patch")
+    additions = file.get("additions")
+    deletions = file.get("deletions")
+    if (
+        not isinstance(patch, str)
+        or isinstance(additions, bool)
+        or not isinstance(additions, int)
+        or additions < 0
+        or isinstance(deletions, bool)
+        or not isinstance(deletions, int)
+        or deletions < 0
+    ):
+        return False
+    lines = patch.split("\n")
+    added = sum(1 for line in lines if line.startswith("+"))
+    removed = sum(1 for line in lines if line.startswith("-"))
+    return added == additions and removed == deletions and bool(
+        patch or (additions == 0 and deletions == 0 and file.get("status") == "renamed")
+    )
+
+
 def unscanned_text(files: list[dict[str, Any]]) -> list[str]:
     missing: list[str] = []
     for file in files:
-        if isinstance(file.get("patch"), str):
+        if complete_patch(file):
             continue
         if Path(file.get("filename") or "").suffix.lower() in BINARY_EXTENSIONS:
             continue
@@ -443,68 +472,247 @@ def _parse_review_payload(marker_index: int, raw: str) -> dict[str, Any] | None:
     return None
 
 
+_EPOCH_MIN = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def _parse_iso_timestamp(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
 def _receipt_unresolved(review: dict[str, Any]) -> bool | None:
+    has_flag: bool | None = None
+    count_flag: bool | None = None
     if "has_unresolved_findings" in review:
-        value = review.get("has_unresolved_findings")
-        return None if value is None else bool(value)
-    unresolved = review.get("unresolved_findings")
-    if isinstance(unresolved, bool):
-        return unresolved
-    if isinstance(unresolved, int) and unresolved >= 0:
-        return unresolved > 0
-    return None
+        val = review.get("has_unresolved_findings")
+        if not isinstance(val, bool):
+            return None
+        has_flag = val
+    if "unresolved_findings" in review:
+        u = review.get("unresolved_findings")
+        if isinstance(u, bool):
+            count_flag = u
+        elif isinstance(u, int) and not isinstance(u, bool) and u >= 0:
+            count_flag = u > 0
+        else:
+            return None
+    if has_flag is not None and count_flag is not None:
+        if has_flag != count_flag:
+            return None
+        return has_flag
+    return has_flag if has_flag is not None else count_flag
 
 
-def ai_review_verdict(repo: str, number: int, head: str) -> tuple[str, str]:
-    comments = paginate(f"/repos/{repo}/issues/{number}/comments")
-    receipts: list[tuple[str, int, str]] = []
-    for comment in comments:
-        login = (comment.get("user") or {}).get("login", "")
-        if not REVIEWER_LOGINS.match(login):
-            continue
-        body = comment.get("body") or ""
-        for index, pattern in enumerate(RECEIPT_MARKERS):
-            match = pattern.search(body)
-            if match:
-                receipts.append((comment.get("updated_at", ""), index, match.group(1)))
-                break
-    if not receipts:
-        return "pending", "No AI review receipt on this pull request"
-    receipts.sort(reverse=True)
-    review = _parse_review_payload(receipts[0][1], receipts[0][2])
+def _judge_provider_receipt(
+    login_provider: str, marker_index: int, raw: str, head: str
+) -> tuple[str, str, bool | None, bool]:
+    review = _parse_review_payload(marker_index, raw)
     if not review:
-        return "error", "AI review receipt is not valid JSON"
-    status = review.get("status") or ("completed" if receipts[0][1] != 2 else None)
+        return "error", "AI review receipt is not valid JSON", None, False
+    on_head = review.get("commit_sha") == head
+    if "provider" in review:
+        declared = review.get("provider")
+        if not isinstance(declared, str) or declared.strip().lower() != login_provider:
+            return (
+                "failure",
+                f"AI review receipt provider does not match comment author {login_provider}",
+                on_head,
+                False,
+            )
+    status = review.get("status") or ("completed" if marker_index != 2 else None)
     if status != "completed":
-        return "pending", f"AI review {status or 'not finished'}"
-    if review.get("commit_sha") != head:
-        return "failure", "AI review covers another commit, not this head"
+        return "pending", f"AI review {status or 'not finished'}", on_head, True
+    if not on_head:
+        return "failure", "AI review covers another commit, not this head", False, True
     unresolved = _receipt_unresolved(review)
     if unresolved is True:
-        return "failure", "AI review still has unresolved findings on this head"
+        return "failure", "AI review still has unresolved findings on this head", True, True
     if unresolved is None:
-        return "failure", "AI review findings state is not reported"
-    coverage = str(review.get("coverage") or "complete").strip().lower()
-    if coverage not in {"complete", "completed", "full", "reported_complete", "all"}:
-        return "failure", "AI review coverage is incomplete"
-    provider = review.get("provider") or "reviewer"
-    return "success", f"{provider} reviewed this head with no unresolved findings"
+        return "failure", "AI review findings state is not reported", True, True
+    raw_coverage = review.get("coverage")
+    if marker_index in (0, 1):
+        if not isinstance(raw_coverage, str) or raw_coverage.strip().lower() not in COMPLETE_COVERAGE:
+            return "failure", "AI review coverage is incomplete", True, True
+    elif raw_coverage is not None:
+        if not isinstance(raw_coverage, str) or raw_coverage.strip().lower() not in COMPLETE_COVERAGE:
+            return "failure", "AI review coverage is incomplete", True, True
+    return "success", f"{login_provider} reviewed this head with no unresolved findings", True, True
+
+
+def ai_review_verdict(
+    repo: str, number: int, head: str, allowed_providers: set[str] | None = None
+) -> tuple[str, str]:
+    active = ALL_REVIEW_PROVIDERS if allowed_providers is None else (set(allowed_providers) & ALL_REVIEW_PROVIDERS)
+    if not active:
+        return "pending", "No AI review providers configured"
+    comments = paginate(f"/repos/{repo}/issues/{number}/comments")
+    # Track the latest receipt per allowed provider so one provider's clean head
+    # receipt cannot mask another provider's unresolved findings on the same head.
+    latest_by_provider: dict[str, tuple[dt.datetime, str, int, int, int, str]] = {}
+    for seq_idx, comment in enumerate(comments):
+        login = (comment.get("user") or {}).get("login", "")
+        binding = REVIEWER_PROVIDERS.get(login)
+        if not binding:
+            continue
+        login_provider, allowed_indices = binding
+        if login_provider not in active:
+            continue
+        body = comment.get("body") or ""
+        updated_at = comment.get("updated_at") or ""
+        comment_id = comment.get("id")
+        cid = comment_id if isinstance(comment_id, int) and not isinstance(comment_id, bool) else 0
+        parsed_ts = _parse_iso_timestamp(updated_at) or _EPOCH_MIN
+        for index in allowed_indices:
+            match = RECEIPT_MARKERS[index].search(body)
+            if match:
+                candidate = (parsed_ts, updated_at, cid, seq_idx, index, match.group(1))
+                prev = latest_by_provider.get(login_provider)
+                if prev is None or candidate[:4] > prev[:4]:
+                    latest_by_provider[login_provider] = candidate
+                break
+    if not latest_by_provider:
+        return "pending", "No AI review receipt on this pull request"
+
+    judged: list[tuple[tuple[dt.datetime, str, int, int], tuple[dt.datetime, str], str, str, str, bool | None, bool]] = []
+    for login_provider, item in latest_by_provider.items():
+        parsed_ts, updated_at, cid, seq_idx, marker_index, raw = item
+        state, note, on_head, provider_ok = _judge_provider_receipt(
+            login_provider, marker_index, raw, head
+        )
+        judged.append(
+            ((parsed_ts, updated_at, cid, seq_idx), (parsed_ts, updated_at), login_provider, state, note, on_head, provider_ok)
+        )
+
+    judged.sort(key=lambda entry: entry[0], reverse=True)
+    passing_head = [e for e in judged if e[5] is True and e[3] == "success"]
+    failing_head = [e for e in judged if e[5] is True and e[3] in ("error", "failure")]
+    pending_head = [e for e in judged if e[5] is True and e[3] == "pending"]
+
+    if passing_head:
+        max_pass_ts = max(e[1] for e in passing_head)
+        for entry in judged:
+            if entry[5] is None and entry[1] >= max_pass_ts:
+                return entry[3], entry[4]
+        for entry in judged:
+            if not entry[6] and entry[5] is not None and entry[1] >= max_pass_ts:
+                return entry[3], entry[4]
+        if failing_head:
+            return failing_head[0][3], failing_head[0][4]
+        if pending_head:
+            return pending_head[0][3], pending_head[0][4]
+        return passing_head[0][3], passing_head[0][4]
+
+    if failing_head:
+        return failing_head[0][3], failing_head[0][4]
+    return judged[0][3], judged[0][4]
 
 
 def codex_verdict(repo: str, number: int, head: str) -> tuple[str, str]:
-    return ai_review_verdict(repo, number, head)
+    return ai_review_verdict(repo, number, head, allowed_providers={"codex"})
 
 
-def live_label(repo: str, number: int, owner: str) -> str | None:
-    events = paginate(f"/repos/{repo}/issues/{number}/events")
-    latest: dict[str, dict[str, Any]] = {}
-    for event in events:
+def policy_review_providers(policy: dict[str, Any]) -> set[str]:
+    if policy.get("codex_required", True) is True:
+        return {"codex"}
+    configured = policy.get("ai_review_providers")
+    if isinstance(configured, list):
+        return {
+            p.strip().lower()
+            for p in configured
+            if isinstance(p, str) and p.strip().lower() in ALL_REVIEW_PROVIDERS
+        }
+    return set()
+
+
+def _valid_clearing_actor(name: str, event: dict[str, Any], owner: str) -> bool:
+    if event.get("event") != "labeled":
+        return False
+    actor_login = (event.get("actor") or {}).get("login") or ""
+    if name == "owner-approved":
+        return bool(owner) and actor_login == owner
+    if name == "agent-approved":
+        return bool(actor_login)
+    return False
+
+
+def live_label(repo: str, number: int, owner: str, pull: dict[str, Any] | None = None) -> str | None:
+    if pull is None:
+        events = paginate(f"/repos/{repo}/issues/{number}/events")
+        latest: dict[str, dict[str, Any]] = {}
+        for event in events:
+            name = (event.get("label") or {}).get("name")
+            if event.get("event") in ("labeled", "unlabeled") and name in ("owner-approved", "agent-approved"):
+                latest[name] = event
+        for name in ("owner-approved", "agent-approved"):
+            event = latest.get(name)
+            if event and _valid_clearing_actor(name, event, owner):
+                return name
+        return None
+
+    present = {(lbl.get("name") or "") for lbl in (pull.get("labels") or [])}
+    if not (present & {"owner-approved", "agent-approved"}):
+        return None
+    head_info = pull.get("head") or {}
+    head = head_info.get("sha") or ""
+    if not head:
+        return None
+    timeline = paginate(f"/repos/{repo}/issues/{number}/timeline")
+    latest = {}
+    for event in timeline:
+        kind = event.get("event")
+        if kind in ("committed", "head_ref_force_pushed", "head_ref_restored", "reopened"):
+            latest.clear()
+            continue
         name = (event.get("label") or {}).get("name")
-        if event.get("event") in ("labeled", "unlabeled") and name in ("owner-approved", "agent-approved"):
+        if kind in ("labeled", "unlabeled") and name in ("owner-approved", "agent-approved"):
             latest[name] = event
+
+    statuses: list[dict[str, Any]] | None = None
+    activities: list[dict[str, Any]] | None = None
+    head_repo = ((head_info.get("repo") or {}).get("full_name") or "")
+    head_ref = head_info.get("ref") or ""
     for name in ("owner-approved", "agent-approved"):
+        if name not in present:
+            continue
         event = latest.get(name)
-        if event and event.get("event") == "labeled" and (event.get("actor") or {}).get("login") == owner:
+        if not event or not _valid_clearing_actor(name, event, owner):
+            continue
+        if statuses is None:
+            statuses = paginate(f"/repos/{repo}/commits/{head}/statuses")
+        event_id = event.get("id")
+        if event_id is not None and not isinstance(event_id, bool):
+            expected = f"{name} for PR {number} at event {event_id} on this head"
+            if any(
+                s.get("context") == "clearing-label"
+                and s.get("state") == "success"
+                and (s.get("creator") or {}).get("login") == ACTIONS_BOT
+                and s.get("description") == expected
+                for s in statuses
+            ):
+                return name
+        event_ts = _parse_iso_timestamp(event.get("created_at"))
+        if head_repo != repo or not head_ref or event_ts is None:
+            continue
+        if activities is None:
+            activities = paginate(f"/repos/{repo}/activity", {"ref": f"refs/heads/{head_ref}"})
+        push_events: list[tuple[dt.datetime, dict[str, Any]]] = []
+        for entry in activities:
+            if entry.get("activity_type") not in ("branch_creation", "push", "force_push"):
+                continue
+            ts = _parse_iso_timestamp(entry.get("timestamp"))
+            if ts is not None:
+                push_events.append((ts, entry))
+        if not push_events:
+            continue
+        newest_ts, newest = max(push_events, key=lambda pair: pair[0])
+        if newest.get("after") == head and event_ts >= newest_ts:
             return name
     return None
 
@@ -658,7 +866,7 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
     verify_script(repo, policy_ref)
     files = paginate(f"/repos/{repo}/pulls/{number}/files")
     for file in files:
-        if isinstance(file.get("patch"), str) or file.get("changes") != 0:
+        if complete_patch(file) or file.get("changes") != 0:
             continue
         if Path(file.get("filename") or "").suffix.lower() in BINARY_EXTENSIONS:
             continue
@@ -679,13 +887,19 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
     )
     extra = tuple(policy.get("extra_protected_paths") or ())
     tier, fast_path = classify(files, verified_dependabot, base_action_files(repo, policy_ref), extra)
-    if policy.get("codex_required", True) and tier != "T0" and not fast_path:
-        codex_state, codex_note = codex_verdict(repo, number, head)
+    providers = policy_review_providers(policy)
+    if providers and tier != "T0" and not fast_path:
+        if providers == {"codex"}:
+            codex_state, codex_note = codex_verdict(repo, number, head)
+        else:
+            codex_state, codex_note = ai_review_verdict(
+                repo, number, head, allowed_providers=providers
+            )
     else:
         codex_state, codex_note = "skipped", "Not required for this change"
     if codex_state not in ("success", "skipped"):
         reasons.append(codex_note)
-    label = live_label(repo, number, policy.get("owner_login", "")) if tier == "T2" else None
+    label = live_label(repo, number, policy.get("owner_login", ""), pull=pull) if tier == "T2" else None
     if tier == "T2" and label is None:
         reasons.append("Protected paths need a live owner-approved or agent-approved label")
     if tier == "T2" and policy.get("require_owner_label_for_protected") and label != "owner-approved":
@@ -695,7 +909,7 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
     hits = scan_secrets(files)
     if hits:
         reasons.append("Possible secret in the diff: " + "; ".join(sorted(set(hits))[:5]))
-    unscanned = [file.get("filename") for file in files if not isinstance(file.get("patch"), str)]
+    unscanned = [file.get("filename") for file in files if not complete_patch(file)]
     unscannable = unscanned_text(files)
     if unscannable:
         reasons.append("Cannot scan text changes without a diff: " + ", ".join(unscannable[:5]))
@@ -738,6 +952,7 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
         "base_sha": base_head,
         "tier": tier,
         "codex": codex_state,
+        "review_providers": sorted(providers),
         "label": label,
         "confirmed_by_owner": label == "owner-approved",
         "checks": checks,
@@ -779,13 +994,24 @@ def revalidate(repo: str, verdict: dict[str, Any]) -> None:
     if shared_head(repo, verdict["pr"], verdict["head_sha"]):
         raise Refusal("Another open pull request now shares this head; re-run the gate")
     if verdict.get("tier") == "T2":
-        live = live_label(repo, verdict["pr"], policy.get("owner_login", ""))
+        live = live_label(repo, verdict["pr"], policy.get("owner_login", ""), pull=pull)
         if live != verdict.get("label"):
             raise Refusal("Clearing label changed since the verdict; re-run the gate")
     if verdict.get("codex") not in (None, "skipped"):
-        state, note = codex_verdict(repo, verdict["pr"], verdict["head_sha"])
+        providers = policy_review_providers(policy)
+        if not providers:
+            raise Refusal("AI review policy changed since the verdict; re-run the gate")
+        expected_providers = verdict.get("review_providers")
+        if expected_providers is not None and sorted(providers) != sorted(expected_providers):
+            raise Refusal("AI review providers changed since the verdict; re-run the gate")
+        if providers == {"codex"}:
+            state, note = codex_verdict(repo, verdict["pr"], verdict["head_sha"])
+        else:
+            state, note = ai_review_verdict(
+                repo, verdict["pr"], verdict["head_sha"], allowed_providers=providers
+            )
         if state != "success":
-            raise Refusal(f"Codex review is no longer valid: {note}; re-run the gate")
+            raise Refusal(f"AI review is no longer valid: {note}; re-run the gate")
     if policy.get("require_checks", True) and verdict.get("required_checks"):
         required = verdict["required_checks"]
         missing, unsettled, pending, failing = check_results(
@@ -891,7 +1117,10 @@ def scan_direct_pushes(repo: str, default: str, since: str, merge_shas: set, ack
             current = next_sha
             continue
         related = request("GET", f"/repos/{repo}/commits/{current}/pulls", allow=(404,)) or []
-        if not any(pull.get("merged_at") for pull in related):
+        if not any(
+            pull.get("merged_at") and (pull.get("base") or {}).get("ref") == default
+            for pull in related
+        ):
             subject = ((commit.get("commit") or {}).get("message") or "").splitlines()[0]
             note = str(acknowledged.get(current) or acknowledged.get(current[:7]) or "")
             message = f"{current[:7]} on {default} is not associated with a merged pull request: {subject}"

@@ -154,8 +154,12 @@ trusted copy.
   file is still in the objects; rotate it if it ever appears in a finding.
 - Review before merge still applies: open a pull request, run `audit` from the
   installed copy on the branch, and merge through `governance/merge_gate.py`
-  only after it passes. `merge_gate.py` enforces the same single-AI-receipt
-  model as the public track, accepting `ai-review-receipt:v1`,
-  `codex-review-receipt:v1`, and `codex-review-state:v1` markers from
-  `chatgpt-codex-connector[bot]`, `claude[bot]`, or `cursor[bot]` with complete
-  coverage and no unresolved findings.
+  only after it passes. By default (`"codex_required": true`), `merge_gate.py`
+  strictly requires a Codex receipt (`codex-review-receipt:v1`,
+  `codex-review-state:v1`, or `ai-review-receipt:v1` authored by
+  `chatgpt-codex-connector[bot]`). Setting `"codex_required": false` with
+  `"ai_review_providers": ["codex", "claude", "cursor"]` in
+  `governance/policy.json` opts into single-AI-receipt review across the listed
+  providers (`chatgpt-codex-connector[bot]`, `claude[bot]`, or `cursor[bot]`)
+  with author-matched `ai-review-receipt:v1`, explicit complete coverage on
+  receipt markers, and no unresolved findings on the current head.

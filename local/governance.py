@@ -526,8 +526,12 @@ def check_drift(root, source=None):
             continue
         src_bytes = src_path.read_bytes()
         src_sha = hashlib.sha256(src_bytes).hexdigest()
+        dest_error = _validate_regular_destination(root_path, dest_rel)
+        if dest_error:
+            problems.append(f"{dest_rel} invalid destination: {dest_error} (expected sha256 {src_sha})")
+            continue
         dst_path = root_path / dest_rel
-        if dst_path.is_symlink() or not dst_path.is_file():
+        if not dst_path.is_file():
             problems.append(f"{dest_rel} is missing or not a regular file (expected sha256 {src_sha})")
             continue
         dst_bytes = dst_path.read_bytes()

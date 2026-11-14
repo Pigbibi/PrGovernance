@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1032,6 +1033,23 @@ class RepositoryTests(unittest.TestCase):
         symlinked = self.cli("check-drift", "--source", str(local_dir))
         self.assertEqual(symlinked.returncode, 1)
         self.assertIn("scripts/check_hygiene.py", symlinked.stderr)
+
+    def test_check_drift_reports_symlinked_ancestor_directory(self):
+        local_dir = self._seed_canonical_repo()
+        gov_dir = Path(self.root) / "governance"
+        external_dir = Path(self.root).parent / "external-governance"
+        (external_dir / "tests").mkdir(parents=True, exist_ok=True)
+        (external_dir / "merge_gate.py").write_text((gov_dir / "merge_gate.py").read_text())
+        (external_dir / "tests" / "test_merge_gate.py").write_text(
+            (gov_dir / "tests" / "test_merge_gate.py").read_text()
+        )
+        shutil.rmtree(gov_dir)
+        gov_dir.symlink_to(external_dir)
+
+        result = self.cli("check-drift", "--source", str(local_dir))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("governance/merge_gate.py", result.stderr)
+        self.assertIn("not a regular directory", result.stderr)
 
     def test_check_drift_reports_missing_source_directory(self):
         result = self.cli("check-drift", "--source", str(Path(self.root) / "no-such-dir"))
