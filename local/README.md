@@ -49,6 +49,19 @@ python3 PrGovernance/local/governance.py install --root <repository> \
   --source PrGovernance/local
 ```
 
+To also install or update the canonical private-repository merge entry and
+hygiene checker (`governance/merge_gate.py`, `governance/tests/test_merge_gate.py`,
+and `scripts/check_hygiene.py`) in `<repository>`, pass `--include-merge-gate`:
+
+```sh
+python3 PrGovernance/local/governance.py install --root <repository> \
+  --source PrGovernance/local --include-merge-gate
+```
+
+`--include-merge-gate` keeps all hook installation behavior unchanged and refuses
+before making changes if any canonical source file is missing or if a target
+path is a symlink or non-regular file.
+
 A repository that vendors `.githooks/` can instead run
 `python3 .githooks/governance.py install` once from the reviewed default branch.
 
@@ -84,6 +97,8 @@ python3 "$hooks/governance.py" pre-commit
 python3 "$hooks/governance.py" commit-msg FILE
 python3 "$hooks/governance.py" pre-push           # reads ref updates on stdin
 python3 "$hooks/governance.py" verify             # installed copy matches .githooks
+python3 PrGovernance/local/governance.py check-drift --root <repository> \
+  --source PrGovernance/local                     # repository copies match canonical local/
 ```
 
 Every command exits non-zero and prints `governance: <finding>` on failure.
@@ -95,6 +110,13 @@ without `governance.json` compares against the default policy `install` writes,
 so an optional policy file never makes a clone unverifiable. Run it after pulling a change to the
 vendored hooks, and before trusting a clone that was installed by someone else;
 a non-empty result means `install` must run again from a trusted copy.
+
+`check-drift` compares the SHA-256 digest of `.githooks/governance.py`,
+`governance/merge_gate.py`, `governance/tests/test_merge_gate.py`, and
+`scripts/check_hygiene.py` in `--root` against the canonical files in
+`--source` (defaulting to the directory containing `governance.py`). If any
+file is missing, symlinked, or differs, it prints the SHA-256 mismatch and a
+diff summary to stderr and exits non-zero.
 
 ## Configuration
 
@@ -131,6 +153,9 @@ trusted copy.
 - The audit scans the current tree, not history. A credential removed from a
   file is still in the objects; rotate it if it ever appears in a finding.
 - Review before merge still applies: open a pull request, run `audit` from the
-  installed copy on the branch, and merge only after it passes. The reviewer
-  identity rules of the public track apply unchanged; only the enforcement point
-  is local.
+  installed copy on the branch, and merge through `governance/merge_gate.py`
+  only after it passes. `merge_gate.py` enforces the same single-AI-receipt
+  model as the public track, accepting `ai-review-receipt:v1`,
+  `codex-review-receipt:v1`, and `codex-review-state:v1` markers from
+  `chatgpt-codex-connector[bot]`, `claude[bot]`, or `cursor[bot]` with complete
+  coverage and no unresolved findings.

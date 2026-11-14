@@ -14,6 +14,8 @@ publishes a credential.
 
 import argparse
 import codecs
+import difflib
+import hashlib
 import json
 import os
 import re
@@ -342,10 +344,22 @@ def hook_pre_commit(root):
     return audit(root, True, config(root), changed_only=True)
 
 
+HOOK_FILES = ("governance.py", "pre-commit", "commit-msg", "pre-push")
+MERGE_GATE_FILES = (
+    ("merge_gate.py", "governance/merge_gate.py"),
+    ("test_merge_gate.py", "governance/tests/test_merge_gate.py"),
+    ("check_hygiene.py", "scripts/check_hygiene.py"),
+)
+DRIFT_FILES = (
+    ("governance.py", ".githooks/governance.py"),
+    *MERGE_GATE_FILES,
+)
+
+
 def verify(root):
     root = repository_root(root)
     source = Path(root) / ".githooks"
-    names = ["governance.py", "pre-commit", "commit-msg", "pre-push"]
+    names = list(HOOK_FILES)
     missing = [name for name in names if not (source / name).is_file()]
     if missing:
         return [f"missing file {name} in {source}" for name in missing]
@@ -467,13 +481,86 @@ def inherited_hooks(worktrees, target, layout, skip):
     return sources, []
 
 
-def install(root, source=None):
+def _validate_regular_destination(root_path, dest_rel):
+    current = root_path
+    for part in Path(dest_rel).parts[:-1]:
+        current = current / part
+        if current.is_symlink() or (current.exists() and not current.is_dir()):
+            return f"{current} is not a regular directory"
+    dest = root_path / dest_rel
+    if dest.is_symlink() or (dest.exists() and not dest.is_file()):
+        return f"{dest} is not a regular file"
+    return None
+
+
+def _diff_summary(src_label, dst_label, src_bytes, dst_bytes, max_lines=20):
+    src_lines = src_bytes.decode("utf-8", errors="replace").splitlines()
+    dst_lines = dst_bytes.decode("utf-8", errors="replace").splitlines()
+    diff = list(difflib.unified_diff(
+        src_lines, dst_lines, fromfile=src_label, tofile=dst_label, lineterm="", n=2,
+    ))
+    if not diff:
+        return "line-ending or trailing-newline difference"
+    added = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+    summary = f"+{added}/-{removed} lines"
+    preview = "\n".join(diff[:max_lines])
+    if len(diff) > max_lines:
+        preview += f"\n... ({len(diff) - max_lines} more diff lines)"
+    return f"{summary}\n{preview}"
+
+
+def check_drift(root, source=None):
+    """Compare vendored governance files in root against canonical local/ sources."""
+    root_path = Path(repository_root(root))
+    source_dir = Path(source) if source else Path(__file__).resolve().parent
+    if not root_path.is_dir():
+        return [f"target root does not exist: {root_path}"]
+    if not source_dir.is_dir():
+        return [f"source directory does not exist: {source_dir}"]
+    problems = []
+    for src_name, dest_rel in DRIFT_FILES:
+        src_path = source_dir / src_name
+        if not src_path.is_file():
+            problems.append(f"missing canonical file {src_name} in {source_dir}")
+            continue
+        src_bytes = src_path.read_bytes()
+        src_sha = hashlib.sha256(src_bytes).hexdigest()
+        dst_path = root_path / dest_rel
+        if dst_path.is_symlink() or not dst_path.is_file():
+            problems.append(f"{dest_rel} is missing or not a regular file (expected sha256 {src_sha})")
+            continue
+        dst_bytes = dst_path.read_bytes()
+        dst_sha = hashlib.sha256(dst_bytes).hexdigest()
+        if dst_sha != src_sha:
+            summary = _diff_summary(f"canonical/{src_name}", dest_rel, src_bytes, dst_bytes)
+            problems.append(
+                f"{dest_rel} drifted from {src_path} "
+                f"(sha256 actual={dst_sha} expected={src_sha}; {summary})"
+            )
+    return problems
+
+
+def install(root, source=None, include_merge_gate=False):
     root = repository_root(root)
     source = Path(source) if source else Path(root) / ".githooks"
-    names = ["governance.py", "pre-commit", "commit-msg", "pre-push"]
-    missing = [name for name in names if not (source / name).is_file()]
+    names = list(HOOK_FILES)
+    required = list(names)
+    if include_merge_gate:
+        required.extend(src_name for src_name, _ in MERGE_GATE_FILES)
+    missing = [name for name in required if not (source / name).is_file()]
     if missing:
         return [f"missing file {name} in {source}" for name in missing]
+    if include_merge_gate:
+        root_path = Path(root)
+        dest_errors = [
+            error
+            for _, dest_rel in MERGE_GATE_FILES
+            for error in [_validate_regular_destination(root_path, dest_rel)]
+            if error
+        ]
+        if dest_errors:
+            return dest_errors
     target = Path(git_output(root, "rev-parse", "--path-format=absolute",
                              "--git-common-dir").strip()) / "governance"
     layout = repository_layout(root)
@@ -516,6 +603,12 @@ def install(root, source=None):
                 or Path(configured).resolve() != target.resolve()):
             return [f"core.hooksPath for {worktree} is overridden by worktree or "
                     f"environment config: {configured or 'unset'}"]
+    if include_merge_gate:
+        root_path = Path(root)
+        for src_name, dest_rel in MERGE_GATE_FILES:
+            dest = root_path / dest_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / src_name, dest)
     return []
 
 
@@ -528,18 +621,23 @@ def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",
                         choices=["audit", "pre-commit", "commit-msg", "pre-push", "install",
-                                 "verify"])
+                                 "verify", "check-drift"])
     parser.add_argument("argument", nargs="?")
     parser.add_argument("--staged", action="store_true",
                         help="audit the index instead of the committed tree")
     parser.add_argument("--root", default=".")
-    parser.add_argument("--source", help="directory to install the hooks from")
+    parser.add_argument("--source", help="directory to install the hooks from or compare against")
+    parser.add_argument("--include-merge-gate", action="store_true",
+                        help="with install, also copy merge_gate.py, test_merge_gate.py, "
+                             "and check_hygiene.py into --root")
     options = parser.parse_args(argv)
     root = repository_root(str(Path(options.root).resolve()))
     if options.command == "install":
-        problems = install(root, options.source)
+        problems = install(root, options.source, include_merge_gate=options.include_merge_gate)
     elif options.command == "verify":
         problems = verify(root)
+    elif options.command == "check-drift":
+        problems = check_drift(root, options.source)
     else:
         problems = {
             "audit": lambda: audit(root, options.staged, config(root)),
