@@ -96,11 +96,22 @@ async function reviewRequested(github, repo, pr, core, config) {
   if (alreadyNudged(comments, head)) return 'nudged';
   const age = await headAge(github, repo, head);
   if (age === null || age < MIN_HEAD_AGE_MS) return 'too-new';
-  await github.rest.issues.createComment({
-    ...repo,
-    issue_number: pr.number,
-    body: nudgeBody(head, config.mentions),
-  });
+  try {
+    await github.rest.issues.createComment({
+      ...repo,
+      issue_number: pr.number,
+      body: nudgeBody(head, config.mentions),
+    });
+  } catch (err) {
+    if (err && err.status === 403) {
+      throw new Error(
+        'Cannot create the review-request comment: the Review request workflow needs '
+        + 'pull-requests: write (and issues: write). GitHub returned 403 '
+        + 'Resource not accessible by integration.'
+      );
+    }
+    throw err;
+  }
   core.info(`Requested a review for #${pr.number} at ${head.slice(0, 7)}`);
   return 'requested';
 }

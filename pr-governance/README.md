@@ -80,10 +80,11 @@ organization community-health files.
    `templates/gitleaks.yml` and `templates/weekly-secret-scan.yml` into
    `.github/workflows/`, replacing `__GOVERNANCE_REPO__` with the
    `owner/repository` of this governance repository and `__GOVERNANCE_SHA__`
-   with the full commit SHA at the head of `v1`. Copy
-   `templates/pr-review-signal.yml` unchanged as well: review events on fork
-   and Dependabot pull requests get a read-only token, so the gate is started
-   by that workflow's completion instead.
+   with the full commit SHA at the head of `v1`. Keep `codex-nudge.yml`'s
+   `pull-requests: write` and `issues: write`: posting the review request
+   comment on a pull request needs both. Copy `templates/pr-review-signal.yml`
+   unchanged as well: review events on fork and Dependabot pull requests get a
+   read-only token, so the gate is started by that workflow's completion instead.
 3. Add the required contexts to branch protection on the default branch:
    `pr-template`, `ai-review`, `risk-gate`, `Gitleaks`, and the repository's
    own checks. Keep `strict` (require branches to be up to date) and
