@@ -1039,6 +1039,29 @@ class DirectPushAuditTests(unittest.TestCase):
             )
         self.assertEqual(findings, [])
 
+        # Case 4: truncated or missing file patches fail closed instead of proving equivalence.
+        truncated = [{"filename": "a.py", "status": "modified", "additions": 2, "deletions": 0, "changes": 2, "patch": "@@ -1 +1,2 @@\n+a"}]
+        missing_patch = [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 0, "changes": 1, "patch": None}]
+        for bad_files in (truncated, missing_patch):
+            bad_details = {
+                **rebased_details,
+                r1: self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z", files=bad_files),
+                p0: self._rich_commit(p0, ("6" * 40,), "feat: step 1", date="2026-01-05T01:00:00Z", files=bad_files),
+            }
+
+            def bad_request(method, path, body=None, params=None, allow=(), _details=bad_details):
+                if path.startswith("/repos/o/r/commits/") and not path.endswith("/pulls"):
+                    return _details.get(path.rsplit("/", 1)[-1])
+                return request_case2(method, path, body=body, params=params, allow=allow)
+
+            with mock.patch.object(gate, "request", bad_request), \
+                 mock.patch.object(gate, "paginate", lambda path, params=None: []):
+                findings = gate.scan_direct_pushes(
+                    "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+                )
+            self.assertEqual(len(findings), 1)
+            self.assertIn(r1[:7], findings[0])
+
     def test_squash_or_divergent_rebase_does_not_exempt_parent_commits(self):
         r1 = "3" * 40
         unrelated = "5" * 40

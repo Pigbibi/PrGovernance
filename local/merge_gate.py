@@ -1662,7 +1662,13 @@ def _canonical_commit_files(commit_detail: dict[str, Any]) -> list[tuple[Any, ..
             return None
         filename = entry.get("filename")
         status = entry.get("status")
-        previous = entry.get("previous_filename") or ""
+        raw_previous = entry.get("previous_filename")
+        if raw_previous is None:
+            previous = ""
+        elif isinstance(raw_previous, str):
+            previous = raw_previous
+        else:
+            return None
         additions = entry.get("additions")
         deletions = entry.get("deletions")
         changes = entry.get("changes")
@@ -1671,26 +1677,39 @@ def _canonical_commit_files(commit_detail: dict[str, Any]) -> list[tuple[Any, ..
             or not filename
             or not isinstance(status, str)
             or not status
-            or not isinstance(previous, str)
             or not isinstance(additions, int)
             or isinstance(additions, bool)
+            or additions < 0
             or not isinstance(deletions, int)
             or isinstance(deletions, bool)
+            or deletions < 0
             or not isinstance(changes, int)
             or isinstance(changes, bool)
+            or changes != additions + deletions
         ):
             return None
         patch = entry.get("patch")
-        if isinstance(patch, str):
-            proof: tuple[str, str] = ("patch", patch)
-        elif (
-            patch is None
-            and status == "renamed"
+        sha = entry.get("sha")
+        sha_hex = sha.lower() if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha.lower()) else ""
+        if (
+            patch in (None, "")
+            and additions == 0
+            and deletions == 0
             and changes == 0
-            and isinstance(entry.get("sha"), str)
-            and entry.get("sha")
+            and sha_hex
+            and status == "renamed"
         ):
-            proof = ("rename_sha", str(entry["sha"]))
+            proof: tuple[str, str] = ("rename_sha", sha_hex)
+        elif (
+            patch in (None, "")
+            and additions == 0
+            and deletions == 0
+            and changes == 0
+            and sha_hex == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        ):
+            proof = ("empty_blob", sha_hex)
+        elif complete_patch(entry):
+            proof = ("patch", patch)
         else:
             return None
         normalized.append((filename, previous, status, additions, deletions, changes, proof))
