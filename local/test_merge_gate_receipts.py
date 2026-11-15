@@ -261,6 +261,95 @@ class AiReviewReceiptTests(unittest.TestCase):
         self.assertEqual(state, "failure")
         self.assertIn("another commit", note)
 
+    def test_missing_or_invalid_commit_sha_returns_error(self):
+        for marker, login, provider in (
+            ("ai-review-receipt:v1", "claude[bot]", "claude"),
+            ("codex-review-receipt:v1", "chatgpt-codex-connector[bot]", "codex"),
+        ):
+            for bad_sha in ("__ABSENT__", None, "", "   ", 123, "abc123", "z" * 40):
+                with self.subTest(marker=marker, commit_sha=bad_sha):
+                    review = {
+                        "provider": provider,
+                        "status": "completed",
+                        "unresolved_findings": 0,
+                        "coverage": "complete",
+                    }
+                    if bad_sha != "__ABSENT__":
+                        review["commit_sha"] = bad_sha
+                    comment = self.comment(login, marker, {"review": review})
+                    state, note = self.verdict([comment])
+                    self.assertEqual(state, "error")
+                    self.assertIn("commit_sha", note)
+
+            with self.subTest(marker=marker, uppercase_head=True):
+                comment = self.comment(
+                    login,
+                    marker,
+                    {
+                        "review": {
+                            "provider": provider,
+                            "commit_sha": self.HEAD.upper(),
+                            "status": "completed",
+                            "unresolved_findings": 0,
+                            "coverage": "complete",
+                        }
+                    },
+                )
+                self.assertEqual(self.verdict([comment])[0], "success")
+
+    def test_newer_receipt_missing_commit_sha_not_masked_by_older_clean_receipt(self):
+        for marker, login, provider in (
+            ("ai-review-receipt:v1", "claude[bot]", "claude"),
+            ("codex-review-receipt:v1", "chatgpt-codex-connector[bot]", "codex"),
+        ):
+            older_clean = self.comment(
+                login,
+                marker,
+                {
+                    "review": {
+                        "provider": provider,
+                        "commit_sha": self.HEAD,
+                        "status": "completed",
+                        "unresolved_findings": 0,
+                        "coverage": "complete",
+                    }
+                },
+                updated_at="2026-11-14T08:00:00Z",
+            )
+            with self.subTest(marker=marker, case="completed_with_findings"):
+                newer_findings = self.comment(
+                    login,
+                    marker,
+                    {
+                        "review": {
+                            "provider": provider,
+                            "status": "completed",
+                            "unresolved_findings": 2,
+                            "coverage": "complete",
+                        }
+                    },
+                    updated_at="2026-11-14T09:00:00Z",
+                )
+                state, note = self.verdict([older_clean, newer_findings])
+                self.assertEqual(state, "error")
+                self.assertIn("commit_sha", note)
+
+            with self.subTest(marker=marker, case="in_progress"):
+                newer_pending = self.comment(
+                    login,
+                    marker,
+                    {
+                        "review": {
+                            "provider": provider,
+                            "status": "in_progress",
+                        }
+                    },
+                    updated_at="2026-11-14T09:00:00Z",
+                )
+                state, note = self.verdict([older_clean, newer_pending])
+                self.assertEqual(state, "pending")
+                self.assertIn("in_progress", note)
+
     def test_unresolved_findings_variants_are_rejected(self):
         for payload in (
             {"unresolved_findings": 2},
