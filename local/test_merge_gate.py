@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import tempfile
 import threading
 import time
 import unittest
@@ -203,6 +204,12 @@ class SecretTests(unittest.TestCase):
     def test_triple_plus_added_line_is_still_scanned(self):
         files = [changed("app.py", '+++key = "ghp_' + "a" * 36 + '"\n')]
         self.assertTrue(gate.scan_secrets(files))
+
+    def test_unicode_and_control_line_separators_do_not_hide_secret(self):
+        for sep in ("\u2028", "\u2029", "\x0b", "\x0c", "\r"):
+            with self.subTest(sep=repr(sep)):
+                files = [changed("app.py", '+' + sep + 'key = "ghp_' + "a" * 36 + '"\n')]
+                self.assertTrue(gate.scan_secrets(files))
 
 
 class DiffCompletenessTests(unittest.TestCase):
@@ -549,6 +556,137 @@ class AuditTests(unittest.TestCase):
              mock.patch.object(gate, "load_policy", lambda *a, **k: policy), \
              mock.patch.object(gate, "verify_script", lambda *a, **k: None):
             self.assertEqual(gate.audit("o/r", 1, False), 2)
+
+    def test_future_or_invalid_audit_since_fails(self):
+        for bad_since in ("2099-01-01T00:00:00Z", "not-a-timestamp"):
+            with self.subTest(bad_since=bad_since):
+                policy = {"owner_login": "synthetic-owner", "audit_since": bad_since, "audit_ignore_prs": []}
+
+                def fake_request(method, path, body=None, params=None, allow=()):
+                    if path == "/repos/o/r":
+                        return {"default_branch": "main"}
+                    if path == "/repos/o/r/pulls":
+                        return []
+                    if path == "/repos/o/r/commits":
+                        return []
+                    return []
+
+                captured = io.StringIO()
+                with mock.patch.object(gate, "request", fake_request), \
+                     mock.patch.object(gate, "paginate", lambda path, params=None: []), \
+                     mock.patch.object(gate, "load_policy", lambda *a, **k: policy), \
+                     mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+                     contextlib.redirect_stdout(captured):
+                    code = gate.audit("o/r", 20, False)
+                self.assertEqual(code, 2)
+                self.assertIn("audit_since in policy is invalid or in the future", captured.getvalue())
+
+    def test_strict_direct_ignores_untrusted_branch_exemptions(self):
+        direct = "d" * 40
+        untrusted_policy = {
+            "owner_login": "synthetic-owner",
+            "audit_since": "2026-01-01T00:00:00Z",
+            "audit_ignore_prs": [7],
+            "audit_acknowledged_direct": {direct: "self-excused"},
+            "audit_direct_commits": 1,
+            "audit_strict_direct": False,
+        }
+        pull = {
+            "number": 7,
+            "merged_at": "2025-12-01T00:00:00Z",
+            "head": {"sha": self.HEAD},
+            "merge_commit_sha": self.MERGE,
+        }
+        commit = {
+            "sha": direct,
+            "parents": [],
+            "commit": {"message": "direct change", "committer": {"date": "2025-12-02T00:00:00Z"}},
+        }
+        seen_limit = {}
+
+        def fake_request(method, path, body=None, params=None, allow=()):
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == "/repos/o/r/pulls":
+                return [pull] if params and params.get("page") == 1 else []
+            if path == "/repos/o/r/commits":
+                return [commit]
+            if path.startswith("/repos/o/r/commits/") and path.endswith("/pulls"):
+                return []
+            return []
+
+        orig_scan = gate.scan_direct_pushes
+
+        def wrap_scan(repo, default, since, merge_shas, acknowledged, strict, direct_limit):
+            seen_limit["since"] = since
+            seen_limit["acknowledged"] = acknowledged
+            seen_limit["strict"] = strict
+            seen_limit["direct_limit"] = direct_limit
+            return orig_scan(repo, default, since, merge_shas, acknowledged, strict, direct_limit)
+
+        captured = io.StringIO()
+        with mock.patch.object(gate, "request", fake_request), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: [self.verdict()]), \
+             mock.patch.object(gate, "load_policy", lambda *a, **k: untrusted_policy), \
+             mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+             mock.patch.object(gate, "scan_direct_pushes", wrap_scan), \
+             contextlib.redirect_stdout(captured):
+            code = gate.audit("o/r", 20, True)
+        self.assertEqual(code, 2)
+        self.assertEqual(seen_limit, {"since": "", "acknowledged": {}, "strict": True, "direct_limit": 40})
+        self.assertIn(f"violation: {direct[:7]} on main is not associated", captured.getvalue())
+
+    def test_audit_honors_explicit_policy_ref_and_policy_file(self):
+        direct = "d" * 40
+        trusted_policy = {
+            "owner_login": "synthetic-owner",
+            "audit_ignore_prs": [7],
+            "audit_acknowledged_direct": {direct: "approved emergency hotfix"},
+            "audit_direct_commits": 5,
+        }
+        commit = {
+            "sha": direct,
+            "parents": [],
+            "commit": {"message": "hotfix", "committer": {"date": "2026-01-02T00:00:00Z"}},
+        }
+        refs_seen = []
+
+        def fake_request(method, path, body=None, params=None, allow=()):
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == "/repos/o/r/pulls":
+                return []
+            if path == "/repos/o/r/commits":
+                return [commit]
+            if path.startswith("/repos/o/r/commits/") and path.endswith("/pulls"):
+                return []
+            return []
+
+        def fake_load_policy(repo, ref, fallback=None):
+            refs_seen.append(("load", ref))
+            return trusted_policy
+
+        def fake_verify_script(repo, ref):
+            refs_seen.append(("verify", ref))
+
+        with mock.patch.object(gate, "request", fake_request), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: []), \
+             mock.patch.object(gate, "load_policy", fake_load_policy), \
+             mock.patch.object(gate, "verify_script", fake_verify_script):
+            code = gate.audit("o/r", 20, True, policy_ref="refs/tags/trusted-policy")
+        self.assertEqual(code, 0)
+        self.assertEqual(refs_seen, [("load", "refs/tags/trusted-policy"), ("verify", "refs/tags/trusted-policy")])
+
+        refs_seen.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = Path(tmp) / "policy.json"
+            policy_path.write_text(json.dumps(trusted_policy), encoding="utf-8")
+            with mock.patch.object(gate, "request", fake_request), \
+                 mock.patch.object(gate, "paginate", lambda path, params=None: []), \
+                 mock.patch.object(gate, "verify_script", fake_verify_script):
+                code = gate.audit("o/r", 20, True, policy_file=str(policy_path))
+        self.assertEqual(code, 0)
+        self.assertEqual(refs_seen, [("verify", "main")])
 
 
 class DirectPushAuditTests(unittest.TestCase):
@@ -1122,7 +1260,9 @@ class AiReviewReceiptTests(unittest.TestCase):
                 }
             },
         )
-        self.assertEqual(self.verdict([wrong_marker])[0], "pending")
+        state, note = self.verdict([wrong_marker])
+        self.assertEqual(state, "failure")
+        self.assertIn("Ambiguous or disallowed", note)
 
         mismatched_provider = self.comment(
             "claude[bot]",
@@ -1287,6 +1427,70 @@ class AiReviewReceiptTests(unittest.TestCase):
             {"codex", "claude", "cursor"},
         )
 
+    def test_ambiguous_or_multiple_markers_fail_closed(self):
+        clean_claude = json.dumps(
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            }
+        )
+        dirty_claude = json.dumps(
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 2,
+                    "coverage": "complete",
+                }
+            }
+        )
+        codex_state = json.dumps(
+            {
+                "code_review": {
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "has_unresolved_findings": False,
+                }
+            }
+        )
+        cursor_good = self.comment(
+            "cursor[bot]",
+            "ai-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "cursor",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+            updated_at="2026-11-14T10:00:00Z",
+        )
+        for body in (
+            f"<!-- ai-review-receipt:v1 {clean_claude} -->\n<!-- ai-review-receipt:v1 {dirty_claude} -->",
+            f"<!-- ai-review-receipt:v1 {clean_claude} -->\n<!-- ai-review-receipt:v1 {clean_claude} -->",
+            f"<!-- ai-review-receipt:v1 {clean_claude} -->\n<!-- codex-review-state:v1 {codex_state} -->",
+        ):
+            with self.subTest(body=body):
+                ambiguous = {
+                    "user": {"login": "claude[bot]"},
+                    "body": body,
+                    "updated_at": "2026-11-14T08:00:00Z",
+                }
+                state, note = self.verdict([ambiguous])
+                self.assertEqual(state, "failure")
+                self.assertIn("Ambiguous or disallowed", note)
+
+                state_with_cursor, _ = self.verdict([ambiguous, cursor_good])
+                self.assertEqual(state_with_cursor, "failure")
+
 
 class ClearingLabelTests(unittest.TestCase):
     HEAD = "a" * 40
@@ -1298,12 +1502,22 @@ class ClearingLabelTests(unittest.TestCase):
             "head": {"sha": self.HEAD, "ref": "feat/test", "repo": {"full_name": head_repo}},
         }
 
-    def test_legacy_three_arg_live_label_allows_non_owner_agent_only(self):
+    def test_legacy_three_arg_live_label_enforces_owner_and_agent_logins(self):
         events = [
             {"event": "labeled", "label": {"name": "owner-approved"}, "actor": {"login": "intruder"}},
             {"event": "labeled", "label": {"name": "agent-approved"}, "actor": {"login": "codex-bot"}},
         ]
         with mock.patch.object(gate, "paginate", return_value=events):
+            self.assertIsNone(gate.live_label("o/r", 7, "owner-login"))
+            self.assertEqual(
+                gate.live_label("o/r", 7, "owner-login", agent_logins={"codex-bot"}),
+                "agent-approved",
+            )
+
+        owner_as_agent = [
+            {"event": "labeled", "label": {"name": "agent-approved"}, "actor": {"login": "owner-login"}},
+        ]
+        with mock.patch.object(gate, "paginate", return_value=owner_as_agent):
             self.assertEqual(gate.live_label("o/r", 7, "owner-login"), "agent-approved")
 
         both_valid = [
@@ -1311,7 +1525,10 @@ class ClearingLabelTests(unittest.TestCase):
             {"event": "labeled", "label": {"name": "owner-approved"}, "actor": {"login": "owner-login"}},
         ]
         with mock.patch.object(gate, "paginate", return_value=both_valid):
-            self.assertEqual(gate.live_label("o/r", 7, "owner-login"), "owner-approved")
+            self.assertEqual(
+                gate.live_label("o/r", 7, "owner-login", agent_logins={"codex-bot"}),
+                "owner-approved",
+            )
 
     def test_timeline_commit_or_push_clears_earlier_clearing_labels(self):
         pull = self.pull(["owner-approved"])
@@ -1328,7 +1545,7 @@ class ClearingLabelTests(unittest.TestCase):
         with mock.patch.object(gate, "paginate", return_value=timeline):
             self.assertIsNone(gate.live_label("o/r", 7, "owner-login", pull=pull))
 
-    def test_clearing_label_status_accepts_non_owner_agent_on_exact_head(self):
+    def test_clearing_label_status_accepts_owner_or_configured_agent_on_exact_head(self):
         pull = self.pull(["agent-approved"])
         timeline = [
             {
@@ -1356,9 +1573,32 @@ class ClearingLabelTests(unittest.TestCase):
             raise AssertionError(f"Unexpected paginate call: {path}")
 
         with mock.patch.object(gate, "paginate", fake_paginate):
-            self.assertEqual(gate.live_label("o/r", 7, "owner-login", pull=pull), "agent-approved")
+            self.assertIsNone(gate.live_label("o/r", 7, "owner-login", pull=pull))
+            self.assertEqual(
+                gate.live_label(
+                    "o/r", 7, "owner-login", pull=pull, agent_logins={"review-agent"}
+                ),
+                "agent-approved",
+            )
 
-    def test_activity_fallback_verifies_head_and_rejects_push_after_label_or_fork(self):
+        bad_owner_pull = self.pull(["owner-approved"])
+        bad_owner_timeline = [
+            {
+                "id": 203,
+                "event": "labeled",
+                "label": {"name": "owner-approved"},
+                "actor": {"login": "review-agent"},
+                "created_at": "2026-11-14T08:10:00Z",
+            }
+        ]
+        with mock.patch.object(gate, "paginate", return_value=bad_owner_timeline):
+            self.assertIsNone(
+                gate.live_label(
+                    "o/r", 7, "owner-login", pull=bad_owner_pull, agent_logins={"review-agent"}
+                )
+            )
+
+    def test_activity_fallback_cursor_pagination_and_fork_prs(self):
         pull = self.pull(["agent-approved"])
         timeline = [
             {
@@ -1370,41 +1610,68 @@ class ClearingLabelTests(unittest.TestCase):
             }
         ]
 
-        def run_with_activity(activity_list, test_pull=pull):
+        def run_with_raw(raw_handler, test_pull=pull, agent_logins=frozenset({"review-agent"})):
             def fake_paginate(path, params=None):
                 if path.endswith("/timeline"):
                     return timeline
                 if path.endswith("/statuses"):
                     return []
-                if path.endswith("/activity"):
-                    return activity_list
                 raise AssertionError(f"Unexpected paginate call: {path}")
 
-            with mock.patch.object(gate, "paginate", fake_paginate):
-                return gate.live_label("o/r", 7, "owner-login", pull=test_pull)
+            with mock.patch.object(gate, "paginate", fake_paginate), \
+                 mock.patch.object(gate, "_raw_request", raw_handler):
+                return gate.live_label("o/r", 7, "owner-login", pull=test_pull, agent_logins=set(agent_logins))
+
+        seen_params = []
+
+        def paged_handler(method, path, body=None, params=None, allow=()):
+            self.assertEqual(path, "/repos/o/r/activity")
+            self.assertNotIn("page", params or {})
+            seen_params.append(dict(params or {}))
+            if "after" not in (params or {}):
+                return (
+                    [{"activity_type": "push", "after": "b" * 40, "timestamp": "2026-11-14T07:55:00Z"}],
+                    {"link": '<https://api.github.com/repos/o/r/activity?ref=refs%2Fheads%2Ffeat%2Ftest&per_page=100&after=c2>; rel="next"'},
+                )
+            self.assertEqual(params["after"], "c2")
+            return (
+                [{"activity_type": "push", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00+00:00"}],
+                {},
+            )
+
+        self.assertEqual(run_with_raw(paged_handler), "agent-approved")
+        self.assertEqual(len(seen_params), 2)
+
+        def repeating_cursor_handler(method, path, body=None, params=None, allow=()):
+            return (
+                [{"activity_type": "push", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00Z"}],
+                {"link": '<https://api.github.com/repos/o/r/activity?after=c2>; rel="next"'},
+            )
+
+        self.assertIsNone(run_with_raw(repeating_cursor_handler))
+
+        for bad_entries in (
+            [{"activity_type": "force_push", "after": self.HEAD, "timestamp": "2026-11-14T08:12:00Z"}],
+            [{"activity_type": "pr_merge", "after": "d" * 40, "timestamp": "2026-11-14T08:12:00Z"}],
+            [{"activity_type": "branch_deletion", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00Z"}],
+            [{"activity_type": "push", "after": "b" * 40, "timestamp": "2026-11-14T08:05:00Z"}],
+            [{"activity_type": "push", "after": self.HEAD}],
+            [],
+        ):
+            with self.subTest(bad_entries=bad_entries):
+                self.assertIsNone(run_with_raw(lambda *a, entries=bad_entries, **k: (entries, {})))
+
+        def fork_ok(method, path, body=None, params=None, allow=()):
+            self.assertEqual(path, "/repos/fork/r/activity")
+            return ([{"activity_type": "push", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00Z"}], {})
 
         self.assertEqual(
-            run_with_activity(
-                [
-                    {"activity_type": "push", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00+00:00"},
-                    {"activity_type": "push", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00Z"},
-                ]
-            ),
+            run_with_raw(fork_ok, test_pull=self.pull(["agent-approved"], head_repo="fork/r")),
             "agent-approved",
         )
         self.assertIsNone(
-            run_with_activity(
-                [{"activity_type": "force_push", "after": self.HEAD, "timestamp": "2026-11-14T08:12:00Z"}]
-            )
-        )
-        self.assertIsNone(
-            run_with_activity(
-                [{"activity_type": "push", "after": "b" * 40, "timestamp": "2026-11-14T08:05:00Z"}]
-            )
-        )
-        self.assertIsNone(
-            run_with_activity(
-                [{"activity_type": "push", "after": self.HEAD, "timestamp": "2026-11-14T08:05:00Z"}],
+            run_with_raw(
+                lambda *a, **k: (None, {}),
                 test_pull=self.pull(["agent-approved"], head_repo="fork/r"),
             )
         )
@@ -1441,11 +1708,19 @@ class EvaluatePolicyTests(unittest.TestCase):
             + self.HEAD
             + '","status":"completed","unresolved_findings":0,"coverage":"complete"}} -->',
         }
+        clean_tree = {"truncated": False, "tree": [{"path": "app.py", "mode": "100644", "type": "blob"}]}
 
-        def run_eval(policy, file_entry):
-            with mock.patch.object(gate, "request", side_effect=lambda m, p, **k: (
-                pull if p == "/repos/o/r/pulls/7" else {"default_branch": "main"} if p == "/repos/o/r" else None
-            )), \
+        def run_eval(policy, file_entry, tree_payload=clean_tree):
+            def fake_request(m, p, **k):
+                if p == "/repos/o/r/pulls/7":
+                    return pull
+                if p == "/repos/o/r":
+                    return {"default_branch": "main"}
+                if p == f"/repos/o/r/git/trees/{self.HEAD}":
+                    return tree_payload
+                return None
+
+            with mock.patch.object(gate, "request", side_effect=fake_request), \
                  mock.patch.object(gate, "load_policy", return_value=policy), \
                  mock.patch.object(gate, "verify_script", return_value=None), \
                  mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
@@ -1507,6 +1782,109 @@ class EvaluatePolicyTests(unittest.TestCase):
                 "policy_sha256": "p2",
             }
             gate.revalidate("o/r", reval)
+
+    def test_evaluate_rejects_symlinks_even_under_docs_and_handles_truncated_or_missing_trees(self):
+        pull = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": self.HEAD, "ref": "feat/x", "repo": {"full_name": "o/r"}},
+            "base": {"ref": "main"},
+            "user": {"login": "contributor"},
+            "changed_files": 1,
+            "body": "## AI assistance\nCodex\n\n## What changed\nAdd link\n\n## How verified\nTested\n",
+            "labels": [],
+        }
+        policy = {
+            "codex_required": False,
+            "require_checks": False,
+            "owner_login": "owner-login",
+            "_source": "main",
+            "_sha256": "p3",
+        }
+        doc_link = {
+            "filename": "docs/link.md",
+            "status": "added",
+            "sha": "blob123",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+        }
+        blob_calls = []
+
+        def fake_request(m, p, params=None, **k):
+            if p == "/repos/o/r/pulls/7":
+                return pull
+            if p == "/repos/o/r":
+                return {"default_branch": "main"}
+            if p.startswith("/repos/o/r/git/blobs/"):
+                blob_calls.append(p)
+                return {"size": 0}
+            if p == f"/repos/o/r/git/trees/{self.HEAD}" and params == {"recursive": "1"}:
+                return {"truncated": False, "tree": [{"path": "docs/link.md", "mode": "120000", "type": "blob"}]}
+            return None
+
+        with mock.patch.object(gate, "request", side_effect=fake_request), \
+             mock.patch.object(gate, "load_policy", return_value=policy), \
+             mock.patch.object(gate, "verify_script", return_value=None), \
+             mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
+             mock.patch.object(gate, "shared_head", return_value=False), \
+             mock.patch.object(gate, "base_action_files", return_value=set()), \
+             mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: [doc_link] if p.endswith("/files") else []):
+            verdict, reasons = gate.evaluate("o/r", 7)
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertEqual(verdict["tier"], "T2")
+        self.assertEqual(blob_calls, [])
+        self.assertTrue(any("Symlink entries are not allowed" in r for r in reasons))
+
+        # Truncated recursive tree walks down child subtree SHAs cleanly.
+        def truncated_request(m, p, params=None, **k):
+            if p == "/repos/o/r/pulls/7":
+                return pull
+            if p == "/repos/o/r":
+                return {"default_branch": "main"}
+            if p == f"/repos/o/r/git/trees/{self.HEAD}" and params == {"recursive": "1"}:
+                return {"truncated": True, "tree": []}
+            if p == f"/repos/o/r/git/trees/{self.HEAD}" and params is None:
+                return {"truncated": False, "tree": [{"path": "docs", "mode": "040000", "type": "tree", "sha": "sub1"}]}
+            if p == "/repos/o/r/git/trees/sub1":
+                return {"truncated": False, "tree": [{"path": "link.md", "mode": "120000", "type": "blob"}]}
+            return None
+
+        with mock.patch.object(gate, "request", side_effect=truncated_request):
+            flagged, ok = gate.symlink_entries("o/r", self.HEAD, [doc_link])
+        self.assertTrue(ok)
+        self.assertEqual(flagged, ["docs/link.md"])
+
+        # Missing head tree fails closed and upgrades tier to T2.
+        def missing_tree_request(m, p, params=None, **k):
+            if p == "/repos/o/r/pulls/7":
+                return pull
+            if p == "/repos/o/r":
+                return {"default_branch": "main"}
+            if p == f"/repos/o/r/git/trees/{self.HEAD}":
+                return None
+            return None
+
+        clean_doc = {
+            "filename": "docs/guide.md",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "patch": "@@ -0,0 +1 @@\n+hello\n",
+        }
+        with mock.patch.object(gate, "request", side_effect=missing_tree_request), \
+             mock.patch.object(gate, "load_policy", return_value=policy), \
+             mock.patch.object(gate, "verify_script", return_value=None), \
+             mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
+             mock.patch.object(gate, "shared_head", return_value=False), \
+             mock.patch.object(gate, "base_action_files", return_value=set()), \
+             mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: [clean_doc] if p.endswith("/files") else []):
+            missing_verdict, missing_reasons = gate.evaluate("o/r", 7)
+        self.assertEqual(missing_verdict["verdict"], "fail")
+        self.assertEqual(missing_verdict["tier"], "T2")
+        self.assertIn("Cannot verify Git tree modes for changed files", missing_reasons)
 
 
 if __name__ == "__main__":

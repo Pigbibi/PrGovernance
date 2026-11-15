@@ -163,3 +163,14 @@ trusted copy.
   providers (`chatgpt-codex-connector[bot]`, `claude[bot]`, or `cursor[bot]`)
   with author-matched `ai-review-receipt:v1`, explicit complete coverage on
   receipt markers, and no unresolved findings on the current head.
+- On T2 pull requests, `owner-approved` requires `owner_login`. Optional
+  `"agent_logins"` in the base `governance/policy.json` allowlists trusted
+  non-owner agent GitHub logins allowed to apply `agent-approved`; when
+  omitted, only `owner_login` is accepted (fail closed for arbitrary
+  collaborators or triage users). `merge_gate.py` also refuses Git symlink
+  (`120000`) tree entries on pull requests.
+- `merge_gate.py --audit` accepts `--policy-ref <ref>` or `--policy-file <path>`
+  to evaluate against a trusted policy revision instead of the audited branch;
+  passing `--strict-direct` without a trusted policy ignores self-exemptions
+  (`audit_since`, `audit_ignore_prs`, `audit_acknowledged_direct`) and clamps
+  `audit_direct_commits` to at least 40.

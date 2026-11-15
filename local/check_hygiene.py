@@ -96,7 +96,7 @@ def warn(msg: str) -> None:
 
 def iter_files(root: Path):
     for p in root.rglob("*"):
-        if any(part in SKIP_DIRS for part in p.parts):
+        if any(part in SKIP_DIRS for part in p.relative_to(root).parts):
             continue
         if p.is_file():
             yield p
@@ -170,7 +170,7 @@ def check_filename(root: Path, path: Path) -> None:
 
 def check_dirs(root: Path) -> None:
     for p in root.rglob("*"):
-        if any(part in SKIP_DIRS for part in p.parts):
+        if any(part in SKIP_DIRS for part in p.relative_to(root).parts):
             continue
         if p.is_dir() and BANNED_DIR.match(p.name):
             err(f"{p.relative_to(root)}/: do not split directories by phase, see section 1.3")

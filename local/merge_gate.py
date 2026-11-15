@@ -144,13 +144,13 @@ def auth_token() -> str:
 TOKEN = None
 
 
-def request(
+def _raw_request(
     method: str,
     path: str,
     body: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
     allow: tuple[int, ...] = (),
-) -> Any:
+) -> tuple[Any, dict[str, str]]:
     global TOKEN
     if TOKEN is None:
         TOKEN = auth_token()
@@ -172,18 +172,31 @@ def request(
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read()
+            headers = {k.lower(): v for k, v in response.headers.items()}
     except urllib.error.HTTPError as exc:
         raw = exc.read()
+        headers = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
         if exc.code in allow:
-            return None
+            return None, headers
         try:
             detail = json.loads(raw).get("message", "")
         except (ValueError, AttributeError):
             detail = raw[:200].decode("utf-8", "replace")
         raise ApiError(exc.code, detail) from exc
     if not raw:
-        return None
-    return json.loads(raw)
+        return None, headers
+    return json.loads(raw), headers
+
+
+def request(
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    allow: tuple[int, ...] = (),
+) -> Any:
+    payload, _ = _raw_request(method, path, body=body, params=params, allow=allow)
+    return payload
 
 
 def paginate(path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -367,7 +380,7 @@ def scan_secrets(files: list[dict[str, Any]]) -> list[str]:
         patch = file.get("patch")
         if not isinstance(patch, str):
             continue
-        for line in patch.splitlines():
+        for line in patch.split("\n"):
             # GitHub's files endpoint omits ---/+++ diff headers, so a line
             # starting with +++ is an added line beginning with ++.
             if not line.startswith("+"):
@@ -513,6 +526,13 @@ def _receipt_unresolved(review: dict[str, Any]) -> bool | None:
 def _judge_provider_receipt(
     login_provider: str, marker_index: int, raw: str, head: str
 ) -> tuple[str, str, bool | None, bool]:
+    if marker_index < 0:
+        return (
+            "failure",
+            f"Ambiguous or disallowed AI review receipt markers in {login_provider} comment",
+            True,
+            False,
+        )
     review = _parse_review_payload(marker_index, raw)
     if not review:
         return "error", "AI review receipt is not valid JSON", None, False
@@ -565,18 +585,25 @@ def ai_review_verdict(
         if login_provider not in active:
             continue
         body = comment.get("body") or ""
+        matches = [
+            (idx, match.group(1))
+            for idx, pattern in enumerate(RECEIPT_MARKERS)
+            for match in pattern.finditer(body)
+        ]
+        if not matches:
+            continue
         updated_at = comment.get("updated_at") or ""
         comment_id = comment.get("id")
         cid = comment_id if isinstance(comment_id, int) and not isinstance(comment_id, bool) else 0
         parsed_ts = _parse_iso_timestamp(updated_at) or _EPOCH_MIN
-        for index in allowed_indices:
-            match = RECEIPT_MARKERS[index].search(body)
-            if match:
-                candidate = (parsed_ts, updated_at, cid, seq_idx, index, match.group(1))
-                prev = latest_by_provider.get(login_provider)
-                if prev is None or candidate[:4] > prev[:4]:
-                    latest_by_provider[login_provider] = candidate
-                break
+        if len(matches) > 1 or matches[0][0] not in allowed_indices:
+            candidate = (parsed_ts, updated_at, cid, seq_idx, -1, "")
+        else:
+            marker_index, payload_raw = matches[0]
+            candidate = (parsed_ts, updated_at, cid, seq_idx, marker_index, payload_raw)
+        prev = latest_by_provider.get(login_provider)
+        if prev is None or candidate[:4] > prev[:4]:
+            latest_by_provider[login_provider] = candidate
     if not latest_by_provider:
         return "pending", "No AI review receipt on this pull request"
 
@@ -631,18 +658,76 @@ def policy_review_providers(policy: dict[str, Any]) -> set[str]:
     return set()
 
 
-def _valid_clearing_actor(name: str, event: dict[str, Any], owner: str) -> bool:
+_UNSET = object()
+
+
+def policy_agent_logins(policy: dict[str, Any] | None) -> set[str]:
+    if not isinstance(policy, dict):
+        return set()
+    configured = policy.get("agent_logins")
+    if not isinstance(configured, list):
+        configured = policy.get("approved_agent_logins")
+    if not isinstance(configured, list):
+        return set()
+    return {login.strip() for login in configured if isinstance(login, str) and login.strip()}
+
+
+def _valid_clearing_actor(
+    name: str, event: dict[str, Any], owner: str, agent_logins: set[str] | None = None
+) -> bool:
     if event.get("event") != "labeled":
         return False
     actor_login = (event.get("actor") or {}).get("login") or ""
     if name == "owner-approved":
         return bool(owner) and actor_login == owner
     if name == "agent-approved":
-        return bool(actor_login)
+        allowed = ({owner} if owner else set()) | set(agent_logins or ())
+        return bool(actor_login) and actor_login in allowed
     return False
 
 
-def live_label(repo: str, number: int, owner: str, pull: dict[str, Any] | None = None) -> str | None:
+def branch_activities(activity_repo: str, head_ref: str) -> list[dict[str, Any]] | None:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", activity_repo):
+        return None
+    owner_part, repo_part = activity_repo.split("/", 1)
+    if owner_part in (".", "..") or repo_part in (".", ".."):
+        return None
+    entries: list[dict[str, Any]] = []
+    cursor: str | None = None
+    seen: set[str] = set()
+    while True:
+        params: dict[str, Any] = {"ref": f"refs/heads/{head_ref}", "per_page": 100}
+        if cursor is not None:
+            params["after"] = cursor
+        chunk, headers = _raw_request(
+            "GET",
+            f"/repos/{activity_repo}/activity",
+            params=params,
+            allow=(403, 404),
+        )
+        if chunk is None or not isinstance(chunk, list):
+            return None
+        entries.extend(chunk)
+        link_header = headers.get("link", "")
+        next_match = re.search(r'<([^>]+)>\s*;\s*(?:[^,]*;\s*)?rel="next"', link_header)
+        if not next_match:
+            return entries
+        next_query = urllib.parse.parse_qs(urllib.parse.urlparse(next_match.group(1)).query)
+        next_cursors = next_query.get("after") or []
+        next_cursor = next_cursors[0] if next_cursors else ""
+        if not next_cursor or next_cursor in seen:
+            return None
+        seen.add(next_cursor)
+        cursor = next_cursor
+
+
+def live_label(
+    repo: str,
+    number: int,
+    owner: str,
+    pull: dict[str, Any] | None = None,
+    agent_logins: set[str] | None = None,
+) -> str | None:
     if pull is None:
         events = paginate(f"/repos/{repo}/issues/{number}/events")
         latest: dict[str, dict[str, Any]] = {}
@@ -652,7 +737,7 @@ def live_label(repo: str, number: int, owner: str, pull: dict[str, Any] | None =
                 latest[name] = event
         for name in ("owner-approved", "agent-approved"):
             event = latest.get(name)
-            if event and _valid_clearing_actor(name, event, owner):
+            if event and _valid_clearing_actor(name, event, owner, agent_logins):
                 return name
         return None
 
@@ -675,14 +760,14 @@ def live_label(repo: str, number: int, owner: str, pull: dict[str, Any] | None =
             latest[name] = event
 
     statuses: list[dict[str, Any]] | None = None
-    activities: list[dict[str, Any]] | None = None
+    activities: Any = _UNSET
     head_repo = ((head_info.get("repo") or {}).get("full_name") or "")
     head_ref = head_info.get("ref") or ""
     for name in ("owner-approved", "agent-approved"):
         if name not in present:
             continue
         event = latest.get(name)
-        if not event or not _valid_clearing_actor(name, event, owner):
+        if not event or not _valid_clearing_actor(name, event, owner, agent_logins):
             continue
         if statuses is None:
             statuses = paginate(f"/repos/{repo}/commits/{head}/statuses")
@@ -698,21 +783,28 @@ def live_label(repo: str, number: int, owner: str, pull: dict[str, Any] | None =
             ):
                 return name
         event_ts = _parse_iso_timestamp(event.get("created_at"))
-        if head_repo != repo or not head_ref or event_ts is None:
+        activity_repo = head_repo or ""
+        if not activity_repo or not head_ref or event_ts is None:
             continue
-        if activities is None:
-            activities = paginate(f"/repos/{repo}/activity", {"ref": f"refs/heads/{head_ref}"})
-        push_events: list[tuple[dt.datetime, dict[str, Any]]] = []
+        if activities is _UNSET:
+            activities = branch_activities(activity_repo, head_ref)
+        if not activities:
+            continue
+        timed_entries: list[tuple[dt.datetime, dict[str, Any]]] = []
+        valid_entries = True
         for entry in activities:
-            if entry.get("activity_type") not in ("branch_creation", "push", "force_push"):
-                continue
+            if not isinstance(entry, dict) or not isinstance(entry.get("activity_type"), str) or not entry.get("activity_type"):
+                valid_entries = False
+                break
             ts = _parse_iso_timestamp(entry.get("timestamp"))
-            if ts is not None:
-                push_events.append((ts, entry))
-        if not push_events:
+            if ts is None:
+                valid_entries = False
+                break
+            timed_entries.append((ts, entry))
+        if not valid_entries or not timed_entries:
             continue
-        newest_ts, newest = max(push_events, key=lambda pair: pair[0])
-        if newest.get("after") == head and event_ts >= newest_ts:
+        newest_ts, newest = max(timed_entries, key=lambda pair: pair[0])
+        if newest.get("activity_type") != "branch_deletion" and newest.get("after") == head and event_ts >= newest_ts:
             return name
     return None
 
@@ -850,6 +942,86 @@ def check_results(
     return missing, unsettled, pending, failing
 
 
+def _resolve_tree_mode(
+    repo: str, head: str, path: str, tree_cache: dict[str, dict[str, dict[str, Any]] | None]
+) -> tuple[bool, bool]:
+    """Resolve (resolved_ok, is_symlink) for path by walking Git tree objects."""
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return False, False
+    current_sha = head
+    for idx, segment in enumerate(parts):
+        if current_sha not in tree_cache:
+            data = request("GET", f"/repos/{repo}/git/trees/{current_sha}", allow=(404,))
+            if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
+                tree_cache[current_sha] = None
+                return False, False
+            tree_cache[current_sha] = {
+                e.get("path"): e
+                for e in data["tree"]
+                if isinstance(e, dict) and isinstance(e.get("path"), str)
+            }
+        entries = tree_cache[current_sha]
+        if entries is None:
+            return False, False
+        entry = entries.get(segment)
+        if not entry:
+            return False, False
+        if entry.get("mode") == "120000":
+            return True, True
+        if idx < len(parts) - 1:
+            if entry.get("type") != "tree" or not entry.get("sha"):
+                return False, False
+            current_sha = entry["sha"]
+    return True, False
+
+
+def symlink_entries(
+    repo: str, head: str, files: list[dict[str, Any]]
+) -> tuple[list[str], bool]:
+    checked = [
+        f.get("filename")
+        for f in files
+        if f.get("status") != "removed" and isinstance(f.get("filename"), str) and f.get("filename")
+    ]
+    if not checked:
+        return [], True
+    tree = request(
+        "GET",
+        f"/repos/{repo}/git/trees/{head}",
+        params={"recursive": "1"},
+        allow=(404,),
+    )
+    if not isinstance(tree, dict) or not isinstance(tree.get("tree"), list):
+        return [], False
+    modes = {
+        e.get("path"): e.get("mode")
+        for e in tree["tree"]
+        if isinstance(e, dict) and isinstance(e.get("path"), str)
+    }
+    flagged: list[str] = []
+    tree_cache: dict[str, dict[str, dict[str, Any]] | None] = {}
+    truncated = bool(tree.get("truncated"))
+    for path in checked:
+        parts = [part for part in path.split("/") if part]
+        if not parts:
+            return [], False
+        prefixes = ["/".join(parts[: i + 1]) for i in range(len(parts))]
+        if any(modes.get(prefix) == "120000" for prefix in prefixes):
+            flagged.append(path)
+            continue
+        if path in modes and not (truncated and any(prefix not in modes for prefix in prefixes)):
+            continue
+        if not truncated:
+            return [], False
+        ok, is_symlink = _resolve_tree_mode(repo, head, path, tree_cache)
+        if not ok:
+            return [], False
+        if is_symlink:
+            flagged.append(path)
+    return flagged, True
+
+
 def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
     pull = request("GET", f"/repos/{repo}/pulls/{number}")
     if pull.get("state") != "open":
@@ -865,15 +1037,6 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
         print("warning: no policy on the default branch; reading the head (bootstrap)", file=sys.stderr)
     verify_script(repo, policy_ref)
     files = paginate(f"/repos/{repo}/pulls/{number}/files")
-    for file in files:
-        if complete_patch(file) or file.get("changes") != 0:
-            continue
-        if Path(file.get("filename") or "").suffix.lower() in BINARY_EXTENSIONS:
-            continue
-        if not file.get("sha"):
-            continue
-        blob = request("GET", f"/repos/{repo}/git/blobs/{file['sha']}", allow=(404,))
-        file["_size"] = (blob or {}).get("size")
     reasons: list[str] = []
     if len(files) != pull.get("changed_files") or len(files) >= 3000:
         reasons.append("Changed-file list is incomplete; refuse to judge a partial diff")
@@ -882,11 +1045,33 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
         reasons.append("Base branch advanced since this head was built; update the branch first")
     if shared_head(repo, number, head):
         reasons.append("Another open pull request shares this head; verdicts would collide")
+    symlinks, tree_ok = symlink_entries(repo, head, files)
+    symlink_set = set(symlinks)
+    if symlinks:
+        reasons.append(
+            "Symlink entries are not allowed in pull requests: " + ", ".join(sorted(symlinks)[:5])
+        )
+    if not tree_ok:
+        reasons.append("Cannot verify Git tree modes for changed files")
+    for file in files:
+        if file.get("filename") in symlink_set:
+            continue
+        if complete_patch(file) or file.get("changes") != 0:
+            continue
+        if Path(file.get("filename") or "").suffix.lower() in BINARY_EXTENSIONS:
+            continue
+        if not file.get("sha"):
+            continue
+        blob = request("GET", f"/repos/{repo}/git/blobs/{file['sha']}", allow=(404,))
+        file["_size"] = (blob or {}).get("size")
     verified_dependabot = (
         (pull.get("user") or {}).get("login") == "dependabot[bot]" and dependabot_head(repo, number)
     )
     extra = tuple(policy.get("extra_protected_paths") or ())
     tier, fast_path = classify(files, verified_dependabot, base_action_files(repo, policy_ref), extra)
+    if symlinks or not tree_ok:
+        tier = "T2"
+        fast_path = False
     providers = policy_review_providers(policy)
     if providers and tier != "T0" and not fast_path:
         if providers == {"codex"}:
@@ -899,7 +1084,12 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
         codex_state, codex_note = "skipped", "Not required for this change"
     if codex_state not in ("success", "skipped"):
         reasons.append(codex_note)
-    label = live_label(repo, number, policy.get("owner_login", ""), pull=pull) if tier == "T2" else None
+    agent_logins = policy_agent_logins(policy)
+    label = (
+        live_label(repo, number, policy.get("owner_login", ""), pull=pull, agent_logins=agent_logins)
+        if tier == "T2"
+        else None
+    )
     if tier == "T2" and label is None:
         reasons.append("Protected paths need a live owner-approved or agent-approved label")
     if tier == "T2" and policy.get("require_owner_label_for_protected") and label != "owner-approved":
@@ -994,7 +1184,13 @@ def revalidate(repo: str, verdict: dict[str, Any]) -> None:
     if shared_head(repo, verdict["pr"], verdict["head_sha"]):
         raise Refusal("Another open pull request now shares this head; re-run the gate")
     if verdict.get("tier") == "T2":
-        live = live_label(repo, verdict["pr"], policy.get("owner_login", ""), pull=pull)
+        live = live_label(
+            repo,
+            verdict["pr"],
+            policy.get("owner_login", ""),
+            pull=pull,
+            agent_logins=policy_agent_logins(policy),
+        )
         if live != verdict.get("label"):
             raise Refusal("Clearing label changed since the verdict; re-run the gate")
     if verdict.get("codex") not in (None, "skipped"):
@@ -1134,14 +1330,51 @@ def scan_direct_pushes(repo: str, default: str, since: str, merge_shas: set, ack
     return findings
 
 
-def audit(repo: str, limit: int, strict_direct: bool) -> int:
+def audit(
+    repo: str,
+    limit: int,
+    strict_direct: bool,
+    policy_ref: str | None = None,
+    policy_file: str | None = None,
+) -> int:
     info = request("GET", f"/repos/{repo}")
     default = info["default_branch"]
-    policy = load_policy(repo, default)
-    verify_script(repo, default)
+    if policy_file:
+        try:
+            policy = json.loads(Path(policy_file).read_bytes())
+        except (OSError, ValueError) as exc:
+            raise Refusal(f"Cannot read policy file {policy_file}: {exc}") from exc
+        if not isinstance(policy, dict):
+            raise Refusal(f"Policy file {policy_file} must contain a JSON object")
+        verify_script(repo, default)
+        trusted_policy = True
+    elif policy_ref:
+        policy = load_policy(repo, policy_ref)
+        verify_script(repo, policy_ref)
+        trusted_policy = True
+    else:
+        policy = load_policy(repo, default)
+        verify_script(repo, default)
+        trusted_policy = False
+
     owner = policy.get("owner_login", "")
-    since = policy.get("audit_since") or ""
+    violations: list[str] = []
+    raw_since = policy.get("audit_since") or ""
+    since = ""
+    if raw_since:
+        parsed_since = _parse_iso_timestamp(raw_since)
+        if parsed_since is None or parsed_since > dt.datetime.now(dt.timezone.utc):
+            violations.append("audit_since in policy is invalid or in the future")
+        else:
+            since = parsed_since.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     ignored = {str(number) for number in policy.get("audit_ignore_prs") or []}
+    acknowledged = policy.get("audit_acknowledged_direct") or {}
+    direct_limit = int(policy.get("audit_direct_commits") or 40)
+    if strict_direct and not trusted_policy:
+        since = ""
+        ignored = set()
+        acknowledged = {}
+        direct_limit = max(direct_limit, 40)
     eligible: list[dict[str, Any]] = []
     page = 1
     while True:
@@ -1185,7 +1418,6 @@ def audit(repo: str, limit: int, strict_direct: bool) -> int:
     # The API sorts by update time, not merge time; select the latest merges
     # before applying the limit so a stale update cannot consume the window.
     eligible.sort(key=lambda pull: pull["merged_at"], reverse=True)
-    violations: list[str] = []
     checked = 0
     for pull in eligible[:limit]:
         number = pull["number"]
@@ -1215,8 +1447,6 @@ def audit(repo: str, limit: int, strict_direct: bool) -> int:
             violations.append(f"#{number} merged at {head[:7]} without an authenticated passing verdict")
     merge_shas = {pull.get("merge_commit_sha") for pull in eligible[:limit] if pull.get("merge_commit_sha")}
     strict = bool(strict_direct or policy.get("audit_strict_direct", True))
-    acknowledged = policy.get("audit_acknowledged_direct") or {}
-    direct_limit = int(policy.get("audit_direct_commits") or 40)
     violations.extend(scan_direct_pushes(repo, default, since, merge_shas, acknowledged,
                                         strict, direct_limit))
     print(f"audited {checked} merged pull requests since {since or 'the beginning'}")
@@ -1248,12 +1478,24 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=20, help="merged pull requests to audit")
     parser.add_argument("--strict-direct", action="store_true",
                         help="force the strict direct-push audit even if the policy relaxes it")
+    parser.add_argument("--policy-ref", help="trusted git ref for audit policy and script verification")
+    parser.add_argument("--policy-file", help="trusted local policy JSON file for audit")
     args = parser.parse_args()
     if not args.repo:
         parser.error("--repo is required outside a git checkout")
+    if args.policy_ref and args.policy_file:
+        parser.error("--policy-ref and --policy-file cannot be used together")
+    if not args.audit and (args.policy_ref or args.policy_file):
+        parser.error("--policy-ref and --policy-file apply only to --audit")
     try:
         if args.audit:
-            return audit(args.repo, args.limit, args.strict_direct)
+            return audit(
+                args.repo,
+                args.limit,
+                args.strict_direct,
+                policy_ref=args.policy_ref,
+                policy_file=args.policy_file,
+            )
         if not args.pr:
             parser.error("--pr is required unless --audit is used")
         verdict, reasons = evaluate(args.repo, args.pr)
