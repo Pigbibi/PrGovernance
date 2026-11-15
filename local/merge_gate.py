@@ -1652,9 +1652,97 @@ def _commit_tree_sha(commit: dict[str, Any]) -> str:
     return ""
 
 
-def _canonical_commit_files(commit_detail: dict[str, Any]) -> list[tuple[Any, ...]] | None:
+VALID_GIT_FILE_MODES = frozenset({"100644", "100755", "120000", "160000"})
+ALLOWED_DIFF_STATUSES = frozenset({"added", "modified", "removed", "renamed", "copied", "changed"})
+
+
+def _fetch_tree_map(
+    repo: str,
+    tree_sha: str,
+    *,
+    recursive: bool,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> dict[str, tuple[str, str, str]] | str | None:
+    key = (tree_sha, recursive)
+    if key in tree_cache:
+        return tree_cache[key]
+    params = {"recursive": "1"} if recursive else None
+    res = request("GET", f"/repos/{repo}/git/trees/{tree_sha}", params=params, allow=(404,))
+    if not isinstance(res, dict) or not isinstance(res.get("tree"), list):
+        tree_cache[key] = None
+        return None
+    if recursive and res.get("truncated") is True:
+        tree_cache[key] = "TRUNCATED"
+        return "TRUNCATED"
+    path_key = "path"
+    entries: dict[str, tuple[str, str, str]] = {}
+    for item in res["tree"]:
+        if not isinstance(item, dict):
+            continue
+        p = item.get(path_key)
+        t = item.get("type")
+        m = item.get("mode")
+        s = item.get("sha")
+        if (
+            isinstance(p, str)
+            and p
+            and isinstance(t, str)
+            and isinstance(m, str)
+            and isinstance(s, str)
+            and re.fullmatch(r"[0-9a-f]{40}", s.lower())
+        ):
+            entries[p] = (t, m, s.lower())
+    tree_cache[key] = entries
+    return entries
+
+
+def _lookup_tree_file_mode(
+    repo: str,
+    tree_sha: str,
+    filepath: str,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> str:
+    if not tree_sha or not filepath:
+        return ""
+    parts = filepath.split("/")
+    if any(not seg or seg in (".", "..") for seg in parts):
+        return ""
+    flat = _fetch_tree_map(repo, tree_sha, recursive=True, tree_cache=tree_cache)
+    if isinstance(flat, dict):
+        entry = flat.get(filepath)
+        if entry and entry[0] in ("blob", "commit") and entry[1] in VALID_GIT_FILE_MODES:
+            return entry[1]
+        return ""
+    if flat != "TRUNCATED":
+        return ""
+    current_tree = tree_sha
+    for segment in parts[:-1]:
+        node_map = _fetch_tree_map(repo, current_tree, recursive=False, tree_cache=tree_cache)
+        if not isinstance(node_map, dict):
+            return ""
+        sub = node_map.get(segment)
+        if not sub or sub[0] != "tree" or sub[1] != "040000":
+            return ""
+        current_tree = sub[2]
+    leaf_map = _fetch_tree_map(repo, current_tree, recursive=False, tree_cache=tree_cache)
+    if not isinstance(leaf_map, dict):
+        return ""
+    leaf = leaf_map.get(parts[-1])
+    if leaf and leaf[0] in ("blob", "commit") and leaf[1] in VALID_GIT_FILE_MODES:
+        return leaf[1]
+    return ""
+
+
+def _canonical_commit_files(
+    repo: str,
+    commit_detail: dict[str, Any],
+    parent_commit: dict[str, Any] | None,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> list[tuple[Any, ...]] | None:
     files = commit_detail.get("files")
-    if not isinstance(files, list) or not (0 < len(files) < 300):
+    commit_tree = _commit_tree_sha(commit_detail)
+    parent_tree = _commit_tree_sha(parent_commit) if isinstance(parent_commit, dict) else ""
+    if not isinstance(files, list) or not (0 < len(files) < 300) or not commit_tree:
         return None
     normalized: list[tuple[Any, ...]] = []
     for entry in files:
@@ -1676,7 +1764,7 @@ def _canonical_commit_files(commit_detail: dict[str, Any]) -> list[tuple[Any, ..
             not isinstance(filename, str)
             or not filename
             or not isinstance(status, str)
-            or not status
+            or status not in ALLOWED_DIFF_STATUSES
             or not isinstance(additions, int)
             or isinstance(additions, bool)
             or additions < 0
@@ -1688,6 +1776,21 @@ def _canonical_commit_files(commit_detail: dict[str, Any]) -> list[tuple[Any, ..
             or changes != additions + deletions
         ):
             return None
+        if status == "added":
+            old_mode = ""
+        else:
+            if not parent_tree:
+                return None
+            old_path = previous if (status in ("renamed", "copied") and previous) else filename
+            old_mode = _lookup_tree_file_mode(repo, parent_tree, old_path, tree_cache)
+            if not old_mode:
+                return None
+        if status == "removed":
+            new_mode = ""
+        else:
+            new_mode = _lookup_tree_file_mode(repo, commit_tree, filename, tree_cache)
+            if not new_mode:
+                return None
         patch = entry.get("patch")
         sha = entry.get("sha")
         sha_hex = sha.lower() if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha.lower()) else ""
@@ -1712,7 +1815,7 @@ def _canonical_commit_files(commit_detail: dict[str, Any]) -> list[tuple[Any, ..
             proof = ("patch", patch)
         else:
             return None
-        normalized.append((filename, previous, status, additions, deletions, changes, proof))
+        normalized.append((filename, previous, status, additions, deletions, changes, old_mode, new_mode, proof))
     normalized.sort()
     return normalized
 
@@ -1733,6 +1836,7 @@ def _rebased_chain_content_matches(
     pr_commits: list[dict[str, Any]],
     base_parent: str,
     pr_base_parent: str,
+    indexed: dict[str, dict[str, Any]] | None = None,
 ) -> bool:
     if len(step_commits) != len(pr_commits) or not pr_commits:
         return False
@@ -1745,13 +1849,18 @@ def _rebased_chain_content_matches(
         tree_pairs = [(_commit_tree_sha(s), _commit_tree_sha(p)) for s, p in zip(step_commits, pr_commits)]
         if all(st and st == pt for st, pt in tree_pairs):
             return True
-    for step_commit, pr_commit in zip(step_commits, pr_commits):
+    step_parent_head = _resolve_commit(repo, base_parent, indexed if indexed is not None else {}) if base_parent else None
+    pr_parent_head = _resolve_commit(repo, pr_base_parent, {}) if pr_base_parent else None
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None] = {}
+    for index, (step_commit, pr_commit) in enumerate(zip(step_commits, pr_commits)):
         step_detail = _resolve_commit_detail(repo, step_commit)
         pr_detail = _resolve_commit_detail(repo, pr_commit)
         if step_detail is None or pr_detail is None:
             return False
-        step_files = _canonical_commit_files(step_detail)
-        pr_files = _canonical_commit_files(pr_detail)
+        step_parent = step_parent_head if index == 0 else step_commits[index - 1]
+        pr_parent = pr_parent_head if index == 0 else pr_commits[index - 1]
+        step_files = _canonical_commit_files(repo, step_detail, step_parent, tree_cache)
+        pr_files = _canonical_commit_files(repo, pr_detail, pr_parent, tree_cache)
         if step_files is None or pr_files is None or step_files != pr_files:
             return False
     return True
@@ -1799,12 +1908,48 @@ def _authenticated_pull_merge_method(
     return None
 
 
+def _is_ancestor_of_base_parent(
+    repo: str,
+    base_sha: str,
+    base_parent: str,
+    indexed: dict[str, dict[str, Any]],
+) -> bool:
+    if not base_sha or not base_parent:
+        return False
+    target = base_sha.lower()
+    current = base_parent
+    seen: set[str] = set()
+    had_multi_parent = False
+    reached_root = False
+    while isinstance(current, str) and current and current.lower() not in seen:
+        lowered = current.lower()
+        if lowered == target:
+            return True
+        seen.add(lowered)
+        commit = indexed.get(current)
+        if not isinstance(commit, dict):
+            break
+        parents = [
+            p.get("sha")
+            for p in (commit.get("parents") or [])
+            if isinstance(p, dict) and isinstance(p.get("sha"), str) and p.get("sha")
+        ]
+        if len(parents) > 1:
+            had_multi_parent = True
+        if not parents:
+            reached_root = True
+            break
+        current = parents[0]
+    if reached_root and not had_multi_parent:
+        return False
+    return _commit_is_ancestor(repo, base_sha, base_parent)
+
+
 def _collect_rebased_commits(
     repo: str,
     pull: dict[str, Any],
     merge_sha: str,
     indexed: dict[str, dict[str, Any]],
-    first_parent: set[str] | None = None,
     merge_method: str | None = None,
 ) -> set[str]:
     if merge_method is not None and merge_method != "rebase":
@@ -1878,12 +2023,12 @@ def _collect_rebased_commits(
             earlier_shas.append(step_sha)
         base_parent = parent_sha
         step_sha = parent_sha
-    if not _commit_is_ancestor(repo, base_sha, base_parent, first_parent):
+    if not _is_ancestor_of_base_parent(repo, base_sha, base_parent, indexed):
         return set()
     if merge_method != "rebase":
         step_commits_rev.reverse()
         if not _rebased_chain_content_matches(
-            repo, step_commits_rev, pr_commits, base_parent, pr_base_parent
+            repo, step_commits_rev, pr_commits, base_parent, pr_base_parent, indexed
         ):
             return set()
     return set(earlier_shas)
@@ -1946,7 +2091,6 @@ def scan_direct_pushes(
                         pull,
                         current,
                         indexed,
-                        first_parent=first_parent,
                         merge_method=method,
                     )
                 )
@@ -1976,7 +2120,6 @@ def scan_direct_pushes(
                             p,
                             current,
                             indexed,
-                            first_parent=first_parent,
                             merge_method=method,
                         )
                     )

@@ -982,17 +982,37 @@ class DirectPushAuditTests(unittest.TestCase):
         self.assertIn(direct_forged[:7], findings[0])
 
         # Case 2: outside-window PR with authenticated squash verdict is rejected immediately.
+        p_base = "6" * 40
+        t_root, t_r1, t_r2 = "a0" * 20, "a1" * 20, "a2" * 20
+        t_p_base, t_p0, t_p1 = "b0" * 20, "b1" * 20, "b2" * 20
+        blob_sha = "c" * 40
         valid_tree_chain = [
-            self._rich_commit(r2, (r1,), "feat: step 2", date="2026-01-05T02:00:00Z"),
-            self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z"),
-            self._rich_commit(root, (), "chore: root"),
+            self._rich_commit(r2, (r1,), "feat: step 2", date="2026-01-05T02:00:00Z", tree_sha=t_r2),
+            self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z", tree_sha=t_r1),
+            self._rich_commit(root, (), "chore: root", tree_sha=t_root),
+        ]
+        pr9_tree_commits = [
+            self._rich_commit(p0, (p_base,), "feat: step 1", date="2026-01-05T01:00:00Z", tree_sha=t_p0),
+            self._rich_commit(p1, (p0,), "feat: step 2", date="2026-01-05T02:00:00Z", tree_sha=t_p1),
         ]
         rebased_pull = {**pull_outside, "merge_commit_sha": r2}
         rebased_details = {
-            r1: self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z", files=file_a),
-            r2: self._rich_commit(r2, (r1,), "feat: step 2", date="2026-01-05T02:00:00Z", files=file_b),
-            p0: details_forged[p0],
-            p1: details_forged[p1],
+            root: valid_tree_chain[2],
+            p_base: self._rich_commit(p_base, (), "chore: other base", tree_sha=t_p_base),
+            r1: self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z", tree_sha=t_r1, files=file_a),
+            r2: self._rich_commit(r2, (r1,), "feat: step 2", date="2026-01-05T02:00:00Z", tree_sha=t_r2, files=file_b),
+            p0: self._rich_commit(p0, (p_base,), "feat: step 1", date="2026-01-05T01:00:00Z", tree_sha=t_p0, files=file_a),
+            p1: self._rich_commit(p1, (p0,), "feat: step 2", date="2026-01-05T02:00:00Z", tree_sha=t_p1, files=file_b),
+        }
+        trees = {
+            sha: {
+                "truncated": False,
+                "tree": [
+                    {"path": "a.py", "type": "blob", "mode": "100644", "sha": blob_sha},
+                    {"path": "b.py", "type": "blob", "mode": "100644", "sha": blob_sha},
+                ],
+            }
+            for sha in (t_root, t_r1, t_r2, t_p_base, t_p0, t_p1)
         }
 
         def request_case2(method, path, body=None, params=None, allow=()):
@@ -1003,10 +1023,11 @@ class DirectPushAuditTests(unittest.TestCase):
             if path.startswith("/repos/o/r/commits/") and path.endswith("/pulls"):
                 return []
             if path.startswith("/repos/o/r/commits/"):
-                sha = path.rsplit("/", 1)[-1]
-                return rebased_details.get(sha)
+                return rebased_details.get(path.rsplit("/", 1)[-1])
+            if path.startswith("/repos/o/r/git/trees/"):
+                return trees.get(path.rsplit("/", 1)[-1])
             if path == "/repos/o/r/pulls/9/commits":
-                return pr9_commits if params and params.get("page") == 1 else []
+                return pr9_tree_commits if params and params.get("page") == 1 else []
             return []
 
         squash_comment_for_rebased = {
@@ -1031,7 +1052,7 @@ class DirectPushAuditTests(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertIn(r1[:7], findings[0])
 
-        # Case 3: outside-window PR with unknown method passes when per-commit file diffs match.
+        # Case 3: outside-window PR with unknown method passes when diffs and tree modes match.
         with mock.patch.object(gate, "request", request_case2), \
              mock.patch.object(gate, "paginate", lambda path, params=None: []):
             findings = gate.scan_direct_pushes(
@@ -1039,14 +1060,14 @@ class DirectPushAuditTests(unittest.TestCase):
             )
         self.assertEqual(findings, [])
 
-        # Case 4: truncated or missing file patches fail closed instead of proving equivalence.
+        # Case 4: truncated/missing patches, mode changes (100644 -> 100755), or missing trees fail closed.
         truncated = [{"filename": "a.py", "status": "modified", "additions": 2, "deletions": 0, "changes": 2, "patch": "@@ -1 +1,2 @@\n+a"}]
         missing_patch = [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 0, "changes": 1, "patch": None}]
         for bad_files in (truncated, missing_patch):
             bad_details = {
                 **rebased_details,
-                r1: self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z", files=bad_files),
-                p0: self._rich_commit(p0, ("6" * 40,), "feat: step 1", date="2026-01-05T01:00:00Z", files=bad_files),
+                r1: self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z", tree_sha=t_r1, files=bad_files),
+                p0: self._rich_commit(p0, (p_base,), "feat: step 1", date="2026-01-05T01:00:00Z", tree_sha=t_p0, files=bad_files),
             }
 
             def bad_request(method, path, body=None, params=None, allow=(), _details=bad_details):
@@ -1058,6 +1079,91 @@ class DirectPushAuditTests(unittest.TestCase):
                  mock.patch.object(gate, "paginate", lambda path, params=None: []):
                 findings = gate.scan_direct_pushes(
                     "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+                )
+            self.assertEqual(len(findings), 1)
+            self.assertIn(r1[:7], findings[0])
+
+        chmod_trees = {
+            **trees,
+            t_r1: {
+                "truncated": False,
+                "tree": [{"path": "a.py", "type": "blob", "mode": "100755", "sha": blob_sha}],
+            },
+        }
+        missing_trees = {**trees, t_r1: None}
+        for bad_trees in (chmod_trees, missing_trees):
+            def tree_request(method, path, body=None, params=None, allow=(), _trees=bad_trees):
+                if path.startswith("/repos/o/r/git/trees/"):
+                    return _trees.get(path.rsplit("/", 1)[-1])
+                return request_case2(method, path, body=body, params=params, allow=allow)
+
+            with mock.patch.object(gate, "request", tree_request), \
+                 mock.patch.object(gate, "paginate", lambda path, params=None: []):
+                findings = gate.scan_direct_pushes(
+                    "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+                )
+            self.assertEqual(len(findings), 1)
+            self.assertIn(r1[:7], findings[0])
+
+        # Case 5: truncated recursive trees fall back cleanly to segment-by-segment lookup.
+        sub_tree = "d1" * 20
+        dir_file = [{"filename": "dir/a.py", "status": "modified", "additions": 1, "deletions": 0, "changes": 1, "patch": "+a"}]
+        dir_details = {
+            **rebased_details,
+            r1: self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z", tree_sha=t_r1, files=dir_file),
+            p0: self._rich_commit(p0, (p_base,), "feat: step 1", date="2026-01-05T01:00:00Z", tree_sha=t_p0, files=dir_file),
+        }
+
+        def trunc_request(method, path, body=None, params=None, allow=()):
+            if path.startswith("/repos/o/r/commits/") and not path.endswith("/pulls"):
+                return dir_details.get(path.rsplit("/", 1)[-1])
+            if path == f"/repos/o/r/git/trees/{t_r1}" and params == {"recursive": "1"}:
+                return {"truncated": True, "tree": []}
+            if path == f"/repos/o/r/git/trees/{t_r1}" and not params:
+                return {
+                    "truncated": False,
+                    "tree": [
+                        {"path": "dir", "type": "tree", "mode": "040000", "sha": sub_tree},
+                        {"path": "b.py", "type": "blob", "mode": "100644", "sha": blob_sha},
+                    ],
+                }
+            if path == f"/repos/o/r/git/trees/{sub_tree}" and not params:
+                return {"truncated": False, "tree": [{"path": "a.py", "type": "blob", "mode": "100644", "sha": blob_sha}]}
+            if path.startswith("/repos/o/r/git/trees/"):
+                return {
+                    "truncated": False,
+                    "tree": [{"path": "dir/a.py", "type": "blob", "mode": "100644", "sha": blob_sha}, {"path": "b.py", "type": "blob", "mode": "100644", "sha": blob_sha}],
+                }
+            return request_case2(method, path, body=body, params=params, allow=allow)
+
+        with mock.patch.object(gate, "request", trunc_request), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: []):
+            findings = gate.scan_direct_pushes(
+                "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+            )
+        self.assertEqual(findings, [])
+
+        # Case 6: outside-window PR whose base.sha is a later first-parent commit than
+        # base_parent fails closed even when audit populates the tip-wide first_parent set.
+        later_base_pull = {**rebased_pull, "base": {"ref": "main", "sha": r2}}
+        for unindexed_root in (False, True):
+            chain_c6 = valid_tree_chain[:-1] if unindexed_root else valid_tree_chain
+
+            def base_fwd_request(method, path, body=None, params=None, allow=(), _root=unindexed_root):
+                if path == f"/repos/o/r/commits/{r2}/pulls":
+                    return [later_base_pull]
+                if _root and path == f"/repos/o/r/compare/{r2}...{root}":
+                    return {"status": "behind", "merge_base_commit": {"sha": root}}
+                if _root and path == f"/repos/o/r/commits/{root}":
+                    return valid_tree_chain[2]
+                return request_case2(method, path, body=body, params=params, allow=allow)
+
+            with mock.patch.object(gate, "request", base_fwd_request), \
+                 mock.patch.object(gate, "paginate", lambda path, params=None: []):
+                fp = gate._first_parent_shas(valid_tree_chain)
+                findings = gate.scan_direct_pushes(
+                    "o/r", "main", set(), {}, True, 20,
+                    listing=chain_c6, first_parent=fp, signers={"synthetic-owner"},
                 )
             self.assertEqual(len(findings), 1)
             self.assertIn(r1[:7], findings[0])
