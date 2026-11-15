@@ -470,12 +470,30 @@ def complete_template(body: str) -> bool:
     )
 
 
-def dependabot_head(repo: str, number: int) -> bool:
-    commits = paginate(f"/repos/{repo}/pulls/{number}/commits")
-    if not commits or len(commits) >= 250:
+def dependabot_head(
+    repo: str,
+    number: int,
+    head: str | None = None,
+    comparison: dict[str, Any] | None = None,
+) -> bool:
+    if isinstance(comparison, dict) and "commits" in comparison:
+        commits = comparison.get("commits")
+        total = comparison.get("total_commits")
+        if not isinstance(commits, list) or not commits or len(commits) >= 250:
+            return False
+        if total is not None and (
+            isinstance(total, bool) or not isinstance(total, int) or total != len(commits)
+        ):
+            return False
+    else:
+        commits = paginate(f"/repos/{repo}/pulls/{number}/commits")
+        if not commits or len(commits) >= 250:
+            return False
+    if head is not None and (not isinstance(commits[-1], dict) or commits[-1].get("sha") != head):
         return False
     return all(
-        (commit.get("author") or {}).get("login") == "dependabot[bot]"
+        isinstance(commit, dict)
+        and (commit.get("author") or {}).get("login") == "dependabot[bot]"
         and (commit.get("committer") or {}).get("login") == "web-flow"
         and (commit.get("commit") or {}).get("verification", {}).get("verified") is True
         for commit in commits
@@ -947,11 +965,17 @@ def live_label(
     return None
 
 
-def head_contains_base(repo: str, base: str, head: str) -> tuple[bool, str]:
+def head_comparison(repo: str, base: str, head: str) -> tuple[bool, str, dict[str, Any]]:
     branch = request("GET", f"/repos/{repo}/branches/{urllib.parse.quote(base, safe='')}")
     base_head = branch["commit"]["sha"]
-    comparison = request("GET", f"/repos/{repo}/compare/{base_head}...{head}")
-    return (comparison.get("merge_base_commit") or {}).get("sha") == base_head, base_head
+    comparison = request("GET", f"/repos/{repo}/compare/{base_head}...{head}") or {}
+    contains_base = (comparison.get("merge_base_commit") or {}).get("sha") == base_head
+    return contains_base, base_head, comparison
+
+
+def head_contains_base(repo: str, base: str, head: str) -> tuple[bool, str]:
+    contains_base, base_head, _ = head_comparison(repo, base, head)
+    return contains_base, base_head
 
 
 def shared_head(repo: str, number: int, head: str) -> bool:
@@ -1198,11 +1222,13 @@ def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[di
         policy = load_policy(repo, policy_ref)
         bootstrap = False
     verify_script(repo, policy_ref)
-    files = paginate(f"/repos/{repo}/pulls/{number}/files")
+    contains_base, base_head, comparison = head_comparison(repo, base_ref, head)
+    raw_files = comparison.get("files") if isinstance(comparison, dict) else None
+    valid_files = isinstance(raw_files, list) and all(isinstance(item, dict) for item in raw_files)
+    files = raw_files if valid_files else []
     reasons: list[str] = []
-    if len(files) != pull.get("changed_files") or len(files) >= 3000:
+    if not valid_files or len(files) >= 300 or len(files) != pull.get("changed_files"):
         reasons.append("Changed-file list is incomplete; refuse to judge a partial diff")
-    contains_base, base_head = head_contains_base(repo, base_ref, head)
     if not contains_base:
         reasons.append("Base branch advanced since this head was built; update the branch first")
     if shared_head(repo, number, head):
@@ -1227,7 +1253,8 @@ def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[di
         blob = request("GET", f"/repos/{repo}/git/blobs/{file['sha']}", allow=(404,))
         file["_size"] = (blob or {}).get("size")
     verified_dependabot = (
-        (pull.get("user") or {}).get("login") == "dependabot[bot]" and dependabot_head(repo, number)
+        (pull.get("user") or {}).get("login") == "dependabot[bot]"
+        and dependabot_head(repo, number, head=head, comparison=comparison)
     )
     extra = tuple(policy.get("extra_protected_paths") or ())
     tier, fast_path = classify(files, verified_dependabot, base_action_files(repo, policy_ref), extra)
@@ -1522,8 +1549,15 @@ def _audit_force_pushes(
     acknowledged: dict[str, Any],
     baseline_sha: str = "",
     baseline_verified: bool = False,
+    strict: bool = True,
 ) -> list[str]:
     activities = branch_activities(repo, default)
+    if activities is None:
+        message = f"cannot verify force-push activity on {default}; branch activity log is unavailable"
+        if strict:
+            return [message]
+        print(f"warning: {message}")
+        return []
     if not activities:
         return []
     expected_ref = f"refs/heads/{default}"
@@ -1785,6 +1819,7 @@ def audit(
             acknowledged,
             baseline_sha=baseline_sha,
             baseline_verified=baseline_verified,
+            strict=strict,
         )
     )
     merge_shas = {

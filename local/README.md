@@ -198,11 +198,14 @@ trusted copy.
   `"agent_logins"` in the base `governance/policy.json` allowlists trusted
   non-owner agent GitHub logins allowed to apply `agent-approved`; when
   omitted, only `owner_login` is accepted (fail closed for arbitrary
-  collaborators or triage users). Before executing a merge, `merge_gate.py`
-  also verifies via `GET /user` that the authenticated caller belongs to
-  `owner_login` (or optional `"verdict_signers"` in `governance/policy.json`) so
-  only audit-accepted verdict signers can merge. `merge_gate.py` also refuses
-  Git symlink (`120000`) tree entries on pull requests.
+  collaborators or triage users). `merge_gate.py` binds diff and
+  Dependabot commit inspection directly to the immutable `base...head`
+  `/compare` payload (refusing partial `>= 300`-file diffs) rather than the
+  mutable PR ref. Before executing a merge, `merge_gate.py` also verifies via
+  `GET /user` that the authenticated caller belongs to `owner_login` (or
+  optional `"verdict_signers"` in `governance/policy.json`) so only
+  audit-accepted verdict signers can merge. `merge_gate.py` also refuses Git
+  symlink (`120000`) tree entries on pull requests.
 - `merge_gate.py --audit` accepts `--policy-ref <ref>` or `--policy-file <path>`
   to evaluate against a trusted policy revision instead of the audited branch;
   whenever strict direct auditing applies without a trusted policy (via
@@ -213,4 +216,4 @@ trusted copy.
   timestamps (`committer.date`), checks the bounded first-parent window
   (stopping early only at a trusted `audit_baseline_sha`), and checks default
   branch `force_push` activity plus merged-PR/baseline ancestry to detect
-  rollbacks.
+  rollbacks (failing closed in strict mode when branch activity is unavailable).

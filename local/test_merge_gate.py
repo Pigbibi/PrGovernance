@@ -1119,21 +1119,21 @@ class DirectPushAuditTests(unittest.TestCase):
                 return [make_verdict(2, pr2["head"]["sha"], m2)]
             return []
 
-        def empty_or_404_raw(method, path, body=None, params=None, allow=()):
-            self.assertEqual(path, "/repos/o/r/activity")
-            return (None, {})
+        def clean_raw(*a, **k):
+            self.assertEqual(a[1], "/repos/o/r/activity")
+            return ([], {})
 
-        for raw_mode in (lambda *a, **k: ([], {}), empty_or_404_raw):
-            captured = io.StringIO()
-            with mock.patch.object(gate, "request", rollback_request), \
-                 mock.patch.object(gate, "paginate", rollback_paginate), \
-                 mock.patch.object(gate, "_raw_request", raw_mode), \
-                 mock.patch.object(gate, "load_policy", lambda *a, **k: {"owner_login": "synthetic-owner"}), \
-                 mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
-                 contextlib.redirect_stdout(captured):
-                code = gate.audit("o/r", 20, True, policy_ref="refs/tags/trusted")
-            self.assertEqual(code, 2)
-            self.assertIn(f"#2 merge commit {m2[:7]} is no longer an ancestor of main", captured.getvalue())
+        captured = io.StringIO()
+        with mock.patch.object(gate, "request", rollback_request), \
+             mock.patch.object(gate, "paginate", rollback_paginate), \
+             mock.patch.object(gate, "_raw_request", clean_raw), \
+             mock.patch.object(gate, "load_policy", lambda *a, **k: {"owner_login": "synthetic-owner"}), \
+             mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+             contextlib.redirect_stdout(captured):
+            code = gate.audit("o/r", 20, True, policy_ref="refs/tags/trusted")
+        self.assertEqual(code, 2)
+        self.assertIn(f"#2 merge commit {m2[:7]} is no longer an ancestor of main", captured.getvalue())
+        self.assertNotIn("cannot verify force-push activity", captured.getvalue())
 
         # 2. Cursor-paginated /activity force_push is caught even when all listed PRs match current main tip.
         def single_pr_request(method, path, body=None, params=None, allow=()):
@@ -1200,6 +1200,79 @@ class DirectPushAuditTests(unittest.TestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn(f"baseline {baseline[:7]} is no longer an ancestor of main", output)
+
+    def test_strict_audit_fails_closed_when_branch_activity_is_unavailable(self):
+        m1 = "1" * 40
+        pr1 = {
+            "number": 1,
+            "merged_at": "2026-01-05T00:00:00Z",
+            "updated_at": "2026-01-05T00:00:00Z",
+            "base": {"ref": "main"},
+            "head": {"sha": "a" * 40},
+            "merge_commit_sha": m1,
+        }
+        verdict = {
+            "user": {"login": "synthetic-owner"},
+            "body": "<!-- governance-verdict:v1 "
+            + json.dumps({
+                "repo": "o/r",
+                "pr": 1,
+                "head_sha": "a" * 40,
+                "merge_sha": m1,
+                "verdict": "pass",
+                "merged": True,
+            })
+            + " -->",
+        }
+
+        def fake_request(method, path, body=None, params=None, allow=()):
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == "/repos/o/r/pulls":
+                return [pr1] if params and params.get("page") == 1 else []
+            if path == "/repos/o/r/commits":
+                return [self.commit(m1, (), "feat: pr 1")]
+            if path == f"/repos/o/r/commits/{m1}/pulls":
+                return [pr1]
+            return []
+
+        def unavailable_raw(method, path, body=None, params=None, allow=()):
+            self.assertEqual(path, "/repos/o/r/activity")
+            return (None, {})
+
+        for strict_arg in (False, True):
+            with self.subTest(strict_arg=strict_arg):
+                captured = io.StringIO()
+                with mock.patch.object(gate, "request", fake_request), \
+                     mock.patch.object(gate, "paginate", lambda path, params=None: [verdict]), \
+                     mock.patch.object(gate, "_raw_request", unavailable_raw), \
+                     mock.patch.object(gate, "load_policy", lambda *a, **k: {"owner_login": "synthetic-owner"}), \
+                     mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+                     contextlib.redirect_stdout(captured):
+                    code = gate.audit("o/r", 20, strict_arg)
+                self.assertEqual(code, 2)
+                self.assertIn(
+                    "violation: cannot verify force-push activity on main; branch activity log is unavailable",
+                    captured.getvalue(),
+                )
+
+        relaxed_out = io.StringIO()
+        with mock.patch.object(gate, "request", fake_request), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: [verdict]), \
+             mock.patch.object(gate, "_raw_request", unavailable_raw), \
+             mock.patch.object(
+                 gate,
+                 "load_policy",
+                 lambda *a, **k: {"owner_login": "synthetic-owner", "audit_strict_direct": False},
+             ), \
+             mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+             contextlib.redirect_stdout(relaxed_out):
+            code = gate.audit("o/r", 20, False, policy_ref="refs/tags/trusted")
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "warning: cannot verify force-push activity on main; branch activity log is unavailable",
+            relaxed_out.getvalue(),
+        )
 
     def test_invalid_audit_baseline_sha_fails(self):
         chain = [self.commit(self.TIP, (), "feat: via pull request")]
@@ -2409,6 +2482,10 @@ class EvaluatePolicyTests(unittest.TestCase):
                     return pull
                 if p == "/repos/o/r":
                     return {"default_branch": "main"}
+                if p == "/repos/o/r/branches/main":
+                    return {"commit": {"sha": self.BASE}}
+                if p == f"/repos/o/r/compare/{self.BASE}...{self.HEAD}":
+                    return {"merge_base_commit": {"sha": self.BASE}, "files": [file_entry]}
                 if p == f"/repos/o/r/git/trees/{self.HEAD}":
                     return tree_payload
                 return None
@@ -2416,11 +2493,10 @@ class EvaluatePolicyTests(unittest.TestCase):
             with mock.patch.object(gate, "request", side_effect=fake_request), \
                  mock.patch.object(gate, "load_policy", return_value=policy), \
                  mock.patch.object(gate, "verify_script", return_value=None), \
-                 mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
                  mock.patch.object(gate, "shared_head", return_value=False), \
                  mock.patch.object(gate, "base_action_files", return_value=set()), \
                  mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: (
-                     [file_entry] if p.endswith("/files") else [claude_comment] if p.endswith("/comments") else []
+                     [claude_comment] if p.endswith("/comments") else []
                  )), \
                  mock.patch.object(gate, "check_results", return_value=([], [], [], [])):
                 return gate.evaluate("o/r", 7)
@@ -2510,6 +2586,10 @@ class EvaluatePolicyTests(unittest.TestCase):
                 return pull
             if p == "/repos/o/r":
                 return {"default_branch": "main"}
+            if p == "/repos/o/r/branches/main":
+                return {"commit": {"sha": self.BASE}}
+            if p == f"/repos/o/r/compare/{self.BASE}...{self.HEAD}":
+                return {"merge_base_commit": {"sha": self.BASE}, "files": [doc_link]}
             if p.startswith("/repos/o/r/git/blobs/"):
                 blob_calls.append(p)
                 return {"size": 0}
@@ -2520,10 +2600,9 @@ class EvaluatePolicyTests(unittest.TestCase):
         with mock.patch.object(gate, "request", side_effect=fake_request), \
              mock.patch.object(gate, "load_policy", return_value=policy), \
              mock.patch.object(gate, "verify_script", return_value=None), \
-             mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
              mock.patch.object(gate, "shared_head", return_value=False), \
              mock.patch.object(gate, "base_action_files", return_value=set()), \
-             mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: [doc_link] if p.endswith("/files") else []):
+             mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: []):
             verdict, reasons = gate.evaluate("o/r", 7)
         self.assertEqual(verdict["verdict"], "fail")
         self.assertEqual(verdict["tier"], "T2")
@@ -2555,6 +2634,10 @@ class EvaluatePolicyTests(unittest.TestCase):
                 return pull
             if p == "/repos/o/r":
                 return {"default_branch": "main"}
+            if p == "/repos/o/r/branches/main":
+                return {"commit": {"sha": self.BASE}}
+            if p == f"/repos/o/r/compare/{self.BASE}...{self.HEAD}":
+                return {"merge_base_commit": {"sha": self.BASE}, "files": [clean_doc]}
             if p == f"/repos/o/r/git/trees/{self.HEAD}":
                 return None
             return None
@@ -2570,10 +2653,9 @@ class EvaluatePolicyTests(unittest.TestCase):
         with mock.patch.object(gate, "request", side_effect=missing_tree_request), \
              mock.patch.object(gate, "load_policy", return_value=policy), \
              mock.patch.object(gate, "verify_script", return_value=None), \
-             mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
              mock.patch.object(gate, "shared_head", return_value=False), \
              mock.patch.object(gate, "base_action_files", return_value=set()), \
-             mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: [clean_doc] if p.endswith("/files") else []):
+             mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: []):
             missing_verdict, missing_reasons = gate.evaluate("o/r", 7)
         self.assertEqual(missing_verdict["verdict"], "fail")
         self.assertEqual(missing_verdict["tier"], "T2")
@@ -2611,6 +2693,10 @@ class EvaluatePolicyTests(unittest.TestCase):
                 return pull
             if path == "/repos/o/r":
                 return {"default_branch": "main"}
+            if path == "/repos/o/r/branches/main":
+                return {"commit": {"sha": self.BASE}}
+            if path == f"/repos/o/r/compare/{self.BASE}...{self.HEAD}":
+                return {"merge_base_commit": {"sha": self.BASE}, "files": [doc_file]}
             if path == "/repos/o/r/contents/governance/policy.json":
                 ref = (params or {}).get("ref")
                 policy_refs_seen.append(ref)
@@ -2641,9 +2727,8 @@ class EvaluatePolicyTests(unittest.TestCase):
             policy_path = Path(tmp) / "bootstrap-policy.json"
             policy_path.write_bytes(raw_policy)
             with mock.patch.object(gate, "request", side_effect=fake_request), \
-                 mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
                  mock.patch.object(gate, "shared_head", return_value=False), \
-                 mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: [doc_file] if p.endswith("/files") else []), \
+                 mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: []), \
                  mock.patch.object(gate, "live_label", return_value="owner-approved"):
                 verdict, reasons = gate.evaluate("o/r", 7, policy_file=str(policy_path))
                 self.assertEqual(reasons, [])
@@ -2751,13 +2836,15 @@ class EvaluatePolicyTests(unittest.TestCase):
                 return pull
             if path == "/repos/o/r":
                 return {"default_branch": "main"}
+            if path == "/repos/o/r/branches/main":
+                return {"commit": {"sha": self.BASE}}
+            if path == f"/repos/o/r/compare/{self.BASE}...{self.HEAD}":
+                return {"merge_base_commit": {"sha": self.BASE}, "files": [protected_file]}
             if path == f"/repos/o/r/git/trees/{self.HEAD}":
                 return tree_payload
             return None
 
         def fake_paginate(path, params=None):
-            if path.endswith("/files"):
-                return [protected_file]
             if path.endswith("/comments"):
                 return state["comments"]
             if path.endswith("/timeline"):
@@ -2769,7 +2856,6 @@ class EvaluatePolicyTests(unittest.TestCase):
         with mock.patch.object(gate, "request", side_effect=fake_request), \
              mock.patch.object(gate, "load_policy", return_value=policy), \
              mock.patch.object(gate, "verify_script", return_value=None), \
-             mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
              mock.patch.object(gate, "shared_head", return_value=False), \
              mock.patch.object(gate, "base_action_files", return_value=set()), \
              mock.patch.object(gate, "branch_activities", return_value=[]), \
@@ -2823,6 +2909,197 @@ class EvaluatePolicyTests(unittest.TestCase):
             state["timeline"].append({"event": "base_ref_changed", "created_at": "2026-11-14T08:15:00Z"})
             with self.assertRaises(gate.Refusal):
                 gate.revalidate("o/r", ok_verdict)
+
+    def test_evaluate_binds_files_and_dependabot_commits_to_captured_head_against_swapped_pr_ref(self):
+        pull = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": self.HEAD, "ref": "feat/x", "repo": {"full_name": "o/r"}},
+            "base": {"ref": "main"},
+            "user": {"login": "contributor"},
+            "changed_files": 1,
+            "body": "",
+            "labels": [],
+        }
+        workflow_file = {
+            "filename": ".github/workflows/ci.yml",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "patch": "@@ -1 +1 @@\n-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n+      uses: actions/checkout@4f1c2a8d0e9b7c6a5f4e3d2c1b0a9f8e7d6c5b4a\n",
+        }
+        policy = {
+            "owner_login": "owner",
+            "codex_required": False,
+            "require_checks": False,
+            "_source": "main",
+            "_sha256": "p-bind",
+        }
+        tree_payload = {
+            "truncated": False,
+            "tree": [{"path": ".github/workflows/ci.yml", "mode": "100644", "type": "blob"}],
+        }
+        seen_paths = []
+
+        def fake_request(method, path, params=None, **kwargs):
+            seen_paths.append(path)
+            if path == "/repos/o/r/pulls/7":
+                return pull
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == "/repos/o/r/branches/main":
+                return {"commit": {"sha": self.BASE}}
+            if path == f"/repos/o/r/compare/{self.BASE}...{self.HEAD}":
+                return {"merge_base_commit": {"sha": self.BASE}, "files": [workflow_file]}
+            if path == f"/repos/o/r/git/trees/{self.HEAD}":
+                return tree_payload
+            return None
+
+        def guard_paginate(path, params=None):
+            if path.endswith("/files"):
+                raise AssertionError("evaluate() must never inspect mutable /pulls/{n}/files")
+            return []
+
+        with mock.patch.object(gate, "request", side_effect=fake_request), \
+             mock.patch.object(gate, "load_policy", return_value=policy), \
+             mock.patch.object(gate, "verify_script", return_value=None), \
+             mock.patch.object(gate, "shared_head", return_value=False), \
+             mock.patch.object(gate, "base_action_files", return_value=set()), \
+             mock.patch.object(gate, "paginate", side_effect=guard_paginate):
+            verdict, reasons = gate.evaluate("o/r", 7)
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertEqual(verdict["tier"], "T2")
+        self.assertIn(f"/repos/o/r/compare/{self.BASE}...{self.HEAD}", seen_paths)
+        self.assertTrue(any("owner-approved" in r for r in reasons))
+
+        # dependabot_head refuses commits whose tip does not match captured head.
+        swapped_dependabot_commit = {
+            "sha": "b" * 40,
+            "author": {"login": "dependabot[bot]"},
+            "committer": {"login": "web-flow"},
+            "commit": {"verification": {"verified": True}},
+        }
+        matching_dependabot_commit = {**swapped_dependabot_commit, "sha": self.HEAD}
+        with mock.patch.object(gate, "paginate", return_value=[swapped_dependabot_commit]):
+            self.assertFalse(gate.dependabot_head("o/r", 7, head=self.HEAD))
+        with mock.patch.object(gate, "paginate", return_value=[matching_dependabot_commit]):
+            self.assertTrue(gate.dependabot_head("o/r", 7, head=self.HEAD))
+
+        # In evaluate(), swapped commits on /pulls/{n}/commits cannot unlock dependabot fast-path,
+        # while an immutable compare commits list bound to HEAD succeeds without touching /pulls/{n}/commits.
+        dep_pull = {**pull, "user": {"login": "dependabot[bot]"}, "body": "bump checkout"}
+        compare_with_commits = {"value": None}
+
+        def dep_request(method, path, params=None, **kwargs):
+            if path == "/repos/o/r/pulls/7":
+                return dep_pull
+            if path == f"/repos/o/r/compare/{self.BASE}...{self.HEAD}":
+                payload = {
+                    "merge_base_commit": {"sha": self.BASE},
+                    "files": [workflow_file],
+                }
+                if compare_with_commits["value"] is not None:
+                    payload.update(compare_with_commits["value"])
+                return payload
+            return fake_request(method, path, params=params, **kwargs)
+
+        def dep_paginate(path, params=None):
+            if path == "/repos/o/r/pulls/7/commits":
+                if compare_with_commits["value"] is not None:
+                    raise AssertionError("should not query mutable /pulls/{n}/commits when compare includes commits")
+                return [swapped_dependabot_commit]
+            return guard_paginate(path, params)
+
+        with mock.patch.object(gate, "request", side_effect=dep_request), \
+             mock.patch.object(gate, "load_policy", return_value=policy), \
+             mock.patch.object(gate, "verify_script", return_value=None), \
+             mock.patch.object(gate, "shared_head", return_value=False), \
+             mock.patch.object(gate, "base_action_files", return_value={".github/workflows/ci.yml"}), \
+             mock.patch.object(gate, "paginate", side_effect=dep_paginate):
+            dep_verdict, dep_reasons = gate.evaluate("o/r", 7)
+            self.assertEqual(dep_verdict["verdict"], "fail")
+            self.assertEqual(dep_verdict["tier"], "T2")
+            self.assertTrue(any("owner-approved" in r for r in dep_reasons))
+
+            compare_with_commits["value"] = {
+                "commits": [matching_dependabot_commit],
+                "total_commits": 1,
+            }
+            fast_verdict, fast_reasons = gate.evaluate("o/r", 7)
+            self.assertEqual(fast_reasons, [])
+            self.assertEqual(fast_verdict["verdict"], "pass")
+            self.assertEqual(fast_verdict["tier"], "T1")
+
+    def test_evaluate_fails_closed_on_missing_or_partial_compare_files(self):
+        policy = {
+            "owner_login": "owner",
+            "codex_required": False,
+            "require_checks": False,
+            "_source": "main",
+            "_sha256": "p-cap",
+        }
+        doc_file = {
+            "filename": "docs/a.md",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "patch": "@@ -0,0 +1 @@\n+hi\n",
+        }
+        three_hundred_files = [
+            {**doc_file, "filename": f"docs/f{i}.md"} for i in range(300)
+        ]
+        cases = (
+            ("missing_files", 1, {"merge_base_commit": {"sha": self.BASE}}),
+            ("non_list_files", 1, {"merge_base_commit": {"sha": self.BASE}, "files": {}}),
+            ("count_mismatch", 2, {"merge_base_commit": {"sha": self.BASE}, "files": [doc_file]}),
+            ("compare_300_cap", 300, {"merge_base_commit": {"sha": self.BASE}, "files": three_hundred_files}),
+        )
+        for label, changed_count, compare_payload in cases:
+            with self.subTest(case=label):
+                pull = {
+                    "number": 7,
+                    "state": "open",
+                    "draft": False,
+                    "head": {"sha": self.HEAD, "ref": "feat/x", "repo": {"full_name": "o/r"}},
+                    "base": {"ref": "main"},
+                    "user": {"login": "contributor"},
+                    "changed_files": changed_count,
+                    "body": "",
+                    "labels": [],
+                }
+                tree_payload = {
+                    "truncated": False,
+                    "tree": [
+                        {"path": item["filename"], "mode": "100644", "type": "blob"}
+                        for item in (compare_payload.get("files") if isinstance(compare_payload.get("files"), list) else [])
+                    ],
+                }
+
+                def fake_request(method, path, params=None, **kwargs):
+                    if path == "/repos/o/r/pulls/7":
+                        return pull
+                    if path == "/repos/o/r":
+                        return {"default_branch": "main"}
+                    if path == "/repos/o/r/branches/main":
+                        return {"commit": {"sha": self.BASE}}
+                    if path == f"/repos/o/r/compare/{self.BASE}...{self.HEAD}":
+                        return compare_payload
+                    if path == f"/repos/o/r/git/trees/{self.HEAD}":
+                        return tree_payload
+                    return None
+
+                with mock.patch.object(gate, "request", side_effect=fake_request), \
+                     mock.patch.object(gate, "load_policy", return_value=policy), \
+                     mock.patch.object(gate, "verify_script", return_value=None), \
+                     mock.patch.object(gate, "shared_head", return_value=False), \
+                     mock.patch.object(gate, "base_action_files", return_value=set()), \
+                     mock.patch.object(gate, "paginate", return_value=[]):
+                    verdict, reasons = gate.evaluate("o/r", 7)
+                self.assertEqual(verdict["verdict"], "fail")
+                self.assertIn("Changed-file list is incomplete; refuse to judge a partial diff", reasons)
 
 
 class DefaultRepoTests(unittest.TestCase):
@@ -2961,6 +3238,10 @@ class MergeSignerTests(unittest.TestCase):
                 return {"default_branch": "main"}
             if path == "/repos/o/r/pulls/7":
                 return pull
+            if path == "/repos/o/r/branches/main":
+                return {"commit": {"sha": self.BASE}}
+            if path == f"/repos/o/r/compare/{self.BASE}...{self.HEAD}":
+                return {"merge_base_commit": {"sha": self.BASE}, "files": [app_file]}
             if path == f"/repos/o/r/git/trees/{self.HEAD}":
                 return tree_payload
             if path == "/user":
@@ -2970,8 +3251,6 @@ class MergeSignerTests(unittest.TestCase):
             return None
 
         def cli_paginate(path, params=None):
-            if path.endswith("/files"):
-                return [app_file]
             if path.endswith("/comments"):
                 return [claude_comment]
             return []
@@ -2979,7 +3258,6 @@ class MergeSignerTests(unittest.TestCase):
         with mock.patch.object(gate, "request", side_effect=cli_request), \
              mock.patch.object(gate, "load_policy", return_value=base_policy), \
              mock.patch.object(gate, "verify_script", return_value=None), \
-             mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
              mock.patch.object(gate, "shared_head", return_value=False), \
              mock.patch.object(gate, "base_action_files", return_value=set()), \
              mock.patch.object(gate, "paginate", side_effect=cli_paginate):
