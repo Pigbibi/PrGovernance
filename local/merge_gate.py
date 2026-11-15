@@ -596,7 +596,12 @@ def _judge_provider_receipt(
     review = _parse_review_payload(marker_index, raw)
     if not review:
         return "error", "AI review receipt is not valid JSON", None, False
-    on_head = review.get("commit_sha") == head
+    raw_sha = review.get("commit_sha")
+    on_head = (
+        raw_sha.lower() == head.lower()
+        if isinstance(raw_sha, str) and re.fullmatch(r"[0-9a-f]{40}", raw_sha, re.IGNORECASE)
+        else None
+    )
     if "provider" in review:
         declared = review.get("provider")
         if not isinstance(declared, str) or declared.strip().lower() != login_provider:
@@ -610,6 +615,8 @@ def _judge_provider_receipt(
     if status != "completed":
         label = status if isinstance(status, str) and status.strip() else "not finished"
         return "pending", f"AI review {label}", on_head, True
+    if on_head is None:
+        return "error", "AI review receipt is missing a valid commit_sha", None, False
     if not on_head:
         return "failure", "AI review covers another commit, not this head", False, True
     unresolved = _receipt_unresolved(review)

@@ -1169,7 +1169,7 @@ class DefaultRepoTests(unittest.TestCase):
             ("git@github.com:synthetic-owner/service.api.git\n", "synthetic-owner/service.api"),
             ("git@github.com:synthetic-owner/service.api\n", "synthetic-owner/service.api"),
             ("https://github.com/synthetic-owner/service.api.git\n", "synthetic-owner/service.api"),
-            ("https://github.com/Pigbibi/PrGovernance.git\n", "Pigbibi/PrGovernance"),
+            ("https://github.com/synthetic-owner/repo-name.git\n", "synthetic-owner/repo-name"),
             ("https://gitlab.example.com/owner/repo.git\n", None),
         )
         for remote_url, expected in cases:
