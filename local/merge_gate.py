@@ -575,6 +575,8 @@ def _extract_receipt_markers(body: str) -> list[tuple[int, str | None]]:
         start = match.end()
         end = body.find("-->", start)
         payload = None if end < 0 else body[start:end].strip()
+        if marker_index == 1 and payload == "":
+            continue
         matches.append((marker_index, payload))
     return matches
 
@@ -604,9 +606,10 @@ def _judge_provider_receipt(
                 on_head,
                 False,
             )
-    status = review.get("status") or ("completed" if marker_index != 2 else None)
+    status = review.get("status")
     if status != "completed":
-        return "pending", f"AI review {status or 'not finished'}", on_head, True
+        label = status if isinstance(status, str) and status.strip() else "not finished"
+        return "pending", f"AI review {label}", on_head, True
     if not on_head:
         return "failure", "AI review covers another commit, not this head", False, True
     unresolved = _receipt_unresolved(review)
@@ -1584,21 +1587,630 @@ def _audit_force_pushes(
         if note:
             print(f"note: acknowledged force push on {default} ({id_key}): {note}")
             continue
+        before = str(entry.get("before") or "")
         after = str(entry.get("after") or "")
         if (
             baseline_sha
             and baseline_verified
+            and before
             and after
+            and not re.fullmatch(r"0+", before)
+            and not re.fullmatch(r"0+", after)
+            and before.lower() != baseline_sha
             and after.lower() != baseline_sha
+            and _commit_is_ancestor(repo, before, baseline_sha)
             and _commit_is_ancestor(repo, after, baseline_sha)
         ):
             continue
-        before = str(entry.get("before") or "")
         origin = before[:7] if before else "unknown"
         target = after[:7] if after else "unknown"
         event_label = f"activity {id_key}" if id_key else "activity"
         findings.append(f"force push on {default} ({event_label}: {origin}..{target})")
     return findings
+
+
+def _rebased_commit_matches(step_commit: dict[str, Any], pr_commit: dict[str, Any]) -> bool:
+    step_sha = step_commit.get("sha")
+    pr_sha = pr_commit.get("sha")
+    if isinstance(step_sha, str) and isinstance(pr_sha, str) and step_sha and step_sha == pr_sha:
+        return True
+    step_meta = step_commit.get("commit")
+    pr_meta = pr_commit.get("commit")
+    if not isinstance(step_meta, dict) or not isinstance(pr_meta, dict):
+        return False
+    step_message = step_meta.get("message")
+    pr_message = pr_meta.get("message")
+    if (
+        not isinstance(step_message, str)
+        or not isinstance(pr_message, str)
+        or not pr_message
+        or step_message != pr_message
+    ):
+        return False
+    step_author = step_meta.get("author")
+    pr_author = pr_meta.get("author")
+    if not isinstance(step_author, dict) or not isinstance(pr_author, dict):
+        return False
+    pr_email = pr_author.get("email")
+    if not isinstance(pr_email, str) or not pr_email or step_author.get("email") != pr_email:
+        return False
+    pr_date = pr_author.get("date")
+    if not isinstance(pr_date, str) or not pr_date or step_author.get("date") != pr_date:
+        return False
+    pr_name = pr_author.get("name")
+    if isinstance(pr_name, str) and pr_name and step_author.get("name") != pr_name:
+        return False
+    return True
+
+
+def _commit_tree_sha(commit: dict[str, Any]) -> str:
+    tree_sha = ((commit.get("commit") or {}).get("tree") or {}).get("sha")
+    if isinstance(tree_sha, str):
+        lowered = tree_sha.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", lowered):
+            return lowered
+    return ""
+
+
+VALID_GIT_FILE_MODES = frozenset({"100644", "100755", "120000", "160000"})
+ALLOWED_DIFF_STATUSES = frozenset({"added", "modified", "removed", "renamed", "copied", "changed"})
+
+
+def _fetch_tree_map(
+    repo: str,
+    tree_sha: str,
+    *,
+    recursive: bool,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> dict[str, tuple[str, str, str]] | str | None:
+    key = (tree_sha, recursive)
+    if key in tree_cache:
+        return tree_cache[key]
+    params = {"recursive": "1"} if recursive else None
+    res = request("GET", f"/repos/{repo}/git/trees/{tree_sha}", params=params, allow=(404,))
+    if not isinstance(res, dict) or not isinstance(res.get("tree"), list):
+        tree_cache[key] = None
+        return None
+    if res.get("truncated") is True:
+        result: dict[str, tuple[str, str, str]] | str | None = "TRUNCATED" if recursive else None
+        tree_cache[key] = result
+        return result
+    path_key = "path"
+    entries: dict[str, tuple[str, str, str]] = {}
+    for item in res["tree"]:
+        if not isinstance(item, dict):
+            continue
+        p = item.get(path_key)
+        t = item.get("type")
+        m = item.get("mode")
+        s = item.get("sha")
+        if (
+            isinstance(p, str)
+            and p
+            and (recursive or ("/" not in p and p not in (".", "..")))
+            and isinstance(t, str)
+            and isinstance(m, str)
+            and isinstance(s, str)
+            and re.fullmatch(r"[0-9a-f]{40}", s.lower())
+        ):
+            entries[p] = (t, m, s.lower())
+    tree_cache[key] = entries
+    return entries
+
+
+def _lookup_tree_file_mode(
+    repo: str,
+    tree_sha: str,
+    filepath: str,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> str:
+    if not tree_sha or not filepath:
+        return ""
+    parts = filepath.split("/")
+    if any(not seg or seg in (".", "..") for seg in parts):
+        return ""
+    flat = _fetch_tree_map(repo, tree_sha, recursive=True, tree_cache=tree_cache)
+    if isinstance(flat, dict):
+        entry = flat.get(filepath)
+        if entry and entry[0] in ("blob", "commit") and entry[1] in VALID_GIT_FILE_MODES:
+            return entry[1]
+        return ""
+    if flat != "TRUNCATED":
+        return ""
+    current_tree = tree_sha
+    for segment in parts[:-1]:
+        node_map = _fetch_tree_map(repo, current_tree, recursive=False, tree_cache=tree_cache)
+        if not isinstance(node_map, dict):
+            return ""
+        sub = node_map.get(segment)
+        if not sub or sub[0] != "tree" or sub[1] != "040000":
+            return ""
+        current_tree = sub[2]
+    leaf_map = _fetch_tree_map(repo, current_tree, recursive=False, tree_cache=tree_cache)
+    if not isinstance(leaf_map, dict):
+        return ""
+    leaf = leaf_map.get(parts[-1])
+    if leaf and leaf[0] in ("blob", "commit") and leaf[1] in VALID_GIT_FILE_MODES:
+        return leaf[1]
+    return ""
+
+
+def _canonical_commit_files(
+    repo: str,
+    commit_detail: dict[str, Any],
+    parent_commit: dict[str, Any] | None,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> list[tuple[Any, ...]] | None:
+    files = commit_detail.get("files")
+    commit_tree = _commit_tree_sha(commit_detail)
+    parent_tree = _commit_tree_sha(parent_commit) if isinstance(parent_commit, dict) else ""
+    if (
+        commit_detail.get("_files_complete") is not _FILES_COMPLETE_TOKEN
+        or not isinstance(files, list)
+        or not (0 < len(files) <= 3000)
+        or not commit_tree
+    ):
+        return None
+    normalized: list[tuple[Any, ...]] = []
+    covered_paths: set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            return None
+        filename = entry.get("filename")
+        status = entry.get("status")
+        raw_previous = entry.get("previous_filename")
+        if raw_previous is None:
+            previous = ""
+        elif isinstance(raw_previous, str):
+            previous = raw_previous
+        else:
+            return None
+        additions = entry.get("additions")
+        deletions = entry.get("deletions")
+        changes = entry.get("changes")
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or not isinstance(status, str)
+            or status not in ALLOWED_DIFF_STATUSES
+            or not isinstance(additions, int)
+            or isinstance(additions, bool)
+            or additions < 0
+            or not isinstance(deletions, int)
+            or isinstance(deletions, bool)
+            or deletions < 0
+            or not isinstance(changes, int)
+            or isinstance(changes, bool)
+            or changes != additions + deletions
+        ):
+            return None
+        if status == "added":
+            old_mode = ""
+        else:
+            if not parent_tree:
+                return None
+            old_path = previous if (status in ("renamed", "copied") and previous) else filename
+            old_mode = _lookup_tree_file_mode(repo, parent_tree, old_path, tree_cache)
+            if not old_mode:
+                return None
+        if status == "removed":
+            new_mode = ""
+        else:
+            new_mode = _lookup_tree_file_mode(repo, commit_tree, filename, tree_cache)
+            if not new_mode:
+                return None
+        patch = entry.get("patch")
+        sha = entry.get("sha")
+        sha_hex = sha.lower() if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha.lower()) else ""
+        if (
+            patch in (None, "")
+            and additions == 0
+            and deletions == 0
+            and changes == 0
+            and sha_hex
+            and status == "renamed"
+        ):
+            proof: tuple[str, str] = ("rename_sha", sha_hex)
+        elif (
+            patch in (None, "")
+            and additions == 0
+            and deletions == 0
+            and changes == 0
+            and sha_hex == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        ):
+            proof = ("empty_blob", sha_hex)
+        elif complete_patch(entry):
+            proof = ("patch", patch)
+        else:
+            return None
+        covered_paths.add(filename)
+        if isinstance(previous, str) and previous:
+            covered_paths.add(previous)
+        normalized.append((filename, previous, status, additions, deletions, changes, old_mode, new_mode, proof))
+    parent_map = (
+        {}
+        if parent_commit is None
+        else (_fetch_tree_map(repo, parent_tree, recursive=True, tree_cache=tree_cache) if parent_tree else None)
+    )
+    commit_map = _fetch_tree_map(repo, commit_tree, recursive=True, tree_cache=tree_cache)
+    if _has_uncovered_tree_diff(
+        repo,
+        parent_tree,
+        commit_tree,
+        parent_map,
+        commit_map,
+        covered_paths,
+        tree_cache,
+    ):
+        return None
+    normalized.sort()
+    return normalized
+
+
+def _flat_tree_children(
+    flat_map: dict[str, tuple[str, str, str]],
+    prefix: str,
+) -> dict[str, tuple[str, str, str]]:
+    children: dict[str, tuple[str, str, str]] = {}
+    for full_path, entry in flat_map.items():
+        if not full_path.startswith(prefix):
+            continue
+        rel = full_path[len(prefix):]
+        if not rel:
+            continue
+        if "/" not in rel:
+            if rel not in (".", ".."):
+                children[rel] = entry
+            continue
+        subdir = rel.split("/", 1)[0]
+        if subdir and subdir not in (".", "..") and subdir not in children:
+            children[subdir] = ("tree", "040000", "")
+    return children
+
+
+def _has_uncovered_tree_diff(
+    repo: str,
+    parent_tree: str,
+    commit_tree: str,
+    parent_map: dict[str, tuple[str, str, str]] | str | None,
+    commit_map: dict[str, tuple[str, str, str]] | str | None,
+    covered_paths: set[str],
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> bool:
+    if parent_map is None or commit_map is None:
+        return True
+    if isinstance(parent_map, dict) and isinstance(commit_map, dict):
+        for path in set(parent_map) | set(commit_map):
+            p_entry = parent_map.get(path)
+            c_entry = commit_map.get(path)
+            p_file = p_entry if (p_entry and p_entry[0] in ("blob", "commit")) else None
+            c_file = c_entry if (c_entry and c_entry[0] in ("blob", "commit")) else None
+            if p_file != c_file and path not in covered_paths:
+                return True
+        return False
+
+    stack: list[tuple[str, str, str]] = [("", parent_tree, commit_tree)]
+    seen: set[tuple[str, str, str]] = set()
+    visited = 0
+    while stack:
+        prefix, p_sha, c_sha = stack.pop()
+        if (prefix, p_sha, c_sha) in seen:
+            continue
+        seen.add((prefix, p_sha, c_sha))
+        visited += 1
+        if visited > 2000:
+            return True
+        if p_sha and c_sha and p_sha == c_sha:
+            continue
+        if isinstance(parent_map, dict):
+            p_children = _flat_tree_children(parent_map, prefix)
+        elif not p_sha:
+            p_children = {}
+        else:
+            loaded = _fetch_tree_map(repo, p_sha, recursive=False, tree_cache=tree_cache)
+            if not isinstance(loaded, dict):
+                return True
+            p_children = loaded
+
+        if isinstance(commit_map, dict):
+            c_children = _flat_tree_children(commit_map, prefix)
+        elif not c_sha:
+            c_children = {}
+        else:
+            loaded = _fetch_tree_map(repo, c_sha, recursive=False, tree_cache=tree_cache)
+            if not isinstance(loaded, dict):
+                return True
+            c_children = loaded
+
+        for name in set(p_children) | set(c_children):
+            full_path = f"{prefix}{name}"
+            p_entry = p_children.get(name)
+            c_entry = c_children.get(name)
+            p_file = p_entry if (p_entry and p_entry[0] in ("blob", "commit")) else None
+            c_file = c_entry if (c_entry and c_entry[0] in ("blob", "commit")) else None
+            if p_file != c_file and full_path not in covered_paths:
+                return True
+            p_is_tree = bool(p_entry and p_entry[0] == "tree")
+            c_is_tree = bool(c_entry and c_entry[0] == "tree")
+            if (p_is_tree and p_entry[1] != "040000") or (c_is_tree and c_entry[1] != "040000"):
+                return True
+            if p_is_tree or c_is_tree:
+                p_sub = p_entry[2] if p_is_tree else ""
+                c_sub = c_entry[2] if c_is_tree else ""
+                if p_sub and c_sub and p_sub == c_sub:
+                    continue
+                stack.append((f"{full_path}/", p_sub, c_sub))
+    return False
+
+
+_FILES_COMPLETE_TOKEN = object()
+
+
+def _resolve_commit_detail(repo: str, commit: dict[str, Any]) -> dict[str, Any] | None:
+    if commit.get("_files_complete") is _FILES_COMPLETE_TOKEN and isinstance(commit.get("files"), list):
+        return commit
+    sha = commit.get("sha")
+    if not isinstance(sha, str) or not sha:
+        return None
+    base_detail: dict[str, Any] | None = None
+    all_files: list[dict[str, Any]] = []
+    seen_page_keys: tuple[tuple[str, str, str], ...] | None = None
+    for page in range(1, 31):
+        detail = request(
+            "GET",
+            f"/repos/{repo}/commits/{sha}",
+            params={"per_page": 100, "page": page},
+            allow=(404,),
+        )
+        if not isinstance(detail, dict):
+            return None
+        chunk = detail.get("files")
+        if not isinstance(chunk, list):
+            return None
+        if base_detail is None:
+            base_detail = detail
+        if not chunk:
+            break
+        page_keys: list[tuple[str, str, str]] = []
+        for item in chunk:
+            if not isinstance(item, dict):
+                return None
+            fn = item.get("filename")
+            st = item.get("status")
+            if not isinstance(fn, str) or not fn or not isinstance(st, str) or not st:
+                return None
+            page_keys.append((fn, st, str(item.get("sha") or "")))
+        keys_tuple = tuple(page_keys)
+        if page > 1 and keys_tuple == seen_page_keys:
+            return None
+        seen_page_keys = keys_tuple
+        all_files.extend(chunk)
+        if len(all_files) > 3000:
+            return None
+        if len(chunk) < 30:
+            break
+        if page == 30:
+            return None
+    if base_detail is None:
+        return None
+    stats = base_detail.get("stats")
+    if isinstance(stats, dict) and "total" in stats and stats["total"] is not None:
+        total = stats["total"]
+        if not isinstance(total, int) or isinstance(total, bool):
+            return None
+        total_changes = 0
+        for item in all_files:
+            ch = item.get("changes")
+            if not isinstance(ch, int) or isinstance(ch, bool) or ch < 0:
+                return None
+            total_changes += ch
+        if total != total_changes:
+            return None
+    return {**base_detail, "files": all_files, "_files_complete": _FILES_COMPLETE_TOKEN}
+
+
+def _rebased_chain_content_matches(
+    repo: str,
+    step_commits: list[dict[str, Any]],
+    pr_commits: list[dict[str, Any]],
+    base_parent: str,
+    pr_base_parent: str,
+    indexed: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    if len(step_commits) != len(pr_commits) or not pr_commits:
+        return False
+    if all(
+        isinstance(s.get("sha"), str) and s.get("sha") and s.get("sha") == p.get("sha")
+        for s, p in zip(step_commits, pr_commits)
+    ):
+        return True
+    if base_parent and pr_base_parent == base_parent:
+        tree_pairs = [(_commit_tree_sha(s), _commit_tree_sha(p)) for s, p in zip(step_commits, pr_commits)]
+        if all(st and st == pt for st, pt in tree_pairs):
+            return True
+    step_parent_head = _resolve_commit(repo, base_parent, indexed if indexed is not None else {}) if base_parent else None
+    pr_parent_head = _resolve_commit(repo, pr_base_parent, {}) if pr_base_parent else None
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None] = {}
+    for index, (step_commit, pr_commit) in enumerate(zip(step_commits, pr_commits)):
+        step_detail = _resolve_commit_detail(repo, step_commit)
+        pr_detail = _resolve_commit_detail(repo, pr_commit)
+        if step_detail is None or pr_detail is None:
+            return False
+        step_parent = step_parent_head if index == 0 else step_commits[index - 1]
+        pr_parent = pr_parent_head if index == 0 else pr_commits[index - 1]
+        step_files = _canonical_commit_files(repo, step_detail, step_parent, tree_cache)
+        pr_files = _canonical_commit_files(repo, pr_detail, pr_parent, tree_cache)
+        if step_files is None or pr_files is None or step_files != pr_files:
+            return False
+    return True
+
+
+def _authenticated_pull_merge_method(
+    repo: str,
+    pull: dict[str, Any],
+    merge_sha: str,
+    signers: set[str] | None,
+) -> str | None:
+    if not signers:
+        return None
+    number = pull.get("number")
+    head = (pull.get("head") or {}).get("sha")
+    if (
+        not isinstance(number, int)
+        or isinstance(number, bool)
+        or not isinstance(head, str)
+        or not head
+        or not merge_sha
+    ):
+        return None
+    comments = paginate(f"/repos/{repo}/issues/{number}/comments")
+    for comment in comments:
+        author = (comment.get("user") or {}).get("login")
+        if not isinstance(author, str) or author not in signers:
+            continue
+        for match in re.finditer(rf"<!--\s*{VERDICT_MARKER}\s*(\{{[\s\S]*?\}})\s*-->", comment.get("body") or ""):
+            try:
+                verdict = json.loads(match.group(1))
+            except ValueError:
+                continue
+            if (
+                verdict.get("repo") == repo
+                and verdict.get("pr") == number
+                and verdict.get("head_sha") == head
+                and verdict.get("merge_sha") == merge_sha
+                and verdict.get("verdict") == "pass"
+                and verdict.get("merged") is True
+            ):
+                method = verdict.get("merge_method")
+                if isinstance(method, str) and method:
+                    return method
+    return None
+
+
+def _is_ancestor_of_base_parent(
+    repo: str,
+    base_sha: str,
+    base_parent: str,
+    indexed: dict[str, dict[str, Any]],
+) -> bool:
+    if not base_sha or not base_parent:
+        return False
+    target = base_sha.lower()
+    current = base_parent
+    seen: set[str] = set()
+    had_multi_parent = False
+    reached_root = False
+    while isinstance(current, str) and current and current.lower() not in seen:
+        lowered = current.lower()
+        if lowered == target:
+            return True
+        seen.add(lowered)
+        commit = indexed.get(current)
+        if not isinstance(commit, dict):
+            break
+        parents = [
+            p.get("sha")
+            for p in (commit.get("parents") or [])
+            if isinstance(p, dict) and isinstance(p.get("sha"), str) and p.get("sha")
+        ]
+        if len(parents) > 1:
+            had_multi_parent = True
+        if not parents:
+            reached_root = True
+            break
+        current = parents[0]
+    if reached_root and not had_multi_parent:
+        return False
+    return _commit_is_ancestor(repo, base_sha, base_parent)
+
+
+def _collect_rebased_commits(
+    repo: str,
+    pull: dict[str, Any],
+    merge_sha: str,
+    indexed: dict[str, dict[str, Any]],
+    merge_method: str | None = None,
+) -> set[str]:
+    if merge_method is not None and merge_method != "rebase":
+        return set()
+    if pull.get("commits") == 1:
+        return set()
+    number = pull.get("number")
+    head_sha = (pull.get("head") or {}).get("sha")
+    base_sha = (pull.get("base") or {}).get("sha")
+    if (
+        not isinstance(number, int)
+        or isinstance(number, bool)
+        or not isinstance(head_sha, str)
+        or not head_sha
+        or not isinstance(base_sha, str)
+        or not base_sha
+    ):
+        return set()
+    pr_commits: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        chunk = request(
+            "GET",
+            f"/repos/{repo}/pulls/{number}/commits",
+            params={"per_page": 100, "page": page},
+            allow=(404,),
+        )
+        if not isinstance(chunk, list):
+            return set()
+        pr_commits.extend(chunk)
+        if len(pr_commits) >= 250:
+            return set()
+        if len(chunk) < 100:
+            break
+        page += 1
+    if len(pr_commits) <= 1 or pr_commits[-1].get("sha") != head_sha:
+        return set()
+    pr_base_parent = ""
+    for index, pr_commit in enumerate(pr_commits):
+        if not isinstance(pr_commit, dict):
+            return set()
+        pr_parents = pr_commit.get("parents") or []
+        if len(pr_parents) != 1 or not isinstance(pr_parents[0], dict):
+            return set()
+        pr_parent_sha = pr_parents[0].get("sha")
+        if not isinstance(pr_parent_sha, str) or not pr_parent_sha:
+            return set()
+        if index == 0:
+            pr_base_parent = pr_parent_sha
+        elif pr_parent_sha != pr_commits[index - 1].get("sha"):
+            return set()
+    earlier_shas: list[str] = []
+    step_commits_rev: list[dict[str, Any]] = []
+    step_sha = merge_sha
+    base_parent = ""
+    for index in range(len(pr_commits) - 1, -1, -1):
+        pr_commit = pr_commits[index]
+        step_commit = _resolve_commit(repo, step_sha, indexed) if step_sha else None
+        if not isinstance(step_commit, dict):
+            return set()
+        raw_parents = step_commit.get("parents") or []
+        if len(raw_parents) != 1 or not isinstance(raw_parents[0], dict):
+            return set()
+        parent_sha = raw_parents[0].get("sha")
+        if not isinstance(parent_sha, str) or not parent_sha:
+            return set()
+        if not _rebased_commit_matches(step_commit, pr_commit):
+            return set()
+        step_commits_rev.append(step_commit)
+        if index < len(pr_commits) - 1:
+            earlier_shas.append(step_sha)
+        base_parent = parent_sha
+        step_sha = parent_sha
+    if not _is_ancestor_of_base_parent(repo, base_sha, base_parent, indexed):
+        return set()
+    if merge_method != "rebase":
+        step_commits_rev.reverse()
+        if not _rebased_chain_content_matches(
+            repo, step_commits_rev, pr_commits, base_parent, pr_base_parent, indexed
+        ):
+            return set()
+    return set(earlier_shas)
 
 
 def scan_direct_pushes(
@@ -1610,6 +2222,10 @@ def scan_direct_pushes(
     limit: int,
     baseline_sha: str = "",
     listing: list[dict[str, Any]] | None = None,
+    pulls_by_merge_sha: dict[str, dict[str, Any]] | None = None,
+    pull_methods: dict[int, str] | None = None,
+    first_parent: set[str] | None = None,
+    signers: set[str] | None = None,
 ) -> list[str]:
     # Only main's first-parent chain is evidence of a push that bypassed the entry;
     # scanning the raw commit listing both misses chain commits behind a long branch
@@ -1625,10 +2241,28 @@ def scan_direct_pushes(
                           params={"sha": default, "per_page": 100}) or []
     for commit in listing:
         indexed.setdefault(commit["sha"], commit)
+    resolved_methods: dict[int, str] = dict(pull_methods or {})
     findings: list[str] = []
-    current, visited = (listing[0]["sha"] if listing else ""), 0
+    rebased_commits: set[str] = set()
+    seen_shas: set[str] = set()
+    current, visited, steps = (listing[0]["sha"] if listing else ""), 0, 0
+    max_steps = max(limit * 20, 2000)
     while current and visited < limit:
+        if current in seen_shas:
+            findings.append(
+                f"{current[:7]} on {default} forms a commit parent cycle; "
+                "the direct-push audit is incomplete"
+            )
+            break
+        seen_shas.add(current)
         if baseline_sha and current.lower() == baseline_sha:
+            break
+        steps += 1
+        if steps > max_steps:
+            findings.append(
+                f"{current[:7]} on {default} exceeded direct-push traversal limit ({max_steps}); "
+                "the direct-push audit is incomplete"
+            )
             break
         commit = _resolve_commit(repo, current, indexed)
         if commit is None:
@@ -1637,17 +2271,54 @@ def scan_direct_pushes(
             break
         parents = [parent.get("sha") for parent in (commit.get("parents") or [])]
         next_sha = parents[0] if parents else ""
+        if current in rebased_commits:
+            current = next_sha
+            continue
         visited += 1
+        pull = pulls_by_merge_sha.get(current) if pulls_by_merge_sha else None
         if current in merge_shas:
+            if len(parents) == 1 and pull is not None:
+                number = pull.get("number")
+                method = resolved_methods.get(number) if isinstance(number, int) else None
+                rebased_commits.update(
+                    _collect_rebased_commits(
+                        repo,
+                        pull,
+                        current,
+                        indexed,
+                        merge_method=method,
+                    )
+                )
             current = next_sha
             continue
         related = request("GET", f"/repos/{repo}/commits/{current}/pulls", allow=(404,)) or []
-        if not any(
-            pull.get("merged_at")
-            and (pull.get("base") or {}).get("ref") == default
-            and pull.get("merge_commit_sha") == current
-            for pull in related
-        ):
+        matched = [
+            p
+            for p in related
+            if p.get("merged_at")
+            and (p.get("base") or {}).get("ref") == default
+            and p.get("merge_commit_sha") == current
+        ]
+        if matched:
+            if len(parents) == 1:
+                for p in matched:
+                    number = p.get("number")
+                    method = resolved_methods.get(number) if isinstance(number, int) else None
+                    if method is None and isinstance(number, int) and not isinstance(number, bool):
+                        found_method = _authenticated_pull_merge_method(repo, p, current, signers)
+                        if found_method is not None:
+                            resolved_methods[number] = found_method
+                            method = found_method
+                    rebased_commits.update(
+                        _collect_rebased_commits(
+                            repo,
+                            p,
+                            current,
+                            indexed,
+                            merge_method=method,
+                        )
+                    )
+        else:
             subject = ((commit.get("commit") or {}).get("message") or "").splitlines()[0]
             note = str(acknowledged.get(current) or acknowledged.get(current[:7]) or "")
             message = f"{current[:7]} on {default} is not associated with a merged pull request: {subject}"
@@ -1755,6 +2426,7 @@ def audit(
     eligible.sort(key=lambda pull: pull["merged_at"], reverse=True)
     audited_pulls = eligible[:limit]
     checked = 0
+    pull_methods: dict[int, str] = {}
     for pull in audited_pulls:
         number = pull["number"]
         checked += 1
@@ -1780,6 +2452,9 @@ def audit(
                     and verdict.get("merged") is True
                 ):
                     passed = True
+                    method = verdict.get("merge_method")
+                    if isinstance(method, str) and isinstance(number, int) and not isinstance(number, bool):
+                        pull_methods[number] = method
         if not passed:
             violations.append(f"#{number} merged at {head[:7]} without an authenticated passing verdict")
     listing = request(
@@ -1822,11 +2497,12 @@ def audit(
             strict=strict,
         )
     )
-    merge_shas = {
-        pull.get("merge_commit_sha")
+    pulls_by_merge_sha = {
+        pull["merge_commit_sha"]: pull
         for pull in default_pulls
         if pull.get("merge_commit_sha")
     }
+    merge_shas = set(pulls_by_merge_sha)
     violations.extend(
         scan_direct_pushes(
             repo,
@@ -1837,6 +2513,10 @@ def audit(
             direct_limit,
             baseline_sha=baseline_sha,
             listing=listing,
+            pulls_by_merge_sha=pulls_by_merge_sha,
+            pull_methods=pull_methods,
+            first_parent=first_parent,
+            signers=signers,
         )
     )
     print(f"audited {checked} merged pull requests since {since or 'the beginning'}")

@@ -348,6 +348,8 @@ HOOK_FILES = ("governance.py", "pre-commit", "commit-msg", "pre-push")
 MERGE_GATE_FILES = (
     ("merge_gate.py", "governance/merge_gate.py"),
     ("test_merge_gate.py", "governance/tests/test_merge_gate.py"),
+    ("test_merge_gate_receipts.py", "governance/tests/test_merge_gate_receipts.py"),
+    ("test_merge_gate_audit.py", "governance/tests/test_merge_gate_audit.py"),
     ("check_hygiene.py", "scripts/check_hygiene.py"),
 )
 DRIFT_FILES = (
@@ -691,8 +693,9 @@ def main(argv):
     parser.add_argument("--root", default=".")
     parser.add_argument("--source", help="directory to install the hooks from or compare against")
     parser.add_argument("--include-merge-gate", action="store_true",
-                        help="with install or verify, include merge_gate.py, test_merge_gate.py, "
-                             "and check_hygiene.py inside the installed .git/governance directory")
+                        help="with install or verify, include merge_gate.py, "
+                             "test_merge_gate*.py, and check_hygiene.py inside the installed "
+                             ".git/governance directory")
     options = parser.parse_args(argv)
     root = repository_root(str(Path(options.root).resolve()))
     if options.command == "install":
