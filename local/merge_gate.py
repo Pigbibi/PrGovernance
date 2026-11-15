@@ -1612,7 +1612,7 @@ def _audit_force_pushes(
 def _rebased_commit_matches(step_commit: dict[str, Any], pr_commit: dict[str, Any]) -> bool:
     step_sha = step_commit.get("sha")
     pr_sha = pr_commit.get("sha")
-    if isinstance(step_sha, str) and isinstance(pr_sha, str) and step_sha == pr_sha:
+    if isinstance(step_sha, str) and isinstance(pr_sha, str) and step_sha and step_sha == pr_sha:
         return True
     step_meta = step_commit.get("commit")
     pr_meta = pr_commit.get("commit")
@@ -1627,15 +1627,157 @@ def _rebased_commit_matches(step_commit: dict[str, Any], pr_commit: dict[str, An
         or step_message != pr_message
     ):
         return False
-    step_author = step_meta.get("author") if isinstance(step_meta.get("author"), dict) else {}
-    pr_author = pr_meta.get("author") if isinstance(pr_meta.get("author"), dict) else {}
+    step_author = step_meta.get("author")
+    pr_author = pr_meta.get("author")
+    if not isinstance(step_author, dict) or not isinstance(pr_author, dict):
+        return False
     pr_email = pr_author.get("email")
-    if pr_email and step_author.get("email") != pr_email:
+    if not isinstance(pr_email, str) or not pr_email or step_author.get("email") != pr_email:
         return False
     pr_date = pr_author.get("date")
-    if pr_date and step_author.get("date") != pr_date:
+    if not isinstance(pr_date, str) or not pr_date or step_author.get("date") != pr_date:
+        return False
+    pr_name = pr_author.get("name")
+    if isinstance(pr_name, str) and pr_name and step_author.get("name") != pr_name:
         return False
     return True
+
+
+def _commit_tree_sha(commit: dict[str, Any]) -> str:
+    tree_sha = ((commit.get("commit") or {}).get("tree") or {}).get("sha")
+    if isinstance(tree_sha, str):
+        lowered = tree_sha.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", lowered):
+            return lowered
+    return ""
+
+
+def _canonical_commit_files(commit_detail: dict[str, Any]) -> list[tuple[Any, ...]] | None:
+    files = commit_detail.get("files")
+    if not isinstance(files, list) or not (0 < len(files) < 300):
+        return None
+    normalized: list[tuple[Any, ...]] = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            return None
+        filename = entry.get("filename")
+        status = entry.get("status")
+        previous = entry.get("previous_filename") or ""
+        additions = entry.get("additions")
+        deletions = entry.get("deletions")
+        changes = entry.get("changes")
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or not isinstance(status, str)
+            or not status
+            or not isinstance(previous, str)
+            or not isinstance(additions, int)
+            or isinstance(additions, bool)
+            or not isinstance(deletions, int)
+            or isinstance(deletions, bool)
+            or not isinstance(changes, int)
+            or isinstance(changes, bool)
+        ):
+            return None
+        patch = entry.get("patch")
+        if isinstance(patch, str):
+            proof: tuple[str, str] = ("patch", patch)
+        elif (
+            patch is None
+            and status == "renamed"
+            and changes == 0
+            and isinstance(entry.get("sha"), str)
+            and entry.get("sha")
+        ):
+            proof = ("rename_sha", str(entry["sha"]))
+        else:
+            return None
+        normalized.append((filename, previous, status, additions, deletions, changes, proof))
+    normalized.sort()
+    return normalized
+
+
+def _resolve_commit_detail(repo: str, commit: dict[str, Any]) -> dict[str, Any] | None:
+    if isinstance(commit.get("files"), list):
+        return commit
+    sha = commit.get("sha")
+    if not isinstance(sha, str) or not sha:
+        return None
+    detail = request("GET", f"/repos/{repo}/commits/{sha}", allow=(404,))
+    return detail if isinstance(detail, dict) else None
+
+
+def _rebased_chain_content_matches(
+    repo: str,
+    step_commits: list[dict[str, Any]],
+    pr_commits: list[dict[str, Any]],
+    base_parent: str,
+    pr_base_parent: str,
+) -> bool:
+    if len(step_commits) != len(pr_commits) or not pr_commits:
+        return False
+    if all(
+        isinstance(s.get("sha"), str) and s.get("sha") and s.get("sha") == p.get("sha")
+        for s, p in zip(step_commits, pr_commits)
+    ):
+        return True
+    if base_parent and pr_base_parent == base_parent:
+        tree_pairs = [(_commit_tree_sha(s), _commit_tree_sha(p)) for s, p in zip(step_commits, pr_commits)]
+        if all(st and st == pt for st, pt in tree_pairs):
+            return True
+    for step_commit, pr_commit in zip(step_commits, pr_commits):
+        step_detail = _resolve_commit_detail(repo, step_commit)
+        pr_detail = _resolve_commit_detail(repo, pr_commit)
+        if step_detail is None or pr_detail is None:
+            return False
+        step_files = _canonical_commit_files(step_detail)
+        pr_files = _canonical_commit_files(pr_detail)
+        if step_files is None or pr_files is None or step_files != pr_files:
+            return False
+    return True
+
+
+def _authenticated_pull_merge_method(
+    repo: str,
+    pull: dict[str, Any],
+    merge_sha: str,
+    signers: set[str] | None,
+) -> str | None:
+    if not signers:
+        return None
+    number = pull.get("number")
+    head = (pull.get("head") or {}).get("sha")
+    if (
+        not isinstance(number, int)
+        or isinstance(number, bool)
+        or not isinstance(head, str)
+        or not head
+        or not merge_sha
+    ):
+        return None
+    comments = paginate(f"/repos/{repo}/issues/{number}/comments")
+    for comment in comments:
+        author = (comment.get("user") or {}).get("login")
+        if not isinstance(author, str) or author not in signers:
+            continue
+        for match in re.finditer(rf"<!--\s*{VERDICT_MARKER}\s*(\{{[\s\S]*?\}})\s*-->", comment.get("body") or ""):
+            try:
+                verdict = json.loads(match.group(1))
+            except ValueError:
+                continue
+            if (
+                verdict.get("repo") == repo
+                and verdict.get("pr") == number
+                and verdict.get("head_sha") == head
+                and verdict.get("merge_sha") == merge_sha
+                and verdict.get("verdict") == "pass"
+                and verdict.get("merged") is True
+            ):
+                method = verdict.get("merge_method")
+                if isinstance(method, str) and method:
+                    return method
+    return None
 
 
 def _collect_rebased_commits(
@@ -1651,7 +1793,16 @@ def _collect_rebased_commits(
     if pull.get("commits") == 1:
         return set()
     number = pull.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
+    head_sha = (pull.get("head") or {}).get("sha")
+    base_sha = (pull.get("base") or {}).get("sha")
+    if (
+        not isinstance(number, int)
+        or isinstance(number, bool)
+        or not isinstance(head_sha, str)
+        or not head_sha
+        or not isinstance(base_sha, str)
+        or not base_sha
+    ):
         return set()
     pr_commits: list[dict[str, Any]] = []
     page = 1
@@ -1670,15 +1821,28 @@ def _collect_rebased_commits(
         if len(chunk) < 100:
             break
         page += 1
-    if len(pr_commits) <= 1:
+    if len(pr_commits) <= 1 or pr_commits[-1].get("sha") != head_sha:
         return set()
+    pr_base_parent = ""
+    for index, pr_commit in enumerate(pr_commits):
+        if not isinstance(pr_commit, dict):
+            return set()
+        pr_parents = pr_commit.get("parents") or []
+        if len(pr_parents) != 1 or not isinstance(pr_parents[0], dict):
+            return set()
+        pr_parent_sha = pr_parents[0].get("sha")
+        if not isinstance(pr_parent_sha, str) or not pr_parent_sha:
+            return set()
+        if index == 0:
+            pr_base_parent = pr_parent_sha
+        elif pr_parent_sha != pr_commits[index - 1].get("sha"):
+            return set()
     earlier_shas: list[str] = []
+    step_commits_rev: list[dict[str, Any]] = []
     step_sha = merge_sha
     base_parent = ""
     for index in range(len(pr_commits) - 1, -1, -1):
         pr_commit = pr_commits[index]
-        if not isinstance(pr_commit, dict):
-            return set()
         step_commit = _resolve_commit(repo, step_sha, indexed) if step_sha else None
         if not isinstance(step_commit, dict):
             return set()
@@ -1690,13 +1854,18 @@ def _collect_rebased_commits(
             return set()
         if not _rebased_commit_matches(step_commit, pr_commit):
             return set()
+        step_commits_rev.append(step_commit)
         if index < len(pr_commits) - 1:
             earlier_shas.append(step_sha)
         base_parent = parent_sha
         step_sha = parent_sha
-    base_sha = (pull.get("base") or {}).get("sha")
-    if isinstance(base_sha, str) and base_sha:
-        if not _commit_is_ancestor(repo, base_sha, base_parent, first_parent):
+    if not _commit_is_ancestor(repo, base_sha, base_parent, first_parent):
+        return set()
+    if merge_method != "rebase":
+        step_commits_rev.reverse()
+        if not _rebased_chain_content_matches(
+            repo, step_commits_rev, pr_commits, base_parent, pr_base_parent
+        ):
             return set()
     return set(earlier_shas)
 
@@ -1713,6 +1882,7 @@ def scan_direct_pushes(
     pulls_by_merge_sha: dict[str, dict[str, Any]] | None = None,
     pull_methods: dict[int, str] | None = None,
     first_parent: set[str] | None = None,
+    signers: set[str] | None = None,
 ) -> list[str]:
     # Only main's first-parent chain is evidence of a push that bypassed the entry;
     # scanning the raw commit listing both misses chain commits behind a long branch
@@ -1728,6 +1898,7 @@ def scan_direct_pushes(
                           params={"sha": default, "per_page": 100}) or []
     for commit in listing:
         indexed.setdefault(commit["sha"], commit)
+    resolved_methods: dict[int, str] = dict(pull_methods or {})
     findings: list[str] = []
     rebased_commits: set[str] = set()
     current, visited = (listing[0]["sha"] if listing else ""), 0
@@ -1748,7 +1919,8 @@ def scan_direct_pushes(
         pull = pulls_by_merge_sha.get(current) if pulls_by_merge_sha else None
         if current in merge_shas:
             if len(parents) == 1 and pull is not None:
-                method = pull_methods.get(pull.get("number")) if pull_methods else None
+                number = pull.get("number")
+                method = resolved_methods.get(number) if isinstance(number, int) else None
                 rebased_commits.update(
                     _collect_rebased_commits(
                         repo,
@@ -1772,7 +1944,13 @@ def scan_direct_pushes(
         if matched:
             if len(parents) == 1:
                 for p in matched:
-                    method = pull_methods.get(p.get("number")) if pull_methods else None
+                    number = p.get("number")
+                    method = resolved_methods.get(number) if isinstance(number, int) else None
+                    if method is None and isinstance(number, int) and not isinstance(number, bool):
+                        found_method = _authenticated_pull_merge_method(repo, p, current, signers)
+                        if found_method is not None:
+                            resolved_methods[number] = found_method
+                            method = found_method
                     rebased_commits.update(
                         _collect_rebased_commits(
                             repo,
@@ -1981,6 +2159,7 @@ def audit(
             pulls_by_merge_sha=pulls_by_merge_sha,
             pull_methods=pull_methods,
             first_parent=first_parent,
+            signers=signers,
         )
     )
     print(f"audited {checked} merged pull requests since {since or 'the beginning'}")

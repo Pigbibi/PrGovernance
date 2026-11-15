@@ -217,7 +217,9 @@ trusted copy.
   `audit_direct_commits` to at least 40. Direct-push scanning ignores commit
   timestamps (`committer.date`), checks the bounded first-parent window
   (stopping early only at a trusted `audit_baseline_sha` and recognizing verified
-  intermediate commits from rebase-merged pull requests), and checks
+  intermediate commits from rebase-merged pull requests only when backed by an
+  authenticated `rebase` verdict or cryptographic/patch-level commit
+  equivalence), and checks
   default-branch `force_push` activity (requiring both `before` and `after` to
   strictly precede `audit_baseline_sha` for pre-baseline exemptions) plus
   merged-PR/baseline ancestry to detect rollbacks (failing closed in strict mode

@@ -810,16 +810,24 @@ class DirectPushAuditTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(f"{self.DIRECT[:7]} on main could not be resolved", output)
 
-    def _rich_commit(self, sha, parents, message, email="dev@example.com", date="2026-01-05T00:00:00Z"):
-        return {
+    def _rich_commit(
+        self, sha, parents, message, email="dev@example.com", date="2026-01-05T00:00:00Z", tree_sha=None, files=None
+    ):
+        commit_obj = {
+            "message": message,
+            "author": {"email": email, "date": date},
+            "committer": {"date": date},
+        }
+        if tree_sha is not None:
+            commit_obj["tree"] = {"sha": tree_sha}
+        entry = {
             "sha": sha,
             "parents": [{"sha": p} for p in parents],
-            "commit": {
-                "message": message,
-                "author": {"email": email, "date": date},
-                "committer": {"date": date},
-            },
+            "commit": commit_obj,
         }
+        if files is not None:
+            entry["files"] = files
+        return entry
 
     def test_multi_commit_rebase_merge_commits_are_not_direct_pushes(self):
         root = "0" * 40
@@ -827,18 +835,21 @@ class DirectPushAuditTests(unittest.TestCase):
         r_old_2 = "2" * 40
         r1 = "3" * 40
         r2 = "4" * 40
+        pre_base = "6" * 40
         orig_old_1 = "e" * 40
         orig_old_2 = "f" * 40
         orig_1 = "7" * 40
         orig_2 = "8" * 40
         orig_3 = "9" * 40
+        t_old_1 = "a1" * 20
+        t_old_2 = "a2" * 20
 
         chain = [
             self._rich_commit(self.TIP, (r2,), "feat: step 3", date="2026-01-05T03:00:00Z"),
             self._rich_commit(r2, (r1,), "feat: step 2", date="2026-01-05T02:00:00Z"),
             self._rich_commit(r1, (r_old_2,), "feat: step 1", date="2026-01-05T01:00:00Z"),
-            self._rich_commit(r_old_2, (r_old_1,), "fix: old 2", date="2026-01-04T02:00:00Z"),
-            self._rich_commit(r_old_1, (root,), "fix: old 1", date="2026-01-04T01:00:00Z"),
+            self._rich_commit(r_old_2, (r_old_1,), "fix: old 2", date="2026-01-04T02:00:00Z", tree_sha=t_old_2),
+            self._rich_commit(r_old_1, (root,), "fix: old 1", date="2026-01-04T01:00:00Z", tree_sha=t_old_1),
             self._rich_commit(root, (), "chore: root", date="2026-01-03T00:00:00Z"),
         ]
         pull_7 = {
@@ -859,13 +870,13 @@ class DirectPushAuditTests(unittest.TestCase):
         }
         pr_commits = {
             7: [
-                self._rich_commit(orig_1, (), "feat: step 1", date="2026-01-05T01:00:00Z"),
+                self._rich_commit(orig_1, (pre_base,), "feat: step 1", date="2026-01-05T01:00:00Z"),
                 self._rich_commit(orig_2, (orig_1,), "feat: step 2", date="2026-01-05T02:00:00Z"),
                 self._rich_commit(orig_3, (orig_2,), "feat: step 3", date="2026-01-05T03:00:00Z"),
             ],
             6: [
-                self._rich_commit(orig_old_1, (), "fix: old 1", date="2026-01-04T01:00:00Z"),
-                self._rich_commit(orig_old_2, (orig_old_1,), "fix: old 2", date="2026-01-04T02:00:00Z"),
+                self._rich_commit(orig_old_1, (root,), "fix: old 1", date="2026-01-04T01:00:00Z", tree_sha=t_old_1),
+                self._rich_commit(orig_old_2, (orig_old_1,), "fix: old 2", date="2026-01-04T02:00:00Z", tree_sha=t_old_2),
             ],
         }
         verdict_7 = {
@@ -912,6 +923,121 @@ class DirectPushAuditTests(unittest.TestCase):
             code = gate.audit("o/r", 20, True)
         self.assertEqual(code, 0, captured.getvalue())
         self.assertIn("no violations", captured.getvalue())
+
+    def test_unknown_merge_method_requires_content_proof_and_rejects_squash_forgery(self):
+        root = "0" * 40
+        direct_forged = "1" * 40
+        squash_forged = "2" * 40
+        r1 = "3" * 40
+        r2 = "4" * 40
+        p0 = "7" * 40
+        p1 = "8" * 40
+        file_a = [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 0, "changes": 1, "patch": "+a"}]
+        file_b = [{"filename": "b.py", "status": "modified", "additions": 1, "deletions": 0, "changes": 1, "patch": "+b"}]
+        file_evil = [{"filename": "evil.py", "status": "added", "additions": 1, "deletions": 0, "changes": 1, "patch": "+x"}]
+
+        # Case 1: outside-window PR discovered via /commits/{sha}/pulls (merge_method=None)
+        # cannot exempt a direct push whose commit message/author metadata mimic P0.
+        forged_chain = [
+            self._rich_commit(squash_forged, (direct_forged,), "feat: step 2", date="2026-01-05T02:00:00Z"),
+            self._rich_commit(direct_forged, (root,), "feat: step 1", date="2026-01-05T01:00:00Z"),
+            self._rich_commit(root, (), "chore: root"),
+        ]
+        pull_outside = {
+            "number": 9,
+            "merged_at": self.DATE,
+            "base": {"ref": "main", "sha": root},
+            "head": {"sha": p1},
+            "merge_commit_sha": squash_forged,
+            "commits": 2,
+        }
+        pr9_commits = [
+            self._rich_commit(p0, ("6" * 40,), "feat: step 1", date="2026-01-05T01:00:00Z"),
+            self._rich_commit(p1, (p0,), "feat: step 2", date="2026-01-05T02:00:00Z"),
+        ]
+        details_forged = {
+            squash_forged: self._rich_commit(squash_forged, (direct_forged,), "feat: step 2", date="2026-01-05T02:00:00Z", files=file_a + file_b),
+            direct_forged: self._rich_commit(direct_forged, (root,), "feat: step 1", date="2026-01-05T01:00:00Z", files=file_evil),
+            p0: self._rich_commit(p0, ("6" * 40,), "feat: step 1", date="2026-01-05T01:00:00Z", files=file_a),
+            p1: self._rich_commit(p1, (p0,), "feat: step 2", date="2026-01-05T02:00:00Z", files=file_b),
+        }
+
+        def request_case1(method, path, body=None, params=None, allow=()):
+            if path == f"/repos/o/r/commits/{squash_forged}/pulls":
+                return [pull_outside]
+            if path == f"/repos/o/r/commits/{root}/pulls":
+                return [{"merged_at": self.DATE, "base": {"ref": "main"}, "merge_commit_sha": root}]
+            if path.startswith("/repos/o/r/commits/") and path.endswith("/pulls"):
+                return []
+            if path.startswith("/repos/o/r/commits/"):
+                sha = path.rsplit("/", 1)[-1]
+                return details_forged.get(sha)
+            if path == "/repos/o/r/pulls/9/commits":
+                return pr9_commits if params and params.get("page") == 1 else []
+            return []
+
+        with mock.patch.object(gate, "request", request_case1):
+            findings = gate.scan_direct_pushes("o/r", "main", set(), {}, True, 20, listing=forged_chain)
+        self.assertEqual(len(findings), 1)
+        self.assertIn(direct_forged[:7], findings[0])
+
+        # Case 2: outside-window PR with authenticated squash verdict is rejected immediately.
+        valid_tree_chain = [
+            self._rich_commit(r2, (r1,), "feat: step 2", date="2026-01-05T02:00:00Z"),
+            self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z"),
+            self._rich_commit(root, (), "chore: root"),
+        ]
+        rebased_pull = {**pull_outside, "merge_commit_sha": r2}
+        rebased_details = {
+            r1: self._rich_commit(r1, (root,), "feat: step 1", date="2026-01-05T01:00:00Z", files=file_a),
+            r2: self._rich_commit(r2, (r1,), "feat: step 2", date="2026-01-05T02:00:00Z", files=file_b),
+            p0: details_forged[p0],
+            p1: details_forged[p1],
+        }
+
+        def request_case2(method, path, body=None, params=None, allow=()):
+            if path == f"/repos/o/r/commits/{r2}/pulls":
+                return [rebased_pull]
+            if path == f"/repos/o/r/commits/{root}/pulls":
+                return [{"merged_at": self.DATE, "base": {"ref": "main"}, "merge_commit_sha": root}]
+            if path.startswith("/repos/o/r/commits/") and path.endswith("/pulls"):
+                return []
+            if path.startswith("/repos/o/r/commits/"):
+                sha = path.rsplit("/", 1)[-1]
+                return rebased_details.get(sha)
+            if path == "/repos/o/r/pulls/9/commits":
+                return pr9_commits if params and params.get("page") == 1 else []
+            return []
+
+        squash_comment_for_rebased = {
+            "user": {"login": "synthetic-owner"},
+            "body": "<!-- governance-verdict:v1 "
+            + json.dumps({
+                "repo": "o/r",
+                "pr": 9,
+                "head_sha": p1,
+                "merge_sha": r2,
+                "merge_method": "squash",
+                "verdict": "pass",
+                "merged": True,
+            })
+            + " -->",
+        }
+        with mock.patch.object(gate, "request", request_case2), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: [squash_comment_for_rebased]):
+            findings = gate.scan_direct_pushes(
+                "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+            )
+        self.assertEqual(len(findings), 1)
+        self.assertIn(r1[:7], findings[0])
+
+        # Case 3: outside-window PR with unknown method passes when per-commit file diffs match.
+        with mock.patch.object(gate, "request", request_case2), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: []):
+            findings = gate.scan_direct_pushes(
+                "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+            )
+        self.assertEqual(findings, [])
 
     def test_squash_or_divergent_rebase_does_not_exempt_parent_commits(self):
         r1 = "3" * 40
