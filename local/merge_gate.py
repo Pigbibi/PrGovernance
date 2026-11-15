@@ -1471,6 +1471,102 @@ def _resolve_commit(repo: str, sha: str, indexed: dict[str, dict[str, Any]]) -> 
     return commit
 
 
+def _first_parent_shas(listing: list[dict[str, Any]]) -> set[str]:
+    indexed = {
+        commit["sha"]: commit
+        for commit in listing
+        if isinstance(commit, dict) and isinstance(commit.get("sha"), str)
+    }
+    reachable: set[str] = set()
+    current = listing[0].get("sha") if listing and isinstance(listing[0], dict) else ""
+    while isinstance(current, str) and current and current.lower() not in reachable:
+        reachable.add(current.lower())
+        commit = indexed.get(current)
+        if not commit:
+            break
+        parents = [
+            parent.get("sha")
+            for parent in (commit.get("parents") or [])
+            if isinstance(parent, dict)
+        ]
+        current = parents[0] if parents else ""
+    return reachable
+
+
+def _commit_is_ancestor(
+    repo: str, ancestor: str, tip: str, known_ancestors: set[str] | None = None
+) -> bool:
+    if not ancestor or not tip:
+        return False
+    lowered = ancestor.lower()
+    if lowered == tip.lower() or (known_ancestors is not None and lowered in known_ancestors):
+        return True
+    comparison = request(
+        "GET",
+        f"/repos/{repo}/compare/{ancestor}...{tip}",
+        allow=(404, 422),
+    )
+    if not isinstance(comparison, dict):
+        return False
+    merge_base = (comparison.get("merge_base_commit") or {}).get("sha")
+    if not isinstance(merge_base, str) or merge_base.lower() != lowered:
+        return False
+    status = comparison.get("status")
+    return status is None or status in ("identical", "ahead")
+
+
+def _audit_force_pushes(
+    repo: str,
+    default: str,
+    since: str,
+    acknowledged: dict[str, Any],
+    baseline_sha: str = "",
+    baseline_verified: bool = False,
+) -> list[str]:
+    activities = branch_activities(repo, default)
+    if not activities:
+        return []
+    expected_ref = f"refs/heads/{default}"
+    since_dt = _parse_iso_timestamp(since) if since else None
+    findings: list[str] = []
+    for entry in activities:
+        if not isinstance(entry, dict) or entry.get("activity_type") != "force_push":
+            continue
+        entry_ref = entry.get("ref")
+        if entry_ref is not None and entry_ref != expected_ref:
+            continue
+        entry_ts = _parse_iso_timestamp(entry.get("timestamp"))
+        if since_dt is not None and entry_ts is not None and entry_ts < since_dt:
+            continue
+        entry_id = entry.get("id")
+        id_key = (
+            str(entry_id)
+            if entry_id is not None and not isinstance(entry_id, bool)
+            else ""
+        )
+        note = ""
+        if id_key:
+            note = str(acknowledged.get(f"activity:{id_key}") or acknowledged.get(id_key) or "")
+        if note:
+            print(f"note: acknowledged force push on {default} ({id_key}): {note}")
+            continue
+        after = str(entry.get("after") or "")
+        if (
+            baseline_sha
+            and baseline_verified
+            and after
+            and after.lower() != baseline_sha
+            and _commit_is_ancestor(repo, after, baseline_sha)
+        ):
+            continue
+        before = str(entry.get("before") or "")
+        origin = before[:7] if before else "unknown"
+        target = after[:7] if after else "unknown"
+        event_label = f"activity {id_key}" if id_key else "activity"
+        findings.append(f"force push on {default} ({event_label}: {origin}..{target})")
+    return findings
+
+
 def scan_direct_pushes(
     repo: str,
     default: str,
@@ -1479,6 +1575,7 @@ def scan_direct_pushes(
     strict: bool,
     limit: int,
     baseline_sha: str = "",
+    listing: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     # Only main's first-parent chain is evidence of a push that bypassed the entry;
     # scanning the raw commit listing both misses chain commits behind a long branch
@@ -1489,8 +1586,9 @@ def scan_direct_pushes(
     # branches too, so ancestors missing from it are fetched one by one rather than
     # silently ending the walk.
     indexed: dict[str, dict[str, Any]] = {}
-    listing = request("GET", f"/repos/{repo}/commits",
-                      params={"sha": default, "per_page": 100}) or []
+    if listing is None:
+        listing = request("GET", f"/repos/{repo}/commits",
+                          params={"sha": default, "per_page": 100}) or []
     for commit in listing:
         indexed.setdefault(commit["sha"], commit)
     findings: list[str] = []
@@ -1551,6 +1649,7 @@ def audit(
         verify_script(repo, default)
         trusted_policy = False
 
+    strict = bool(strict_direct or policy.get("audit_strict_direct", True))
     signers = _valid_verdict_signers(policy)
     violations: list[str] = []
     raw_since = policy.get("audit_since") or ""
@@ -1571,7 +1670,7 @@ def audit(
     ignored = {str(number) for number in policy.get("audit_ignore_prs") or []}
     acknowledged = policy.get("audit_acknowledged_direct") or {}
     direct_limit = int(policy.get("audit_direct_commits") or 40)
-    if strict_direct and not trusted_policy:
+    if strict and not trusted_policy:
         since = ""
         baseline_sha = ""
         ignored = set()
@@ -1620,8 +1719,9 @@ def audit(
     # The API sorts by update time, not merge time; select the latest merges
     # before applying the limit so a stale update cannot consume the window.
     eligible.sort(key=lambda pull: pull["merged_at"], reverse=True)
+    audited_pulls = eligible[:limit]
     checked = 0
-    for pull in eligible[:limit]:
+    for pull in audited_pulls:
         number = pull["number"]
         checked += 1
         head = pull["head"]["sha"]
@@ -1648,12 +1748,50 @@ def audit(
                     passed = True
         if not passed:
             violations.append(f"#{number} merged at {head[:7]} without an authenticated passing verdict")
+    listing = request(
+        "GET",
+        f"/repos/{repo}/commits",
+        params={"sha": default, "per_page": 100},
+    ) or []
+    default_tip = listing[0]["sha"] if listing else ""
+    first_parent = _first_parent_shas(listing)
+    baseline_verified = False
+    default_pulls = [
+        pull for pull in audited_pulls if (pull.get("base") or {}).get("ref") == default
+    ]
+    if not default_tip:
+        if baseline_sha or default_pulls:
+            violations.append(f"could not resolve {default} tip; rollback audit is incomplete")
+    else:
+        if baseline_sha:
+            baseline_verified = _commit_is_ancestor(repo, baseline_sha, default_tip, first_parent)
+            if not baseline_verified:
+                violations.append(
+                    f"baseline {baseline_sha[:7]} is no longer an ancestor of {default} "
+                    f"(possible force-push rollback)"
+                )
+        for pull in default_pulls:
+            merge_sha = pull.get("merge_commit_sha")
+            if merge_sha and not _commit_is_ancestor(repo, merge_sha, default_tip, first_parent):
+                violations.append(
+                    f"#{pull['number']} merge commit {merge_sha[:7]} is no longer an ancestor of "
+                    f"{default} (possible force-push rollback)"
+                )
+    violations.extend(
+        _audit_force_pushes(
+            repo,
+            default,
+            since,
+            acknowledged,
+            baseline_sha=baseline_sha,
+            baseline_verified=baseline_verified,
+        )
+    )
     merge_shas = {
         pull.get("merge_commit_sha")
-        for pull in eligible[:limit]
-        if pull.get("merge_commit_sha") and (pull.get("base") or {}).get("ref") == default
+        for pull in default_pulls
+        if pull.get("merge_commit_sha")
     }
-    strict = bool(strict_direct or policy.get("audit_strict_direct", True))
     violations.extend(
         scan_direct_pushes(
             repo,
@@ -1663,6 +1801,7 @@ def audit(
             strict,
             direct_limit,
             baseline_sha=baseline_sha,
+            listing=listing,
         )
     )
     print(f"audited {checked} merged pull requests since {since or 'the beginning'}")

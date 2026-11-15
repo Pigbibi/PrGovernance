@@ -205,9 +205,12 @@ trusted copy.
   Git symlink (`120000`) tree entries on pull requests.
 - `merge_gate.py --audit` accepts `--policy-ref <ref>` or `--policy-file <path>`
   to evaluate against a trusted policy revision instead of the audited branch;
-  passing `--strict-direct` without a trusted policy ignores self-exemptions
-  (`audit_since`, `audit_baseline_sha`, `audit_ignore_prs`,
-  `audit_acknowledged_direct`) and clamps `audit_direct_commits` to at least 40.
-  Direct-push scanning ignores commit timestamps (`committer.date`) and checks
-  the bounded first-parent window, stopping early only at a trusted
-  `audit_baseline_sha`.
+  whenever strict direct auditing applies without a trusted policy (via
+  `--strict-direct` or default/explicit `audit_strict_direct: true`), it ignores
+  default-branch exemptions (`audit_since`, `audit_baseline_sha`,
+  `audit_ignore_prs`, `audit_acknowledged_direct`) and clamps
+  `audit_direct_commits` to at least 40. Direct-push scanning ignores commit
+  timestamps (`committer.date`), checks the bounded first-parent window
+  (stopping early only at a trusted `audit_baseline_sha`), and checks default
+  branch `force_push` activity plus merged-PR/baseline ancestry to detect
+  rollbacks.

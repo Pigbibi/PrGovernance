@@ -526,6 +526,7 @@ class AuditTests(unittest.TestCase):
 
         with mock.patch.object(gate, "request", fake_request), \
              mock.patch.object(gate, "paginate", lambda path, params=None: comments), \
+             mock.patch.object(gate, "branch_activities", return_value=[]), \
              mock.patch.object(gate, "load_policy", lambda *a, **k: policy), \
              mock.patch.object(gate, "verify_script", lambda *a, **k: None):
             return gate.audit("o/r", 20, False)
@@ -587,9 +588,10 @@ class AuditTests(unittest.TestCase):
 
         with mock.patch.object(gate, "request", fake_request), \
              mock.patch.object(gate, "paginate", lambda path, params=None: []), \
+             mock.patch.object(gate, "branch_activities", return_value=[]), \
              mock.patch.object(gate, "load_policy", lambda *a, **k: policy), \
              mock.patch.object(gate, "verify_script", lambda *a, **k: None):
-            self.assertEqual(gate.audit("o/r", 1, False), 2)
+            self.assertEqual(gate.audit("o/r", 1, False, policy_ref="refs/tags/trusted"), 2)
 
     def test_future_or_invalid_audit_since_fails(self):
         for bad_since in ("2099-01-01T00:00:00Z", "not-a-timestamp"):
@@ -608,6 +610,7 @@ class AuditTests(unittest.TestCase):
                 captured = io.StringIO()
                 with mock.patch.object(gate, "request", fake_request), \
                      mock.patch.object(gate, "paginate", lambda path, params=None: []), \
+                     mock.patch.object(gate, "branch_activities", return_value=[]), \
                      mock.patch.object(gate, "load_policy", lambda *a, **k: policy), \
                      mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
                      contextlib.redirect_stdout(captured):
@@ -652,7 +655,9 @@ class AuditTests(unittest.TestCase):
 
         orig_scan = gate.scan_direct_pushes
 
-        def wrap_scan(repo, default, merge_shas, acknowledged, strict, direct_limit, baseline_sha=""):
+        def wrap_scan(
+            repo, default, merge_shas, acknowledged, strict, direct_limit, baseline_sha="", listing=None
+        ):
             seen_limit["baseline_sha"] = baseline_sha
             seen_limit["acknowledged"] = acknowledged
             seen_limit["strict"] = strict
@@ -665,11 +670,13 @@ class AuditTests(unittest.TestCase):
                 strict,
                 direct_limit,
                 baseline_sha=baseline_sha,
+                listing=listing,
             )
 
         captured = io.StringIO()
         with mock.patch.object(gate, "request", fake_request), \
              mock.patch.object(gate, "paginate", lambda path, params=None: [self.verdict()]), \
+             mock.patch.object(gate, "branch_activities", return_value=[]), \
              mock.patch.object(gate, "load_policy", lambda *a, **k: untrusted_policy), \
              mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
              mock.patch.object(gate, "scan_direct_pushes", wrap_scan), \
@@ -678,6 +685,106 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(seen_limit, {"baseline_sha": "", "acknowledged": {}, "strict": True, "direct_limit": 40})
         self.assertIn(f"violation: {direct[:7]} on main is not associated", captured.getvalue())
+
+    def test_policy_driven_strict_audit_ignores_untrusted_branch_exemptions(self):
+        direct = "d" * 40
+        force_event = {
+            "id": 9001,
+            "activity_type": "force_push",
+            "ref": "refs/heads/main",
+            "before": "e" * 40,
+            "after": direct,
+            "timestamp": "2025-11-15T00:00:00Z",
+        }
+        pull = {
+            "number": 7,
+            "merged_at": "2025-12-01T00:00:00Z",
+            "head": {"sha": self.HEAD},
+            "merge_commit_sha": self.MERGE,
+        }
+        commit = {
+            "sha": direct,
+            "parents": [],
+            "commit": {"message": "direct change", "committer": {"date": "2025-12-02T00:00:00Z"}},
+        }
+
+        def fake_request(method, path, body=None, params=None, allow=()):
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == "/repos/o/r/pulls":
+                return [pull] if params and params.get("page") == 1 else []
+            if path == "/repos/o/r/commits":
+                return [commit]
+            if path.startswith("/repos/o/r/commits/") and path.endswith("/pulls"):
+                return []
+            return []
+
+        for extra_policy in ({}, {"audit_strict_direct": True}):
+            with self.subTest(extra_policy=extra_policy):
+                untrusted_policy = {
+                    "owner_login": "synthetic-owner",
+                    "audit_since": "2026-01-01T00:00:00Z",
+                    "audit_baseline_sha": direct,
+                    "audit_ignore_prs": [7],
+                    "audit_acknowledged_direct": {
+                        direct: "self-excused",
+                        "9001": "self-excused-force",
+                    },
+                    "audit_direct_commits": 1,
+                    **extra_policy,
+                }
+                seen_limit = {}
+                orig_scan = gate.scan_direct_pushes
+
+                def wrap_scan(
+                    repo, default, merge_shas, acknowledged, strict, direct_limit, baseline_sha="", listing=None
+                ):
+                    seen_limit["baseline_sha"] = baseline_sha
+                    seen_limit["acknowledged"] = acknowledged
+                    seen_limit["strict"] = strict
+                    seen_limit["direct_limit"] = direct_limit
+                    return orig_scan(
+                        repo,
+                        default,
+                        merge_shas,
+                        acknowledged,
+                        strict,
+                        direct_limit,
+                        baseline_sha=baseline_sha,
+                        listing=listing,
+                    )
+
+                captured = io.StringIO()
+                with mock.patch.object(gate, "request", fake_request), \
+                     mock.patch.object(gate, "paginate", lambda path, params=None: []), \
+                     mock.patch.object(gate, "branch_activities", return_value=[force_event]), \
+                     mock.patch.object(gate, "load_policy", lambda *a, **k: untrusted_policy), \
+                     mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+                     mock.patch.object(gate, "scan_direct_pushes", wrap_scan), \
+                     contextlib.redirect_stdout(captured):
+                    code = gate.audit("o/r", 20, False)
+                out = captured.getvalue()
+                self.assertEqual(code, 2)
+                self.assertEqual(seen_limit, {"baseline_sha": "", "acknowledged": {}, "strict": True, "direct_limit": 40})
+                self.assertIn("#7 merged at aaaaaaa without an authenticated passing verdict", out)
+                self.assertIn(f"violation: {direct[:7]} on main is not associated", out)
+                self.assertIn("force push on main (activity 9001", out)
+
+        trusted_policy = {
+            "owner_login": "synthetic-owner",
+            "audit_since": "2026-01-01T00:00:00Z",
+            "audit_baseline_sha": direct,
+            "audit_ignore_prs": [7],
+            "audit_acknowledged_direct": {direct: "approved", "9001": "approved-reset"},
+            "audit_strict_direct": True,
+        }
+        with mock.patch.object(gate, "request", fake_request), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: []), \
+             mock.patch.object(gate, "branch_activities", return_value=[force_event]), \
+             mock.patch.object(gate, "load_policy", lambda *a, **k: trusted_policy), \
+             mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gate.audit("o/r", 20, False, policy_ref="refs/tags/trusted"), 0)
 
     def test_audit_honors_explicit_policy_ref_and_policy_file(self):
         direct = "d" * 40
@@ -714,6 +821,7 @@ class AuditTests(unittest.TestCase):
 
         with mock.patch.object(gate, "request", fake_request), \
              mock.patch.object(gate, "paginate", lambda path, params=None: []), \
+             mock.patch.object(gate, "branch_activities", return_value=[]), \
              mock.patch.object(gate, "load_policy", fake_load_policy), \
              mock.patch.object(gate, "verify_script", fake_verify_script):
             code = gate.audit("o/r", 20, True, policy_ref="refs/tags/trusted-policy")
@@ -726,6 +834,7 @@ class AuditTests(unittest.TestCase):
             policy_path.write_text(json.dumps(trusted_policy), encoding="utf-8")
             with mock.patch.object(gate, "request", fake_request), \
                  mock.patch.object(gate, "paginate", lambda path, params=None: []), \
+                 mock.patch.object(gate, "branch_activities", return_value=[]), \
                  mock.patch.object(gate, "verify_script", fake_verify_script):
                 code = gate.audit("o/r", 20, True, policy_file=str(policy_path))
         self.assertEqual(code, 0)
@@ -758,7 +867,18 @@ class DirectPushAuditTests(unittest.TestCase):
         return {"user": {"login": "synthetic-owner"},
                 "body": "<!-- governance-verdict:v1 " + json.dumps(verdict) + " -->"}
 
-    def run_audit(self, chain, policy=None, strict_direct=False, details=None, attributed=(), related_pulls=None, pull_base="main"):
+    def run_audit(
+        self,
+        chain,
+        policy=None,
+        strict_direct=False,
+        details=None,
+        attributed=(),
+        related_pulls=None,
+        pull_base="main",
+        policy_ref=None,
+        activities=(),
+    ):
         base = {"owner_login": "synthetic-owner", "audit_since": "", "audit_ignore_prs": []}
         base.update(policy or {})
         pull = {
@@ -771,6 +891,23 @@ class DirectPushAuditTests(unittest.TestCase):
         details = details or {}
         attributed = set(attributed)
         related_pulls = related_pulls or {}
+        parents_of = {
+            commit["sha"]: [parent.get("sha") for parent in (commit.get("parents") or [])]
+            for commit in list(chain) + list(details.values())
+        }
+
+        def ancestors_of(start):
+            seen = set()
+            stack = [start] if start in parents_of else []
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                for parent in parents_of.get(node, []):
+                    if parent in parents_of:
+                        stack.append(parent)
+            return seen
 
         def fake_request(method, path, body=None, params=None, allow=()):
             if path == "/repos/o/r":
@@ -779,6 +916,21 @@ class DirectPushAuditTests(unittest.TestCase):
                 return [pull] if params and params.get("page") == 1 else []
             if path == "/repos/o/r/commits":
                 return chain
+            if path.startswith("/repos/o/r/compare/") and "..." in path:
+                left, right = path.rsplit("/", 1)[-1].split("...", 1)
+                if left not in parents_of or right not in parents_of:
+                    return None
+                right_ancestors = ancestors_of(right)
+                if left in right_ancestors:
+                    return {
+                        "status": "identical" if left == right else "ahead",
+                        "merge_base_commit": {"sha": left},
+                    }
+                left_ancestors = ancestors_of(left)
+                return {
+                    "status": "behind" if right in left_ancestors else "diverged",
+                    "merge_base_commit": {"sha": right if right in left_ancestors else ""},
+                }
             if path.startswith("/repos/o/r/commits/") and path.endswith("/pulls"):
                 sha = path.rsplit("/", 2)[-2]
                 if sha in related_pulls:
@@ -796,11 +948,12 @@ class DirectPushAuditTests(unittest.TestCase):
 
         with mock.patch.object(gate, "request", fake_request), \
              mock.patch.object(gate, "paginate", lambda path, params=None: [self.verdict_comment()]), \
+             mock.patch.object(gate, "branch_activities", return_value=list(activities)), \
              mock.patch.object(gate, "load_policy", lambda *a, **k: base), \
              mock.patch.object(gate, "verify_script", lambda *a, **k: None):
             captured = io.StringIO()
             with contextlib.redirect_stdout(captured):
-                code = gate.audit("o/r", 20, strict_direct)
+                code = gate.audit("o/r", 20, strict_direct, policy_ref=policy_ref)
         return code, captured.getvalue()
 
     def test_chain_direct_push_is_a_violation_by_default(self):
@@ -852,7 +1005,7 @@ class DirectPushAuditTests(unittest.TestCase):
         chain = [self.commit(self.TIP, (self.DIRECT,), "feat: via pull request"),
                  self.commit(self.DIRECT, (), "governance: suspend required CI")]
         policy = {"audit_acknowledged_direct": {self.DIRECT: "owner decision 2026-11-05"}}
-        code, output = self.run_audit(chain, policy)
+        code, output = self.run_audit(chain, policy, policy_ref="refs/tags/trusted")
         self.assertEqual(code, 0)
         self.assertIn(f"note: acknowledged direct push {self.DIRECT[:7]}: owner decision", output)
 
@@ -868,7 +1021,12 @@ class DirectPushAuditTests(unittest.TestCase):
                              date="2026-01-01T00:00:00Z"),
                  self.commit(self.DIRECT, (), "governance: loosen a check",
                              date="2026-01-01T00:00:00Z")]
-        code, output = self.run_audit(chain, {"audit_since": "2026-01-06T00:00:00Z"}, attributed={self.TIP})
+        code, output = self.run_audit(
+            chain,
+            {"audit_since": "2026-01-06T00:00:00Z"},
+            attributed={self.TIP},
+            policy_ref="refs/tags/trusted",
+        )
         self.assertEqual(code, 2)
         self.assertIn(f"violation: {self.DIRECT[:7]} on main is not associated", output)
 
@@ -877,7 +1035,12 @@ class DirectPushAuditTests(unittest.TestCase):
                              date="2026-01-01T00:00:00Z"),
                  self.commit(self.DIRECT, (), "governance: loosen a check",
                              date="2026-01-05T00:00:00Z")]
-        code, output = self.run_audit(chain, {"audit_since": "2026-01-02T00:00:00Z"}, attributed={self.TIP})
+        code, output = self.run_audit(
+            chain,
+            {"audit_since": "2026-01-02T00:00:00Z"},
+            attributed={self.TIP},
+            policy_ref="refs/tags/trusted",
+        )
         self.assertEqual(code, 2)
         self.assertIn(f"violation: {self.DIRECT[:7]} on main is not associated", output)
 
@@ -890,6 +1053,7 @@ class DirectPushAuditTests(unittest.TestCase):
             chain,
             {"audit_since": "2026-01-06T00:00:00Z", "audit_baseline_sha": baseline},
             attributed={self.TIP},
+            policy_ref="refs/tags/trusted",
         )
         self.assertEqual(code, 0)
 
@@ -902,9 +1066,140 @@ class DirectPushAuditTests(unittest.TestCase):
             bypass_chain,
             {"audit_since": "2026-01-06T00:00:00Z", "audit_baseline_sha": baseline},
             attributed={self.TIP},
+            policy_ref="refs/tags/trusted",
         )
         self.assertEqual(code, 2)
         self.assertIn(f"violation: {self.DIRECT[:7]} on main is not associated", output)
+
+    def test_audit_detects_force_push_rollback_via_ancestry_and_activity(self):
+        m1 = "1" * 40
+        m2 = "2" * 40
+        pr1 = {
+            "number": 1,
+            "merged_at": "2026-01-05T00:00:00Z",
+            "base": {"ref": "main"},
+            "head": {"sha": "a" * 40},
+            "merge_commit_sha": m1,
+        }
+        pr2 = {
+            "number": 2,
+            "merged_at": "2026-01-06T00:00:00Z",
+            "base": {"ref": "main"},
+            "head": {"sha": "b" * 40},
+            "merge_commit_sha": m2,
+        }
+
+        def make_verdict(number, head_sha, merge_sha):
+            payload = {
+                "repo": "o/r",
+                "pr": number,
+                "head_sha": head_sha,
+                "merge_sha": merge_sha,
+                "verdict": "pass",
+                "merged": True,
+            }
+            return {"user": {"login": "synthetic-owner"}, "body": "<!-- governance-verdict:v1 " + json.dumps(payload) + " -->"}
+
+        # 1. Main rolled back from PR #2 (m2) to older gate-approved PR #1 (m1), even with empty /activity.
+        def rollback_request(method, path, body=None, params=None, allow=()):
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == "/repos/o/r/pulls":
+                return [pr2, pr1] if params and params.get("page") == 1 else []
+            if path == "/repos/o/r/commits":
+                return [self.commit(m1, (), "feat: pr 1")]
+            if path == f"/repos/o/r/compare/{m2}...{m1}":
+                return {"status": "behind", "merge_base_commit": {"sha": m1}}
+            return []
+
+        def rollback_paginate(path, params=None):
+            if path == "/repos/o/r/issues/1/comments":
+                return [make_verdict(1, pr1["head"]["sha"], m1)]
+            if path == "/repos/o/r/issues/2/comments":
+                return [make_verdict(2, pr2["head"]["sha"], m2)]
+            return []
+
+        def empty_or_404_raw(method, path, body=None, params=None, allow=()):
+            self.assertEqual(path, "/repos/o/r/activity")
+            return (None, {})
+
+        for raw_mode in (lambda *a, **k: ([], {}), empty_or_404_raw):
+            captured = io.StringIO()
+            with mock.patch.object(gate, "request", rollback_request), \
+                 mock.patch.object(gate, "paginate", rollback_paginate), \
+                 mock.patch.object(gate, "_raw_request", raw_mode), \
+                 mock.patch.object(gate, "load_policy", lambda *a, **k: {"owner_login": "synthetic-owner"}), \
+                 mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+                 contextlib.redirect_stdout(captured):
+                code = gate.audit("o/r", 20, True, policy_ref="refs/tags/trusted")
+            self.assertEqual(code, 2)
+            self.assertIn(f"#2 merge commit {m2[:7]} is no longer an ancestor of main", captured.getvalue())
+
+        # 2. Cursor-paginated /activity force_push is caught even when all listed PRs match current main tip.
+        def single_pr_request(method, path, body=None, params=None, allow=()):
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == "/repos/o/r/pulls":
+                return [pr1] if params and params.get("page") == 1 else []
+            if path == "/repos/o/r/commits":
+                return [self.commit(m1, (), "feat: pr 1")]
+            if path == f"/repos/o/r/commits/{m1}/pulls":
+                return [pr1]
+            return []
+
+        def paged_activity_raw(method, path, body=None, params=None, allow=()):
+            self.assertEqual(path, "/repos/o/r/activity")
+            if "after" not in (params or {}):
+                return (
+                    [{"id": 5001, "activity_type": "pr_merge", "ref": "refs/heads/main", "before": "0" * 40, "after": m2, "timestamp": "2026-01-06T00:00:00Z"}],
+                    {"link": '<https://api.github.com/repos/o/r/activity?ref=refs%2Fheads%2Fmain&per_page=100&after=cur2>; rel="next"'},
+                )
+            self.assertEqual(params["after"], "cur2")
+            return (
+                [{"id": 5002, "activity_type": "force_push", "ref": "refs/heads/main", "before": m2, "after": m1, "timestamp": "2026-01-07T00:00:00Z"}],
+                {},
+            )
+
+        captured = io.StringIO()
+        with mock.patch.object(gate, "request", single_pr_request), \
+             mock.patch.object(gate, "paginate", rollback_paginate), \
+             mock.patch.object(gate, "_raw_request", paged_activity_raw), \
+             mock.patch.object(gate, "load_policy", lambda *a, **k: {"owner_login": "synthetic-owner"}), \
+             mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+             contextlib.redirect_stdout(captured):
+            code = gate.audit("o/r", 20, True, policy_ref="refs/tags/trusted")
+        self.assertEqual(code, 2)
+        self.assertIn(f"force push on main (activity 5002: {m2[:7]}..{m1[:7]})", captured.getvalue())
+
+        # Trusted policy acknowledgment by activity ID or audit_since after the event clears it.
+        for trusted_override in (
+            {"audit_acknowledged_direct": {"5002": "approved rollback"}},
+            {"audit_since": "2026-01-08T00:00:00Z"},
+        ):
+            with self.subTest(trusted_override=trusted_override):
+                policy = {"owner_login": "synthetic-owner", **trusted_override}
+                with mock.patch.object(gate, "request", single_pr_request), \
+                     mock.patch.object(gate, "paginate", rollback_paginate), \
+                     mock.patch.object(gate, "_raw_request", paged_activity_raw), \
+                     mock.patch.object(gate, "load_policy", lambda *a, **k: policy), \
+                     mock.patch.object(gate, "verify_script", lambda *a, **k: None), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(gate.audit("o/r", 20, True, policy_ref="refs/tags/trusted"), 0)
+
+        # 3. Baseline SHA rewound past baseline is detected via ancestry check.
+        baseline = "b" * 40
+        older = "c" * 40
+        baseline_chain = [self.commit(older, (), "old ancestor before baseline")]
+        details = {baseline: self.commit(baseline, (older,), "baseline commit")}
+        code, output = self.run_audit(
+            baseline_chain,
+            {"audit_baseline_sha": baseline},
+            details=details,
+            attributed={older},
+            policy_ref="refs/tags/trusted",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn(f"baseline {baseline[:7]} is no longer an ancestor of main", output)
 
     def test_invalid_audit_baseline_sha_fails(self):
         chain = [self.commit(self.TIP, (), "feat: via pull request")]
@@ -2756,11 +3051,12 @@ class MergeSignerTests(unittest.TestCase):
                     if path == "/repos/o/r/pulls":
                         return [merged_pull] if params and params.get("page") == 1 else []
                     if path == "/repos/o/r/commits":
-                        return []
+                        return [{"sha": self.MERGE, "parents": []}]
                     return []
 
                 with mock.patch.object(gate, "request", side_effect=audit_request), \
                      mock.patch.object(gate, "paginate", lambda path, params=None: audit_comments if path.endswith("/comments") else []), \
+                     mock.patch.object(gate, "branch_activities", return_value=[]), \
                      mock.patch.object(gate, "load_policy", return_value=policy), \
                      mock.patch.object(gate, "verify_script", return_value=None):
                     self.assertEqual(gate.audit("o/r", 20, False), 0)
