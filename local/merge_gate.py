@@ -2244,9 +2244,25 @@ def scan_direct_pushes(
     resolved_methods: dict[int, str] = dict(pull_methods or {})
     findings: list[str] = []
     rebased_commits: set[str] = set()
-    current, visited = (listing[0]["sha"] if listing else ""), 0
+    seen_shas: set[str] = set()
+    current, visited, steps = (listing[0]["sha"] if listing else ""), 0, 0
+    max_steps = max(limit * 20, 2000)
     while current and visited < limit:
+        if current in seen_shas:
+            findings.append(
+                f"{current[:7]} on {default} forms a commit parent cycle; "
+                "the direct-push audit is incomplete"
+            )
+            break
+        seen_shas.add(current)
         if baseline_sha and current.lower() == baseline_sha:
+            break
+        steps += 1
+        if steps > max_steps:
+            findings.append(
+                f"{current[:7]} on {default} exceeded direct-push traversal limit ({max_steps}); "
+                "the direct-push audit is incomplete"
+            )
             break
         commit = _resolve_commit(repo, current, indexed)
         if commit is None:
@@ -2255,10 +2271,10 @@ def scan_direct_pushes(
             break
         parents = [parent.get("sha") for parent in (commit.get("parents") or [])]
         next_sha = parents[0] if parents else ""
-        visited += 1
         if current in rebased_commits:
             current = next_sha
             continue
+        visited += 1
         pull = pulls_by_merge_sha.get(current) if pulls_by_merge_sha else None
         if current in merge_shas:
             if len(parents) == 1 and pull is not None:

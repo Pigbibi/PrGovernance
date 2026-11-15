@@ -1439,6 +1439,67 @@ class DirectPushAuditTests(unittest.TestCase):
         )
         self.assertEqual(code_pre, 0, output_pre)
 
+    def test_long_rebase_chain_does_not_exhaust_direct_push_budget(self):
+        unreviewed_parent = "d" * 40
+        rebased_shas = [f"1{i:039x}" for i in range(40)]
+        pr_shas = [f"2{i:039x}" for i in range(40)]
+
+        chain = []
+        pr_commits = []
+        for idx in range(40):
+            r_parent = unreviewed_parent if idx == 0 else rebased_shas[idx - 1]
+            p_parent = unreviewed_parent if idx == 0 else pr_shas[idx - 1]
+            msg = f"feat: step {idx}"
+            date = f"2026-01-05T01:{idx:02d}:00Z"
+            chain.append(self._rich_commit(rebased_shas[idx], (r_parent,), msg, date=date))
+            pr_commits.append(self._rich_commit(pr_shas[idx], (p_parent,), msg, date=date))
+        chain.reverse()
+        chain.append(self._rich_commit(unreviewed_parent, (), "chore: unreviewed direct push", date="2026-01-05T00:00:00Z"))
+
+        tip_sha = rebased_shas[-1]
+        pull_7 = {
+            "number": 7,
+            "merged_at": self.DATE,
+            "base": {"ref": "main", "sha": unreviewed_parent},
+            "head": {"sha": pr_shas[-1]},
+            "merge_commit_sha": tip_sha,
+            "commits": 40,
+        }
+        verdict = {
+            "user": {"login": "synthetic-owner"},
+            "body": "<!-- governance-verdict:v1 "
+            + json.dumps({
+                "repo": "o/r",
+                "pr": 7,
+                "head_sha": pr_shas[-1],
+                "merge_sha": tip_sha,
+                "merge_method": "rebase",
+                "verdict": "pass",
+                "merged": True,
+            })
+            + " -->",
+        }
+
+        def fake_request(method, path, body=None, params=None, allow=()):
+            if path == f"/repos/o/r/commits/{tip_sha}/pulls":
+                return [pull_7]
+            if path == "/repos/o/r/pulls/7/commits":
+                return pr_commits if params and params.get("page") == 1 else []
+            if path.startswith("/repos/o/r/commits/") and path.endswith("/pulls"):
+                return []
+            if path.startswith("/repos/o/r/compare/"):
+                return {"status": "behind", "merge_base_commit": {"sha": unreviewed_parent}}
+            return []
+
+        with mock.patch.object(gate, "request", fake_request), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: [verdict] if path.endswith("/comments") else []):
+            findings = gate.scan_direct_pushes(
+                "o/r", "main", set(), {}, True, 40, listing=chain, signers={"synthetic-owner"}
+            )
+        self.assertEqual(len(findings), 1)
+        self.assertIn(unreviewed_parent[:7], findings[0])
+        self.assertIn("not associated with a merged pull request", findings[0])
+
 
 class MergeSignerTests(unittest.TestCase):
     HEAD = "a" * 40
