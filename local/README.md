@@ -189,8 +189,11 @@ trusted copy.
 - If `governance/policy.json` is not on the repository default branch yet,
   `merge_gate.py --pr <number>` refuses instead of falling back to the pull
   request head. Pass an out-of-band trusted `--policy-file <path>` (outside the
-  pull request worktree) for first-time bootstrap, or merge after committing the
-  policy to the default branch.
+  pull request worktree) only for initial bootstrap when
+  `governance/policy.json` returns `404` on the default branch (once
+  `governance/policy.json` exists on the default branch, `--pr` / `--merge`
+  refuse `--policy-file`); or merge after committing the policy to the default
+  branch.
 - On T2 pull requests, `owner-approved` requires `owner_login`. Optional
   `"agent_logins"` in the base `governance/policy.json` allowlists trusted
   non-owner agent GitHub logins allowed to apply `agent-approved`; when

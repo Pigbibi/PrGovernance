@@ -82,10 +82,6 @@ KEYWORD_PATHS = (
     re.compile(r"^scripts/[^/]*(?:check|verify|validate|hygiene|lint)[^/]*\.(?:py|sh|js|cjs|mjs|ts)$"),
 )
 
-TEST_PATHS = (
-    re.compile(r"^(tests?|examples?|fixtures?)/"),
-    re.compile(r"/(tests?|examples?|fixtures?)/"),
-)
 PLAIN_DOC = (
     re.compile(r"^(docs?)/"),
     re.compile(r"/(docs?)/"),
@@ -226,13 +222,27 @@ def _load_policy_file(policy_file: str) -> dict[str, Any]:
     return policy
 
 
-def load_policy(repo: str, ref: str) -> dict[str, Any]:
-    data = request(
+def _probe_policy(repo: str, ref: str) -> Any:
+    return request(
         "GET",
         f"/repos/{repo}/contents/governance/policy.json",
         params={"ref": ref},
         allow=(404,),
     )
+
+
+def _load_bootstrap_policy_file(repo: str, policy_ref: str, policy_file: str) -> dict[str, Any]:
+    """Load a local policy file only while the default branch has no policy."""
+    if _probe_policy(repo, policy_ref) is not None:
+        raise Refusal(
+            f"governance/policy.json already exists on {policy_ref}; "
+            "--policy-file applies only to initial bootstrap"
+        )
+    return _load_policy_file(policy_file)
+
+
+def load_policy(repo: str, ref: str) -> dict[str, Any]:
+    data = _probe_policy(repo, ref)
     if not data:
         raise Refusal(
             f"No governance/policy.json on {ref}; pass a trusted --policy-file to bootstrap"
@@ -311,27 +321,7 @@ def is_protected(path: str, extra: tuple[str, ...]) -> bool:
 
 def is_t0(file: dict[str, Any]) -> bool:
     names = [name for name in (file.get("filename"), file.get("previous_filename")) if name]
-    if not names:
-        return False
-    if all(any(pattern.search(name) for pattern in PLAIN_DOC) for name in names):
-        return True
-    if not all(any(pattern.search(name) for pattern in TEST_PATHS) for name in names):
-        return False
-    # Only new files are demonstrably isolated: an added SkipTest, decorator or
-    # module-level flag can disable an existing suite without removing a line.
-    # Collection hooks, package markers and helpers that shadow imports change
-    # how existing tests run, so only a new test module itself is exempt.
-    if file.get("status") != "added":
-        return False
-    name = file.get("filename") or ""
-    if re.search(
-        r"(^|/)(conftest\.py|__init__\.py|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml)$",
-        name,
-    ):
-        return False
-    if name.endswith(".py"):
-        return bool(re.search(r"(^|/)test_[^/]*\.py$|(^|/)[^/]*_test\.py$", name))
-    return True
+    return bool(names) and all(any(pattern.search(name) for pattern in PLAIN_DOC) for name in names)
 
 
 def same_action(lines: list[tuple[str, str]]) -> bool:
@@ -1083,7 +1073,7 @@ def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[di
     base_ref = pull["base"]["ref"]
     policy_ref = request("GET", f"/repos/{repo}")["default_branch"]
     if policy_file:
-        policy = _load_policy_file(policy_file)
+        policy = _load_bootstrap_policy_file(repo, policy_ref, policy_file)
         bootstrap = True
         print(
             f"warning: using trusted --policy-file ({policy_file}) instead of {policy_ref} (bootstrap)",
@@ -1227,7 +1217,12 @@ def revalidate(repo: str, verdict: dict[str, Any], policy_file: str | None = Non
     if hashlib.sha256((pull.get("body") or "").encode()).hexdigest() != verdict.get("body_sha256"):
         raise Refusal("Pull request body changed since the verdict; re-run the gate")
     policy_ref = verdict.get("policy_ref") or verdict["base_ref"]
-    policy = _load_policy_file(policy_file) if policy_file else load_policy(repo, policy_ref)
+    if policy_file:
+        policy = _load_bootstrap_policy_file(repo, policy_ref, policy_file)
+        if not verdict.get("bootstrap"):
+            raise Refusal("--policy-file applies only to initial bootstrap verdicts; re-run the gate")
+    else:
+        policy = load_policy(repo, policy_ref)
     if policy.get("_sha256") != verdict.get("policy_sha256"):
         raise Refusal("Policy changed since the verdict; re-run the gate")
     verify_script(repo, policy_ref)
@@ -1493,7 +1488,11 @@ def audit(
                     passed = True
         if not passed:
             violations.append(f"#{number} merged at {head[:7]} without an authenticated passing verdict")
-    merge_shas = {pull.get("merge_commit_sha") for pull in eligible[:limit] if pull.get("merge_commit_sha")}
+    merge_shas = {
+        pull.get("merge_commit_sha")
+        for pull in eligible[:limit]
+        if pull.get("merge_commit_sha") and (pull.get("base") or {}).get("ref") == default
+    }
     strict = bool(strict_direct or policy.get("audit_strict_direct", True))
     violations.extend(scan_direct_pushes(repo, default, since, merge_shas, acknowledged,
                                         strict, direct_limit))
@@ -1529,7 +1528,7 @@ def main() -> int:
     parser.add_argument("--policy-ref", help="trusted git ref for audit policy and script verification")
     parser.add_argument(
         "--policy-file",
-        help="trusted local policy JSON file (outside the PR worktree) for --audit or --pr bootstrap",
+        help="trusted local policy JSON file (outside the PR worktree) for --audit or initial --pr bootstrap (when default branch returns 404)",
     )
     args = parser.parse_args()
     if not args.repo:

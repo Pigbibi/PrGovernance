@@ -49,9 +49,11 @@ class TierTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(gate.classify([changed(name)], False, set(), ()), ("T2", False))
 
-    def test_added_tests_are_t0(self):
-        files = [changed("tests/test_reader.py", status="added")]
-        self.assertEqual(gate.classify(files, False, set(), ()), ("T0", False))
+    def test_added_tests_are_t1(self):
+        for name in ("tests/test_reader.py", "tests/reader_test.py", "examples/demo.py"):
+            with self.subTest(name=name):
+                files = [changed(name, status="added")]
+                self.assertEqual(gate.classify(files, False, set(), ()), ("T1", False))
 
     def test_modified_tests_are_t1(self):
         patch = "@@ -1,2 +1,3 @@\n one\n two\n+three\n"
@@ -733,12 +735,13 @@ class DirectPushAuditTests(unittest.TestCase):
         return {"user": {"login": "synthetic-owner"},
                 "body": "<!-- governance-verdict:v1 " + json.dumps(verdict) + " -->"}
 
-    def run_audit(self, chain, policy=None, strict_direct=False, details=None, attributed=(), related_pulls=None):
+    def run_audit(self, chain, policy=None, strict_direct=False, details=None, attributed=(), related_pulls=None, pull_base="main"):
         base = {"owner_login": "synthetic-owner", "audit_since": "", "audit_ignore_prs": []}
         base.update(policy or {})
         pull = {
             "number": 7,
             "merged_at": self.DATE,
+            "base": {"ref": pull_base},
             "head": {"sha": "h" * 40},
             "merge_commit_sha": self.TIP,
         }
@@ -793,6 +796,14 @@ class DirectPushAuditTests(unittest.TestCase):
         code, output = self.run_audit(chain, related_pulls=related)
         self.assertEqual(code, 2)
         self.assertIn(f"violation: {self.PREV[:7]} on main is not associated", output)
+
+    def test_fast_forwarded_merge_sha_from_non_default_branch_is_not_exempted(self):
+        chain = [self.commit(self.TIP, (self.PREV,), "feat: release pr fast-forwarded to main"),
+                 self.commit(self.PREV, (), "docs: earlier merged pull request")]
+        related = {self.TIP: [{"merged_at": self.DATE, "base": {"ref": "release"}}]}
+        code, output = self.run_audit(chain, attributed={self.PREV}, related_pulls=related, pull_base="release")
+        self.assertEqual(code, 2)
+        self.assertIn(f"violation: {self.TIP[:7]} on main is not associated", output)
 
     def test_commits_outside_the_first_parent_chain_are_not_audited(self):
         chain = [self.commit(self.TIP, (self.DIRECT,), "feat: via pull request"),
@@ -1999,6 +2010,7 @@ class EvaluatePolicyTests(unittest.TestCase):
             "tree": [{"path": "governance/policy.json", "mode": "100644", "type": "blob"}],
         }
         policy_refs_seen = []
+        default_policy_payload = None
 
         def fake_request(method, path, params=None, **kwargs):
             if path == "/repos/o/r/pulls/7":
@@ -2010,7 +2022,7 @@ class EvaluatePolicyTests(unittest.TestCase):
                 policy_refs_seen.append(ref)
                 if ref == self.HEAD:
                     raise AssertionError("Must never load bootstrap policy from PR head")
-                return None
+                return default_policy_payload
             if path == "/repos/o/r/contents/governance/merge_gate.py":
                 return None
             if path == "/repos/o/r/contents/.github/scripts/dependabot-policy.json":
@@ -2049,6 +2061,8 @@ class EvaluatePolicyTests(unittest.TestCase):
                 gate.revalidate("o/r", verdict, policy_file=str(policy_path))
                 with self.assertRaises(gate.Refusal):
                     gate.revalidate("o/r", verdict)
+                with self.assertRaises(gate.Refusal):
+                    gate.revalidate("o/r", {**verdict, "bootstrap": False}, policy_file=str(policy_path))
 
                 out = io.StringIO()
                 with mock.patch.object(gate.sys, "argv", [
@@ -2057,6 +2071,16 @@ class EvaluatePolicyTests(unittest.TestCase):
                     code = gate.main()
                 self.assertEqual(code, 0)
                 self.assertTrue(json.loads(out.getvalue())["bootstrap"])
+
+                # Once default_branch has governance/policy.json (or non-404 response), refuse --policy-file.
+                for payload in ({"type": "file", "content": ""}, [], {}):
+                    default_policy_payload = payload
+                    with self.assertRaises(gate.Refusal) as eval_refused:
+                        gate.evaluate("o/r", 7, policy_file=str(policy_path))
+                    self.assertIn("already exists", str(eval_refused.exception))
+                    with self.assertRaises(gate.Refusal) as rev_refused:
+                        gate.revalidate("o/r", verdict, policy_file=str(policy_path))
+                    self.assertIn("already exists", str(rev_refused.exception))
 
         with mock.patch.object(gate.sys, "argv", [
             "merge_gate.py", "--repo", "o/r", "--pr", "7", "--policy-ref", "refs/tags/trusted"
