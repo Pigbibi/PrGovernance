@@ -50,7 +50,7 @@ python3 PrGovernance/local/governance.py install --root <repository> \
 ```
 
 To also install or update the canonical private-repository merge entry and
-hygiene checker (`merge_gate.py`, `test_merge_gate.py`, and `check_hygiene.py`)
+hygiene checker (`merge_gate.py`, `test_merge_gate*.py`, and `check_hygiene.py`)
 into `.git/governance/` (outside the repository worktree), pass `--include-merge-gate`:
 
 ```sh
@@ -65,7 +65,7 @@ is missing or if a destination inside `.git/governance/` is a symlink or
 non-regular file.
 
 When a repository tracks vendored copies (`governance/merge_gate.py`,
-`governance/tests/test_merge_gate.py`, and `scripts/check_hygiene.py`), update
+`governance/tests/test_merge_gate*.py`, and `scripts/check_hygiene.py`), update
 them explicitly from a clean default-branch checkout with `vendor`:
 
 ```sh
@@ -135,7 +135,7 @@ hooks, and before trusting a clone that was installed by someone else; a
 non-empty result means `install` must run again from a trusted copy.
 
 `check-drift` compares the SHA-256 digest of `.githooks/governance.py`,
-`governance/merge_gate.py`, `governance/tests/test_merge_gate.py`, and
+`governance/merge_gate.py`, `governance/tests/test_merge_gate*.py`, and
 `scripts/check_hygiene.py` in `--root` against the canonical files in
 `--source` (defaulting to the directory containing `governance.py`). If any
 file is missing, symlinked, or differs, it prints the SHA-256 mismatch and a
@@ -180,7 +180,9 @@ trusted copy.
   only after it passes. By default (`"codex_required": true`), `merge_gate.py`
   strictly requires a Codex receipt (`codex-review-receipt:v1`,
   `codex-review-state:v1`, or `ai-review-receipt:v1` authored by
-  `chatgpt-codex-connector[bot]`). Setting `"codex_required": false` with
+  `chatgpt-codex-connector[bot]`). All three receipt formats require explicit
+  `status == "completed"` (native bare `<!-- codex-review-receipt:v1 -->` prose
+  markers without JSON payload are skipped). Setting `"codex_required": false` with
   `"ai_review_providers": ["codex", "claude", "cursor"]` in
   `governance/policy.json` opts into single-AI-receipt review across the listed
   providers (`chatgpt-codex-connector[bot]`, `claude[bot]`, or `cursor[bot]`)
@@ -214,6 +216,9 @@ trusted copy.
   `audit_ignore_prs`, `audit_acknowledged_direct`) and clamps
   `audit_direct_commits` to at least 40. Direct-push scanning ignores commit
   timestamps (`committer.date`), checks the bounded first-parent window
-  (stopping early only at a trusted `audit_baseline_sha`), and checks default
-  branch `force_push` activity plus merged-PR/baseline ancestry to detect
-  rollbacks (failing closed in strict mode when branch activity is unavailable).
+  (stopping early only at a trusted `audit_baseline_sha` and recognizing verified
+  intermediate commits from rebase-merged pull requests), and checks
+  default-branch `force_push` activity (requiring both `before` and `after` to
+  strictly precede `audit_baseline_sha` for pre-baseline exemptions) plus
+  merged-PR/baseline ancestry to detect rollbacks (failing closed in strict mode
+  when branch activity is unavailable).

@@ -575,6 +575,8 @@ def _extract_receipt_markers(body: str) -> list[tuple[int, str | None]]:
         start = match.end()
         end = body.find("-->", start)
         payload = None if end < 0 else body[start:end].strip()
+        if marker_index == 1 and payload == "":
+            continue
         matches.append((marker_index, payload))
     return matches
 
@@ -604,9 +606,10 @@ def _judge_provider_receipt(
                 on_head,
                 False,
             )
-    status = review.get("status") or ("completed" if marker_index != 2 else None)
+    status = review.get("status")
     if status != "completed":
-        return "pending", f"AI review {status or 'not finished'}", on_head, True
+        label = status if isinstance(status, str) and status.strip() else "not finished"
+        return "pending", f"AI review {label}", on_head, True
     if not on_head:
         return "failure", "AI review covers another commit, not this head", False, True
     unresolved = _receipt_unresolved(review)
@@ -1584,21 +1587,118 @@ def _audit_force_pushes(
         if note:
             print(f"note: acknowledged force push on {default} ({id_key}): {note}")
             continue
+        before = str(entry.get("before") or "")
         after = str(entry.get("after") or "")
         if (
             baseline_sha
             and baseline_verified
+            and before
             and after
+            and not re.fullmatch(r"0+", before)
+            and not re.fullmatch(r"0+", after)
+            and before.lower() != baseline_sha
             and after.lower() != baseline_sha
+            and _commit_is_ancestor(repo, before, baseline_sha)
             and _commit_is_ancestor(repo, after, baseline_sha)
         ):
             continue
-        before = str(entry.get("before") or "")
         origin = before[:7] if before else "unknown"
         target = after[:7] if after else "unknown"
         event_label = f"activity {id_key}" if id_key else "activity"
         findings.append(f"force push on {default} ({event_label}: {origin}..{target})")
     return findings
+
+
+def _rebased_commit_matches(step_commit: dict[str, Any], pr_commit: dict[str, Any]) -> bool:
+    step_sha = step_commit.get("sha")
+    pr_sha = pr_commit.get("sha")
+    if isinstance(step_sha, str) and isinstance(pr_sha, str) and step_sha == pr_sha:
+        return True
+    step_meta = step_commit.get("commit")
+    pr_meta = pr_commit.get("commit")
+    if not isinstance(step_meta, dict) or not isinstance(pr_meta, dict):
+        return False
+    step_message = step_meta.get("message")
+    pr_message = pr_meta.get("message")
+    if (
+        not isinstance(step_message, str)
+        or not isinstance(pr_message, str)
+        or not pr_message
+        or step_message != pr_message
+    ):
+        return False
+    step_author = step_meta.get("author") if isinstance(step_meta.get("author"), dict) else {}
+    pr_author = pr_meta.get("author") if isinstance(pr_meta.get("author"), dict) else {}
+    pr_email = pr_author.get("email")
+    if pr_email and step_author.get("email") != pr_email:
+        return False
+    pr_date = pr_author.get("date")
+    if pr_date and step_author.get("date") != pr_date:
+        return False
+    return True
+
+
+def _collect_rebased_commits(
+    repo: str,
+    pull: dict[str, Any],
+    merge_sha: str,
+    indexed: dict[str, dict[str, Any]],
+    first_parent: set[str] | None = None,
+    merge_method: str | None = None,
+) -> set[str]:
+    if merge_method is not None and merge_method != "rebase":
+        return set()
+    if pull.get("commits") == 1:
+        return set()
+    number = pull.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        return set()
+    pr_commits: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        chunk = request(
+            "GET",
+            f"/repos/{repo}/pulls/{number}/commits",
+            params={"per_page": 100, "page": page},
+            allow=(404,),
+        )
+        if not isinstance(chunk, list):
+            return set()
+        pr_commits.extend(chunk)
+        if len(pr_commits) >= 250:
+            return set()
+        if len(chunk) < 100:
+            break
+        page += 1
+    if len(pr_commits) <= 1:
+        return set()
+    earlier_shas: list[str] = []
+    step_sha = merge_sha
+    base_parent = ""
+    for index in range(len(pr_commits) - 1, -1, -1):
+        pr_commit = pr_commits[index]
+        if not isinstance(pr_commit, dict):
+            return set()
+        step_commit = _resolve_commit(repo, step_sha, indexed) if step_sha else None
+        if not isinstance(step_commit, dict):
+            return set()
+        raw_parents = step_commit.get("parents") or []
+        if len(raw_parents) != 1 or not isinstance(raw_parents[0], dict):
+            return set()
+        parent_sha = raw_parents[0].get("sha")
+        if not isinstance(parent_sha, str) or not parent_sha:
+            return set()
+        if not _rebased_commit_matches(step_commit, pr_commit):
+            return set()
+        if index < len(pr_commits) - 1:
+            earlier_shas.append(step_sha)
+        base_parent = parent_sha
+        step_sha = parent_sha
+    base_sha = (pull.get("base") or {}).get("sha")
+    if isinstance(base_sha, str) and base_sha:
+        if not _commit_is_ancestor(repo, base_sha, base_parent, first_parent):
+            return set()
+    return set(earlier_shas)
 
 
 def scan_direct_pushes(
@@ -1610,6 +1710,9 @@ def scan_direct_pushes(
     limit: int,
     baseline_sha: str = "",
     listing: list[dict[str, Any]] | None = None,
+    pulls_by_merge_sha: dict[str, dict[str, Any]] | None = None,
+    pull_methods: dict[int, str] | None = None,
+    first_parent: set[str] | None = None,
 ) -> list[str]:
     # Only main's first-parent chain is evidence of a push that bypassed the entry;
     # scanning the raw commit listing both misses chain commits behind a long branch
@@ -1626,6 +1729,7 @@ def scan_direct_pushes(
     for commit in listing:
         indexed.setdefault(commit["sha"], commit)
     findings: list[str] = []
+    rebased_commits: set[str] = set()
     current, visited = (listing[0]["sha"] if listing else ""), 0
     while current and visited < limit:
         if baseline_sha and current.lower() == baseline_sha:
@@ -1638,16 +1742,48 @@ def scan_direct_pushes(
         parents = [parent.get("sha") for parent in (commit.get("parents") or [])]
         next_sha = parents[0] if parents else ""
         visited += 1
+        if current in rebased_commits:
+            current = next_sha
+            continue
+        pull = pulls_by_merge_sha.get(current) if pulls_by_merge_sha else None
         if current in merge_shas:
+            if len(parents) == 1 and pull is not None:
+                method = pull_methods.get(pull.get("number")) if pull_methods else None
+                rebased_commits.update(
+                    _collect_rebased_commits(
+                        repo,
+                        pull,
+                        current,
+                        indexed,
+                        first_parent=first_parent,
+                        merge_method=method,
+                    )
+                )
             current = next_sha
             continue
         related = request("GET", f"/repos/{repo}/commits/{current}/pulls", allow=(404,)) or []
-        if not any(
-            pull.get("merged_at")
-            and (pull.get("base") or {}).get("ref") == default
-            and pull.get("merge_commit_sha") == current
-            for pull in related
-        ):
+        matched = [
+            p
+            for p in related
+            if p.get("merged_at")
+            and (p.get("base") or {}).get("ref") == default
+            and p.get("merge_commit_sha") == current
+        ]
+        if matched:
+            if len(parents) == 1:
+                for p in matched:
+                    method = pull_methods.get(p.get("number")) if pull_methods else None
+                    rebased_commits.update(
+                        _collect_rebased_commits(
+                            repo,
+                            p,
+                            current,
+                            indexed,
+                            first_parent=first_parent,
+                            merge_method=method,
+                        )
+                    )
+        else:
             subject = ((commit.get("commit") or {}).get("message") or "").splitlines()[0]
             note = str(acknowledged.get(current) or acknowledged.get(current[:7]) or "")
             message = f"{current[:7]} on {default} is not associated with a merged pull request: {subject}"
@@ -1755,6 +1891,7 @@ def audit(
     eligible.sort(key=lambda pull: pull["merged_at"], reverse=True)
     audited_pulls = eligible[:limit]
     checked = 0
+    pull_methods: dict[int, str] = {}
     for pull in audited_pulls:
         number = pull["number"]
         checked += 1
@@ -1780,6 +1917,9 @@ def audit(
                     and verdict.get("merged") is True
                 ):
                     passed = True
+                    method = verdict.get("merge_method")
+                    if isinstance(method, str) and isinstance(number, int) and not isinstance(number, bool):
+                        pull_methods[number] = method
         if not passed:
             violations.append(f"#{number} merged at {head[:7]} without an authenticated passing verdict")
     listing = request(
@@ -1822,11 +1962,12 @@ def audit(
             strict=strict,
         )
     )
-    merge_shas = {
-        pull.get("merge_commit_sha")
+    pulls_by_merge_sha = {
+        pull["merge_commit_sha"]: pull
         for pull in default_pulls
         if pull.get("merge_commit_sha")
     }
+    merge_shas = set(pulls_by_merge_sha)
     violations.extend(
         scan_direct_pushes(
             repo,
@@ -1837,6 +1978,9 @@ def audit(
             direct_limit,
             baseline_sha=baseline_sha,
             listing=listing,
+            pulls_by_merge_sha=pulls_by_merge_sha,
+            pull_methods=pull_methods,
+            first_parent=first_parent,
         )
     )
     print(f"audited {checked} merged pull requests since {since or 'the beginning'}")

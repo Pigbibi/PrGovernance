@@ -31,7 +31,8 @@ and `QuantStrategyLab/.github`.**
 - `pr-governance/` — Node.js (`gate.cjs`, `runner.cjs`, `main.cjs`, `nudge.cjs`),
   Python (`secret_scan.py`), shell scripts, and tests (`test-*.cjs`, `test_secret_scan.py`).
 - `local/` — Python 3 (`governance.py`, `merge_gate.py`, `check_hygiene.py`) and
-  unittest suites (`test_governance.py`, `test_merge_gate.py`), plus hook shims.
+  unittest suites (`test_governance.py`, `test_check_hygiene.py`,
+  `test_merge_gate*.py`), plus hook shims.
 - `VERSION` — shared twin revision integer.
 - `docs/` — rollout and design notes.
 - `.github/workflows/` — `pr-governance-tests.yml` and `governance-drift.yml`.
