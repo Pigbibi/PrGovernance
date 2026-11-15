@@ -762,7 +762,11 @@ class DirectPushAuditTests(unittest.TestCase):
                     return related_pulls[sha]
                 # Only the shas named here have a merged pull request attached;
                 # everything else asks the entry and gets nothing back.
-                return [{"merged_at": self.DATE, "base": {"ref": "main"}}] if sha in attributed else []
+                return (
+                    [{"merged_at": self.DATE, "base": {"ref": "main"}, "merge_commit_sha": sha}]
+                    if sha in attributed
+                    else []
+                )
             if path.startswith("/repos/o/r/commits/"):
                 return details.get(path.rsplit("/", 1)[-1])
             return []
@@ -792,7 +796,7 @@ class DirectPushAuditTests(unittest.TestCase):
     def test_pull_merged_to_non_default_branch_does_not_exempt_direct_push(self):
         chain = [self.commit(self.TIP, (self.PREV,), "feat: via pull request"),
                  self.commit(self.PREV, (), "docs: merged onto release branch only")]
-        related = {self.PREV: [{"merged_at": self.DATE, "base": {"ref": "release"}}]}
+        related = {self.PREV: [{"merged_at": self.DATE, "base": {"ref": "release"}, "merge_commit_sha": self.PREV}]}
         code, output = self.run_audit(chain, related_pulls=related)
         self.assertEqual(code, 2)
         self.assertIn(f"violation: {self.PREV[:7]} on main is not associated", output)
@@ -800,10 +804,18 @@ class DirectPushAuditTests(unittest.TestCase):
     def test_fast_forwarded_merge_sha_from_non_default_branch_is_not_exempted(self):
         chain = [self.commit(self.TIP, (self.PREV,), "feat: release pr fast-forwarded to main"),
                  self.commit(self.PREV, (), "docs: earlier merged pull request")]
-        related = {self.TIP: [{"merged_at": self.DATE, "base": {"ref": "release"}}]}
+        related = {self.TIP: [{"merged_at": self.DATE, "base": {"ref": "release"}, "merge_commit_sha": self.TIP}]}
         code, output = self.run_audit(chain, attributed={self.PREV}, related_pulls=related, pull_base="release")
         self.assertEqual(code, 2)
         self.assertIn(f"violation: {self.TIP[:7]} on main is not associated", output)
+
+    def test_side_or_head_commit_of_merged_pr_does_not_exempt_direct_push(self):
+        chain = [self.commit(self.TIP, (self.PREV,), "feat: via pull request"),
+                 self.commit(self.PREV, (), "feat: side commit from a merge-commit PR")]
+        related = {self.PREV: [{"merged_at": self.DATE, "base": {"ref": "main"}, "merge_commit_sha": "f" * 40}]}
+        code, output = self.run_audit(chain, related_pulls=related)
+        self.assertEqual(code, 2)
+        self.assertIn(f"violation: {self.PREV[:7]} on main is not associated", output)
 
     def test_commits_outside_the_first_parent_chain_are_not_audited(self):
         chain = [self.commit(self.TIP, (self.DIRECT,), "feat: via pull request"),
@@ -1685,6 +1697,61 @@ class AiReviewReceiptTests(unittest.TestCase):
         self.assertEqual(state, "failure")
         self.assertIn("Ambiguous or disallowed", note)
 
+    def test_base_changed_at_invalidates_older_receipt_until_rereviewed(self):
+        cutoff = gate.dt.datetime(2026, 11, 14, 8, 30, 0, tzinfo=gate.dt.timezone.utc)
+        old_codex = self.comment(
+            "chatgpt-codex-connector[bot]",
+            "codex-review-state:v1",
+            {
+                "code_review": {
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "has_unresolved_findings": False,
+                }
+            },
+            updated_at="2026-11-14T08:00:00Z",
+        )
+        old_claude = self.comment(
+            "claude[bot]",
+            "ai-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+            updated_at="2026-11-14T08:00:00Z",
+        )
+        untimed_claude = {
+            "user": old_claude["user"],
+            "body": old_claude["body"],
+            "updated_at": "",
+            "created_at": "",
+        }
+        with mock.patch.object(gate, "paginate", return_value=[old_codex, old_claude, untimed_claude]):
+            state_c, note_c = gate.codex_verdict("o/r", 7, self.HEAD, base_changed_at=cutoff)
+            state_m, note_m = gate.ai_review_verdict(
+                "o/r", 7, self.HEAD, allowed_providers={"codex", "claude"}, base_changed_at=cutoff
+            )
+        self.assertEqual(state_c, "pending")
+        self.assertIn("base change", note_c)
+        self.assertEqual(state_m, "pending")
+        self.assertIn("base change", note_m)
+
+        fresh_claude = {
+            "user": old_claude["user"],
+            "body": old_claude["body"],
+            "created_at": "2026-11-14T09:00:00Z",
+        }
+        with mock.patch.object(gate, "paginate", return_value=[old_codex, old_claude, fresh_claude]):
+            state_after, _ = gate.ai_review_verdict(
+                "o/r", 7, self.HEAD, allowed_providers={"codex", "claude"}, base_changed_at=cutoff
+            )
+        self.assertEqual(state_after, "success")
+
 
 class ClearingLabelTests(unittest.TestCase):
     HEAD = "a" * 40
@@ -1869,6 +1936,86 @@ class ClearingLabelTests(unittest.TestCase):
                 test_pull=self.pull(["agent-approved"], head_repo="fork/r"),
             )
         )
+
+    def test_timeline_base_ref_changed_clears_earlier_label_and_pre_retarget_status(self):
+        pull = self.pull(["owner-approved", "agent-approved"])
+        pre_retarget_status = {
+            "context": "clearing-label",
+            "state": "success",
+            "creator": {"login": gate.ACTIONS_BOT},
+            "description": "owner-approved for PR 7 at event 201 on this head",
+            "updated_at": "2026-11-14T08:00:05Z",
+        }
+        stale_timeline = [
+            {
+                "id": 201,
+                "event": "labeled",
+                "label": {"name": "owner-approved"},
+                "actor": {"login": "owner-login"},
+                "created_at": "2026-11-14T08:00:00Z",
+            },
+            {
+                "id": 202,
+                "event": "labeled",
+                "label": {"name": "agent-approved"},
+                "actor": {"login": "review-agent"},
+                "created_at": "2026-11-14T08:01:00Z",
+            },
+            {"event": "base_ref_changed", "created_at": "2026-11-14T08:05:00Z"},
+        ]
+
+        def run(timeline, statuses):
+            def fake_paginate(path, params=None):
+                if path.endswith("/timeline"):
+                    return timeline
+                if path.endswith("/statuses"):
+                    return statuses
+                raise AssertionError(f"Unexpected paginate call: {path}")
+
+            with mock.patch.object(gate, "paginate", fake_paginate), \
+                 mock.patch.object(gate, "branch_activities", return_value=[]):
+                return gate.live_label(
+                    "o/r", 7, "owner-login", pull=pull, agent_logins={"review-agent"}
+                )
+
+        self.assertIsNone(run(stale_timeline, [pre_retarget_status]))
+
+        # Even if re-labeled after base_ref_changed, an untimed or pre-retarget status never passes.
+        relabeled_timeline = stale_timeline + [
+            {
+                "id": 203,
+                "event": "labeled",
+                "label": {"name": "owner-approved"},
+                "actor": {"login": "owner-login"},
+                "created_at": "2026-11-14T08:10:00Z",
+            }
+        ]
+        for bad_status in (
+            {
+                "context": "clearing-label",
+                "state": "success",
+                "creator": {"login": gate.ACTIONS_BOT},
+                "description": "owner-approved for PR 7 at event 203 on this head",
+            },
+            {
+                "context": "clearing-label",
+                "state": "success",
+                "creator": {"login": gate.ACTIONS_BOT},
+                "description": "owner-approved for PR 7 at event 203 on this head",
+                "updated_at": "2026-11-14T08:04:00Z",
+            },
+        ):
+            with self.subTest(bad_status=bad_status):
+                self.assertIsNone(run(relabeled_timeline, [pre_retarget_status, bad_status]))
+
+        fresh_status = {
+            "context": "clearing-label",
+            "state": "success",
+            "creator": {"login": gate.ACTIONS_BOT},
+            "description": "owner-approved for PR 7 at event 203 on this head",
+            "updated_at": "2026-11-14T08:10:05Z",
+        }
+        self.assertEqual(run(relabeled_timeline, [pre_retarget_status, fresh_status]), "owner-approved")
 
 
 class EvaluatePolicyTests(unittest.TestCase):
@@ -2183,6 +2330,147 @@ class EvaluatePolicyTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as sys_exit:
                 gate.main()
         self.assertEqual(sys_exit.exception.code, 2)
+
+    def test_base_ref_changed_invalidates_both_label_and_receipt_on_unchanged_head_until_reapproved(self):
+        pull = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": self.HEAD, "ref": "feat/x", "repo": {"full_name": "o/r"}},
+            "base": {"ref": "main"},
+            "user": {"login": "contributor"},
+            "changed_files": 1,
+            "body": "## AI assistance\nCodex\n\n## What changed\nConfig\n\n## How verified\nTested\n",
+            "labels": [{"name": "owner-approved"}],
+        }
+        protected_file = {
+            "filename": ".github/workflows/ci.yml",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "patch": "@@ -1 +1 @@\n+# tweak\n",
+        }
+        tree_payload = {
+            "truncated": False,
+            "tree": [{"path": ".github/workflows/ci.yml", "mode": "100644", "type": "blob"}],
+        }
+        policy = {
+            "owner_login": "owner",
+            "codex_required": False,
+            "ai_review_providers": ["codex", "claude"],
+            "require_checks": False,
+            "_source": "main",
+            "_sha256": "p3",
+        }
+        pre_receipt = {
+            "user": {"login": "claude[bot]"},
+            "updated_at": "2026-11-14T08:00:10Z",
+            "body": '<!-- ai-review-receipt:v1 {"review":{"provider":"claude","commit_sha":"'
+            + self.HEAD
+            + '","status":"completed","unresolved_findings":0,"coverage":"complete"}} -->',
+        }
+        pre_status = {
+            "context": "clearing-label",
+            "state": "success",
+            "creator": {"login": gate.ACTIONS_BOT},
+            "description": "owner-approved for PR 7 at event 101 on this head",
+            "updated_at": "2026-11-14T08:00:05Z",
+        }
+        base_timeline = [
+            {
+                "id": 101,
+                "event": "labeled",
+                "label": {"name": "owner-approved"},
+                "actor": {"login": "owner"},
+                "created_at": "2026-11-14T08:00:00Z",
+            },
+            {"event": "base_ref_changed", "created_at": "2026-11-14T08:05:00Z"},
+        ]
+
+        state = {
+            "comments": [pre_receipt],
+            "timeline": list(base_timeline),
+            "statuses": [pre_status],
+        }
+
+        def fake_request(method, path, **kwargs):
+            if path == "/repos/o/r/pulls/7":
+                return pull
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == f"/repos/o/r/git/trees/{self.HEAD}":
+                return tree_payload
+            return None
+
+        def fake_paginate(path, params=None):
+            if path.endswith("/files"):
+                return [protected_file]
+            if path.endswith("/comments"):
+                return state["comments"]
+            if path.endswith("/timeline"):
+                return state["timeline"]
+            if path.endswith("/statuses"):
+                return state["statuses"]
+            return []
+
+        with mock.patch.object(gate, "request", side_effect=fake_request), \
+             mock.patch.object(gate, "load_policy", return_value=policy), \
+             mock.patch.object(gate, "verify_script", return_value=None), \
+             mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
+             mock.patch.object(gate, "shared_head", return_value=False), \
+             mock.patch.object(gate, "base_action_files", return_value=set()), \
+             mock.patch.object(gate, "branch_activities", return_value=[]), \
+             mock.patch.object(gate, "paginate", side_effect=fake_paginate):
+            verdict, reasons = gate.evaluate("o/r", 7)
+            self.assertEqual(verdict["verdict"], "fail")
+            self.assertTrue(any("base change" in r for r in reasons))
+            self.assertTrue(any("owner-approved" in r for r in reasons))
+
+            # Untimed base_ref_changed also fails closed.
+            state["timeline"] = [base_timeline[0], {"event": "base_ref_changed"}]
+            untimed_verdict, untimed_reasons = gate.evaluate("o/r", 7)
+            self.assertEqual(untimed_verdict["verdict"], "fail")
+            self.assertTrue(any("base change" in r for r in untimed_reasons))
+            self.assertTrue(any("owner-approved" in r for r in untimed_reasons))
+
+            # Fresh post-retarget label, clearing-label status, and receipt pass evaluate + revalidate.
+            state["timeline"] = list(base_timeline) + [
+                {
+                    "id": 102,
+                    "event": "labeled",
+                    "label": {"name": "owner-approved"},
+                    "actor": {"login": "owner"},
+                    "created_at": "2026-11-14T08:10:00Z",
+                }
+            ]
+            state["statuses"].append(
+                {
+                    "context": "clearing-label",
+                    "state": "success",
+                    "creator": {"login": gate.ACTIONS_BOT},
+                    "description": "owner-approved for PR 7 at event 102 on this head",
+                    "updated_at": "2026-11-14T08:10:05Z",
+                }
+            )
+            state["comments"].append(
+                {
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "updated_at": "2026-11-14T08:10:10Z",
+                    "body": '<!-- codex-review-state:v1 {"code_review":{"commit_sha":"'
+                    + self.HEAD
+                    + '","status":"completed","has_unresolved_findings":false}} -->',
+                }
+            )
+            ok_verdict, ok_reasons = gate.evaluate("o/r", 7)
+            self.assertEqual(ok_reasons, [])
+            self.assertEqual(ok_verdict["verdict"], "pass")
+            gate.revalidate("o/r", ok_verdict)
+
+            # A base toggle between evaluate and revalidate also causes revalidate to refuse.
+            state["timeline"].append({"event": "base_ref_changed", "created_at": "2026-11-14T08:15:00Z"})
+            with self.assertRaises(gate.Refusal):
+                gate.revalidate("o/r", ok_verdict)
 
 
 class DefaultRepoTests(unittest.TestCase):

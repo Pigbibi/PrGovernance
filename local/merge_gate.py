@@ -496,6 +496,22 @@ def _parse_review_payload(marker_index: int, raw: str) -> dict[str, Any] | None:
 
 
 _EPOCH_MIN = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+_EPOCH_MAX = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+
+
+def _base_change_cutoff(timeline: list[dict[str, Any]] | None) -> dt.datetime | None:
+    if not timeline:
+        return None
+    latest: dt.datetime | None = None
+    for event in timeline:
+        if not isinstance(event, dict) or event.get("event") != "base_ref_changed":
+            continue
+        ts = _parse_iso_timestamp(event.get("created_at"))
+        if ts is None:
+            return _EPOCH_MAX
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
 
 
 def _parse_iso_timestamp(value: Any) -> dt.datetime | None:
@@ -591,7 +607,11 @@ def _judge_provider_receipt(
 
 
 def ai_review_verdict(
-    repo: str, number: int, head: str, allowed_providers: set[str] | None = None
+    repo: str,
+    number: int,
+    head: str,
+    allowed_providers: set[str] | None = None,
+    base_changed_at: dt.datetime | None = None,
 ) -> tuple[str, str]:
     active = ALL_REVIEW_PROVIDERS if allowed_providers is None else (set(allowed_providers) & ALL_REVIEW_PROVIDERS)
     if not active:
@@ -616,17 +636,26 @@ def ai_review_verdict(
         matches = _extract_receipt_markers(body)
         if not matches:
             continue
-        updated_at = comment.get("updated_at") or ""
+        updated_at = comment.get("updated_at") or comment.get("created_at") or ""
         comment_id = comment.get("id")
         cid = comment_id if isinstance(comment_id, int) and not isinstance(comment_id, bool) else 0
-        parsed_ts = _parse_iso_timestamp(updated_at) or _EPOCH_MIN
-        if len(matches) > 1 or matches[0][0] not in allowed_indices:
-            marker_index, payload_raw = -1, None
+        parsed_ts_opt = _parse_iso_timestamp(updated_at)
+        parsed_ts = parsed_ts_opt or _EPOCH_MIN
+        if base_changed_at is not None and (parsed_ts_opt is None or parsed_ts_opt < base_changed_at):
+            state, note, on_head, provider_ok = (
+                "pending",
+                "AI review predates pull request base change",
+                False,
+                True,
+            )
         else:
-            marker_index, payload_raw = matches[0]
-        state, note, on_head, provider_ok = _judge_provider_receipt(
-            login_provider, marker_index, payload_raw, head
-        )
+            if len(matches) > 1 or matches[0][0] not in allowed_indices:
+                marker_index, payload_raw = -1, None
+            else:
+                marker_index, payload_raw = matches[0]
+            state, note, on_head, provider_ok = _judge_provider_receipt(
+                login_provider, marker_index, payload_raw, head
+            )
         head_rank = 1 if on_head is not False else 0
         candidate = (
             head_rank,
@@ -694,8 +723,15 @@ def ai_review_verdict(
     return judged[0][3], judged[0][4]
 
 
-def codex_verdict(repo: str, number: int, head: str) -> tuple[str, str]:
-    return ai_review_verdict(repo, number, head, allowed_providers={"codex"})
+def codex_verdict(
+    repo: str,
+    number: int,
+    head: str,
+    base_changed_at: dt.datetime | None = None,
+) -> tuple[str, str]:
+    return ai_review_verdict(
+        repo, number, head, allowed_providers={"codex"}, base_changed_at=base_changed_at
+    )
 
 
 def policy_review_providers(policy: dict[str, Any]) -> set[str]:
@@ -780,6 +816,7 @@ def live_label(
     owner: str,
     pull: dict[str, Any] | None = None,
     agent_logins: set[str] | None = None,
+    timeline: list[dict[str, Any]] | None = None,
 ) -> str | None:
     if pull is None:
         events = paginate(f"/repos/{repo}/issues/{number}/events")
@@ -801,11 +838,16 @@ def live_label(
     head = head_info.get("sha") or ""
     if not head:
         return None
-    timeline = paginate(f"/repos/{repo}/issues/{number}/timeline")
+    if timeline is None:
+        timeline = paginate(f"/repos/{repo}/issues/{number}/timeline")
     latest = {}
+    reset_events = ("committed", "head_ref_force_pushed", "head_ref_restored", "reopened", "base_ref_changed")
+    base_changed_at = _base_change_cutoff(timeline)
     for event in timeline:
+        if not isinstance(event, dict):
+            continue
         kind = event.get("event")
-        if kind in ("committed", "head_ref_force_pushed", "head_ref_restored", "reopened"):
+        if kind in reset_events:
             latest.clear()
             continue
         name = (event.get("label") or {}).get("name")
@@ -822,20 +864,26 @@ def live_label(
         event = latest.get(name)
         if not event or not _valid_clearing_actor(name, event, owner, agent_logins):
             continue
+        event_ts = _parse_iso_timestamp(event.get("created_at"))
+        if base_changed_at is not None and (event_ts is None or event_ts < base_changed_at):
+            continue
         if statuses is None:
             statuses = paginate(f"/repos/{repo}/commits/{head}/statuses")
         event_id = event.get("id")
         if event_id is not None and not isinstance(event_id, bool):
             expected = f"{name} for PR {number} at event {event_id} on this head"
-            if any(
-                s.get("context") == "clearing-label"
-                and s.get("state") == "success"
-                and (s.get("creator") or {}).get("login") == ACTIONS_BOT
-                and s.get("description") == expected
-                for s in statuses
-            ):
-                return name
-        event_ts = _parse_iso_timestamp(event.get("created_at"))
+            for s in statuses:
+                if (
+                    s.get("context") == "clearing-label"
+                    and s.get("state") == "success"
+                    and (s.get("creator") or {}).get("login") == ACTIONS_BOT
+                    and s.get("description") == expected
+                ):
+                    if base_changed_at is not None:
+                        status_ts = _parse_iso_timestamp(s.get("updated_at") or s.get("created_at"))
+                        if status_ts is None or status_ts < base_changed_at:
+                            continue
+                    return name
         activity_repo = head_repo or ""
         if not activity_repo or not head_ref or event_ts is None:
             continue
@@ -1075,6 +1123,24 @@ def symlink_entries(
     return flagged, True
 
 
+def _review_verdict_for_policy(
+    repo: str,
+    number: int,
+    head: str,
+    providers: set[str],
+    base_changed_at: dt.datetime | None,
+) -> tuple[str, str]:
+    if providers == {"codex"}:
+        return codex_verdict(repo, number, head, base_changed_at=base_changed_at)
+    return ai_review_verdict(
+        repo,
+        number,
+        head,
+        allowed_providers=providers,
+        base_changed_at=base_changed_at,
+    )
+
+
 def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[dict[str, Any], list[str]]:
     pull = request("GET", f"/repos/{repo}/pulls/{number}")
     if pull.get("state") != "open":
@@ -1132,20 +1198,31 @@ def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[di
         tier = "T2"
         fast_path = False
     providers = policy_review_providers(policy)
-    if providers and tier != "T0" and not fast_path:
-        if providers == {"codex"}:
-            codex_state, codex_note = codex_verdict(repo, number, head)
-        else:
-            codex_state, codex_note = ai_review_verdict(
-                repo, number, head, allowed_providers=providers
-            )
+    needs_review = bool(providers and tier != "T0" and not fast_path)
+    timeline = (
+        paginate(f"/repos/{repo}/issues/{number}/timeline")
+        if (needs_review or tier == "T2")
+        else None
+    )
+    base_changed_at = _base_change_cutoff(timeline) if timeline is not None else None
+    if needs_review:
+        codex_state, codex_note = _review_verdict_for_policy(
+            repo, number, head, providers, base_changed_at
+        )
     else:
         codex_state, codex_note = "skipped", "Not required for this change"
     if codex_state not in ("success", "skipped"):
         reasons.append(codex_note)
     agent_logins = policy_agent_logins(policy)
     label = (
-        live_label(repo, number, policy.get("owner_login", ""), pull=pull, agent_logins=agent_logins)
+        live_label(
+            repo,
+            number,
+            policy.get("owner_login", ""),
+            pull=pull,
+            agent_logins=agent_logins,
+            timeline=timeline,
+        )
         if tier == "T2"
         else None
     )
@@ -1243,29 +1320,35 @@ def revalidate(repo: str, verdict: dict[str, Any], policy_file: str | None = Non
         raise Refusal("Base advanced since the verdict; re-run the gate")
     if shared_head(repo, verdict["pr"], verdict["head_sha"]):
         raise Refusal("Another open pull request now shares this head; re-run the gate")
-    if verdict.get("tier") == "T2":
+    needs_label = verdict.get("tier") == "T2"
+    needs_review = verdict.get("codex") not in (None, "skipped")
+    timeline = (
+        paginate(f"/repos/{repo}/issues/{verdict['pr']}/timeline")
+        if (needs_label or needs_review)
+        else None
+    )
+    base_changed_at = _base_change_cutoff(timeline) if timeline is not None else None
+    if needs_label:
         live = live_label(
             repo,
             verdict["pr"],
             policy.get("owner_login", ""),
             pull=pull,
             agent_logins=policy_agent_logins(policy),
+            timeline=timeline,
         )
         if live != verdict.get("label"):
             raise Refusal("Clearing label changed since the verdict; re-run the gate")
-    if verdict.get("codex") not in (None, "skipped"):
+    if needs_review:
         providers = policy_review_providers(policy)
         if not providers:
             raise Refusal("AI review policy changed since the verdict; re-run the gate")
         expected_providers = verdict.get("review_providers")
         if expected_providers is not None and sorted(providers) != sorted(expected_providers):
             raise Refusal("AI review providers changed since the verdict; re-run the gate")
-        if providers == {"codex"}:
-            state, note = codex_verdict(repo, verdict["pr"], verdict["head_sha"])
-        else:
-            state, note = ai_review_verdict(
-                repo, verdict["pr"], verdict["head_sha"], allowed_providers=providers
-            )
+        state, note = _review_verdict_for_policy(
+            repo, verdict["pr"], verdict["head_sha"], providers, base_changed_at
+        )
         if state != "success":
             raise Refusal(f"AI review is no longer valid: {note}; re-run the gate")
     if policy.get("require_checks", True) and verdict.get("required_checks"):
@@ -1374,7 +1457,9 @@ def scan_direct_pushes(repo: str, default: str, since: str, merge_shas: set, ack
             continue
         related = request("GET", f"/repos/{repo}/commits/{current}/pulls", allow=(404,)) or []
         if not any(
-            pull.get("merged_at") and (pull.get("base") or {}).get("ref") == default
+            pull.get("merged_at")
+            and (pull.get("base") or {}).get("ref") == default
+            and pull.get("merge_commit_sha") == current
             for pull in related
         ):
             subject = ((commit.get("commit") or {}).get("message") or "").splitlines()[0]
