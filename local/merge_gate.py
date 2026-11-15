@@ -84,10 +84,10 @@ KEYWORD_PATHS = (
     re.compile(r"^scripts/[^/]*(?:check|verify|validate|hygiene|lint)[^/]*\.(?:py|sh|js|cjs|mjs|ts)$"),
 )
 
+# Limit T0 exemptions to Markdown prose files (non-prose under docs/, such as
+# docs/conf.py, doc/tool.sh, or docs/requirements.txt, still requires review).
 PLAIN_DOC = (
-    re.compile(r"^(docs?)/"),
-    re.compile(r"/(docs?)/"),
-    re.compile(r"\.md$"),
+    re.compile(r"\.md$", re.IGNORECASE),
 )
 
 SECRET_PATTERNS = (
@@ -750,15 +750,52 @@ def policy_review_providers(policy: dict[str, Any]) -> set[str]:
 _UNSET = object()
 
 
+def _clean_logins(configured: Any) -> set[str]:
+    if not isinstance(configured, list):
+        return set()
+    return {login.strip() for login in configured if isinstance(login, str) and login.strip()}
+
+
 def policy_agent_logins(policy: dict[str, Any] | None) -> set[str]:
     if not isinstance(policy, dict):
         return set()
     configured = policy.get("agent_logins")
     if not isinstance(configured, list):
         configured = policy.get("approved_agent_logins")
-    if not isinstance(configured, list):
+    return _clean_logins(configured)
+
+
+def _valid_verdict_signers(policy: dict[str, Any] | None) -> set[str]:
+    """Return GitHub logins accepted by audit() as merge verdict signers."""
+    if not isinstance(policy, dict):
         return set()
-    return {login.strip() for login in configured if isinstance(login, str) and login.strip()}
+    signers = _clean_logins(policy.get("verdict_signers"))
+    owner = policy.get("owner_login")
+    if isinstance(owner, str) and owner.strip():
+        signers.add(owner.strip())
+    return signers
+
+
+def _require_verdict_signer(policy: dict[str, Any] | None) -> str:
+    signers = _valid_verdict_signers(policy)
+    if not signers:
+        raise Refusal("Policy configures no valid verdict signer; refusing merge")
+    try:
+        caller = request("GET", "/user")
+    except ApiError as exc:
+        raise Refusal(
+            f"Cannot verify authenticated GitHub caller ({diagnostic(exc)}); refusing merge"
+        ) from exc
+    caller_login = caller.get("login") if isinstance(caller, dict) else None
+    if not isinstance(caller_login, str) or not caller_login.strip():
+        raise Refusal("Cannot identify authenticated GitHub caller; refusing merge")
+    caller_login = caller_login.strip()
+    if caller_login not in signers:
+        raise Refusal(
+            f"Authenticated caller {caller_login} is not an audit-accepted verdict signer; "
+            "refusing merge"
+        )
+    return caller_login
 
 
 def _valid_clearing_actor(
@@ -1295,7 +1332,9 @@ def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[di
     return verdict, reasons
 
 
-def revalidate(repo: str, verdict: dict[str, Any], policy_file: str | None = None) -> None:
+def _revalidate_with_policy(
+    repo: str, verdict: dict[str, Any], policy_file: str | None = None
+) -> dict[str, Any]:
     pull = request("GET", f"/repos/{repo}/pulls/{verdict['pr']}")
     if pull.get("state") != "open":
         raise Refusal("Pull request is no longer open; re-run the gate")
@@ -1358,6 +1397,11 @@ def revalidate(repo: str, verdict: dict[str, Any], policy_file: str | None = Non
         )
         if missing or unsettled or pending or failing:
             raise Refusal("CI evidence changed since the verdict; re-run the gate")
+    return policy
+
+
+def revalidate(repo: str, verdict: dict[str, Any], policy_file: str | None = None) -> None:
+    _revalidate_with_policy(repo, verdict, policy_file=policy_file)
 
 
 @contextlib.contextmanager
@@ -1387,7 +1431,8 @@ def merge_lock(repo: str, base_ref: str):
 def merge(repo: str, verdict: dict[str, Any], policy_file: str | None = None) -> dict[str, Any]:
     number = verdict["pr"]
     with merge_lock(repo, verdict["base_ref"]):
-        revalidate(repo, verdict, policy_file=policy_file)
+        policy = _revalidate_with_policy(repo, verdict, policy_file=policy_file)
+        _require_verdict_signer(policy)
         result = request(
             "PUT",
             f"/repos/{repo}/pulls/{number}/merge",
@@ -1426,15 +1471,23 @@ def _resolve_commit(repo: str, sha: str, indexed: dict[str, dict[str, Any]]) -> 
     return commit
 
 
-def scan_direct_pushes(repo: str, default: str, since: str, merge_shas: set, acknowledged: dict,
-                       strict: bool, limit: int) -> list[str]:
+def scan_direct_pushes(
+    repo: str,
+    default: str,
+    merge_shas: set,
+    acknowledged: dict,
+    strict: bool,
+    limit: int,
+    baseline_sha: str = "",
+) -> list[str]:
     # Only main's first-parent chain is evidence of a push that bypassed the entry;
     # scanning the raw commit listing both misses chain commits behind a long branch
     # merge and reports side-branch commits that never reached main on their own.
-    # Committer dates are not monotonic along ancestry, so the walk is bounded by
-    # depth alone and the audit window filters each commit on its own. The listing
-    # is reverse-chronological over side branches too, so ancestors missing from it
-    # are fetched one by one rather than silently ending the walk.
+    # Committer dates are attacker-controlled and cannot exclude a direct push, so the
+    # walk checks every first-parent commit in the bounded window and stops early
+    # only at a trusted baseline SHA. The listing is reverse-chronological over side
+    # branches too, so ancestors missing from it are fetched one by one rather than
+    # silently ending the walk.
     indexed: dict[str, dict[str, Any]] = {}
     listing = request("GET", f"/repos/{repo}/commits",
                       params={"sha": default, "per_page": 100}) or []
@@ -1443,6 +1496,8 @@ def scan_direct_pushes(repo: str, default: str, since: str, merge_shas: set, ack
     findings: list[str] = []
     current, visited = (listing[0]["sha"] if listing else ""), 0
     while current and visited < limit:
+        if baseline_sha and current.lower() == baseline_sha:
+            break
         commit = _resolve_commit(repo, current, indexed)
         if commit is None:
             findings.append(f"{current[:7]} on {default} could not be resolved; "
@@ -1451,8 +1506,7 @@ def scan_direct_pushes(repo: str, default: str, since: str, merge_shas: set, ack
         parents = [parent.get("sha") for parent in (commit.get("parents") or [])]
         next_sha = parents[0] if parents else ""
         visited += 1
-        date = ((commit.get("commit") or {}).get("committer") or {}).get("date") or ""
-        if current in merge_shas or (since and date and date < since):
+        if current in merge_shas:
             current = next_sha
             continue
         related = request("GET", f"/repos/{repo}/commits/{current}/pulls", allow=(404,)) or []
@@ -1497,7 +1551,7 @@ def audit(
         verify_script(repo, default)
         trusted_policy = False
 
-    owner = policy.get("owner_login", "")
+    signers = _valid_verdict_signers(policy)
     violations: list[str] = []
     raw_since = policy.get("audit_since") or ""
     since = ""
@@ -1507,11 +1561,19 @@ def audit(
             violations.append("audit_since in policy is invalid or in the future")
         else:
             since = parsed_since.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    raw_baseline = policy.get("audit_baseline_sha")
+    baseline_sha = ""
+    if raw_baseline is not None and raw_baseline != "":
+        if isinstance(raw_baseline, str) and re.fullmatch(r"[0-9a-f]{40}", raw_baseline.strip().lower()):
+            baseline_sha = raw_baseline.strip().lower()
+        else:
+            violations.append("audit_baseline_sha in policy is invalid")
     ignored = {str(number) for number in policy.get("audit_ignore_prs") or []}
     acknowledged = policy.get("audit_acknowledged_direct") or {}
     direct_limit = int(policy.get("audit_direct_commits") or 40)
     if strict_direct and not trusted_policy:
         since = ""
+        baseline_sha = ""
         ignored = set()
         acknowledged = {}
         direct_limit = max(direct_limit, 40)
@@ -1567,7 +1629,8 @@ def audit(
         comments = paginate(f"/repos/{repo}/issues/{number}/comments")
         passed = False
         for comment in comments:
-            if not owner or (comment.get("user") or {}).get("login") != owner:
+            author = (comment.get("user") or {}).get("login")
+            if not signers or not isinstance(author, str) or author not in signers:
                 continue
             for match in re.finditer(rf"<!--\s*{VERDICT_MARKER}\s*(\{{[\s\S]*?\}})\s*-->", comment.get("body") or ""):
                 try:
@@ -1591,8 +1654,17 @@ def audit(
         if pull.get("merge_commit_sha") and (pull.get("base") or {}).get("ref") == default
     }
     strict = bool(strict_direct or policy.get("audit_strict_direct", True))
-    violations.extend(scan_direct_pushes(repo, default, since, merge_shas, acknowledged,
-                                        strict, direct_limit))
+    violations.extend(
+        scan_direct_pushes(
+            repo,
+            default,
+            merge_shas,
+            acknowledged,
+            strict,
+            direct_limit,
+            baseline_sha=baseline_sha,
+        )
+    )
     print(f"audited {checked} merged pull requests since {since or 'the beginning'}")
     if violations:
         for item in violations:

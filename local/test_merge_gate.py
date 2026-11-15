@@ -49,6 +49,20 @@ class TierTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(gate.classify([changed(name)], False, set(), ()), ("T2", False))
 
+    def test_non_prose_files_under_docs_are_not_t0(self):
+        for name, expected_tier in (
+            ("docs/conf.py", "T1"),
+            ("doc/tool.sh", "T1"),
+            ("docs/requirements.txt", "T1"),
+            ("src/auth/docs/handler.py", "T2"),
+            ("docs/deploy.sh", "T2"),
+            ("docs/config.yml", "T2"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(gate.classify([changed(name)], False, set(), ()), (expected_tier, False))
+        renamed = [changed("docs/guide.md", previous="doc/tool.sh", status="renamed")]
+        self.assertEqual(gate.classify(renamed, False, set(), ()), ("T1", False))
+
     def test_added_tests_are_t1(self):
         for name in ("tests/test_reader.py", "tests/reader_test.py", "examples/demo.py"):
             with self.subTest(name=name):
@@ -606,6 +620,7 @@ class AuditTests(unittest.TestCase):
         untrusted_policy = {
             "owner_login": "synthetic-owner",
             "audit_since": "2026-01-01T00:00:00Z",
+            "audit_baseline_sha": direct,
             "audit_ignore_prs": [7],
             "audit_acknowledged_direct": {direct: "self-excused"},
             "audit_direct_commits": 1,
@@ -637,12 +652,20 @@ class AuditTests(unittest.TestCase):
 
         orig_scan = gate.scan_direct_pushes
 
-        def wrap_scan(repo, default, since, merge_shas, acknowledged, strict, direct_limit):
-            seen_limit["since"] = since
+        def wrap_scan(repo, default, merge_shas, acknowledged, strict, direct_limit, baseline_sha=""):
+            seen_limit["baseline_sha"] = baseline_sha
             seen_limit["acknowledged"] = acknowledged
             seen_limit["strict"] = strict
             seen_limit["direct_limit"] = direct_limit
-            return orig_scan(repo, default, since, merge_shas, acknowledged, strict, direct_limit)
+            return orig_scan(
+                repo,
+                default,
+                merge_shas,
+                acknowledged,
+                strict,
+                direct_limit,
+                baseline_sha=baseline_sha,
+            )
 
         captured = io.StringIO()
         with mock.patch.object(gate, "request", fake_request), \
@@ -653,7 +676,7 @@ class AuditTests(unittest.TestCase):
              contextlib.redirect_stdout(captured):
             code = gate.audit("o/r", 20, True)
         self.assertEqual(code, 2)
-        self.assertEqual(seen_limit, {"since": "", "acknowledged": {}, "strict": True, "direct_limit": 40})
+        self.assertEqual(seen_limit, {"baseline_sha": "", "acknowledged": {}, "strict": True, "direct_limit": 40})
         self.assertIn(f"violation: {direct[:7]} on main is not associated", captured.getvalue())
 
     def test_audit_honors_explicit_policy_ref_and_policy_file(self):
@@ -840,20 +863,54 @@ class DirectPushAuditTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(f"warning: {self.DIRECT[:7]} on main is not associated", output)
 
-    def test_direct_push_scan_skips_commits_outside_the_audit_window(self):
-        chain = [self.commit(self.TIP, (self.DIRECT,), "feat: via pull request"),
-                 self.commit(self.DIRECT, (), "governance: loosen a check")]
-        code, _ = self.run_audit(chain, {"audit_since": "2026-01-06T00:00:00Z"})
-        self.assertEqual(code, 0)
+    def test_backdated_direct_push_outside_audit_since_is_still_audited(self):
+        chain = [self.commit(self.TIP, (self.DIRECT,), "feat: via pull request",
+                             date="2026-01-01T00:00:00Z"),
+                 self.commit(self.DIRECT, (), "governance: loosen a check",
+                             date="2026-01-01T00:00:00Z")]
+        code, output = self.run_audit(chain, {"audit_since": "2026-01-06T00:00:00Z"}, attributed={self.TIP})
+        self.assertEqual(code, 2)
+        self.assertIn(f"violation: {self.DIRECT[:7]} on main is not associated", output)
 
     def test_backdated_tip_does_not_hide_an_in_window_direct_push(self):
         chain = [self.commit(self.TIP, (self.DIRECT,), "feat: via pull request",
                              date="2026-01-01T00:00:00Z"),
                  self.commit(self.DIRECT, (), "governance: loosen a check",
                              date="2026-01-05T00:00:00Z")]
-        code, output = self.run_audit(chain, {"audit_since": "2026-01-02T00:00:00Z"})
+        code, output = self.run_audit(chain, {"audit_since": "2026-01-02T00:00:00Z"}, attributed={self.TIP})
         self.assertEqual(code, 2)
         self.assertIn(f"violation: {self.DIRECT[:7]} on main is not associated", output)
+
+    def test_trusted_baseline_sha_bounds_direct_push_walk_without_relying_on_dates(self):
+        baseline = "b" * 40
+        chain = [self.commit(self.TIP, (baseline,), "feat: via pull request",
+                             date="2026-01-01T00:00:00Z"),
+                 self.commit(baseline, (), "chore: historical direct commit before adoption")]
+        code, _ = self.run_audit(
+            chain,
+            {"audit_since": "2026-01-06T00:00:00Z", "audit_baseline_sha": baseline},
+            attributed={self.TIP},
+        )
+        self.assertEqual(code, 0)
+
+        bypass_chain = [
+            self.commit(self.TIP, (self.DIRECT,), "feat: via pull request"),
+            self.commit(self.DIRECT, (baseline,), "direct push after baseline", date="2026-01-01T00:00:00Z"),
+            self.commit(baseline, (), "chore: historical direct commit before adoption"),
+        ]
+        code, output = self.run_audit(
+            bypass_chain,
+            {"audit_since": "2026-01-06T00:00:00Z", "audit_baseline_sha": baseline},
+            attributed={self.TIP},
+        )
+        self.assertEqual(code, 2)
+        self.assertIn(f"violation: {self.DIRECT[:7]} on main is not associated", output)
+
+    def test_invalid_audit_baseline_sha_fails(self):
+        chain = [self.commit(self.TIP, (), "feat: via pull request")]
+        code, output = self.run_audit(chain, {"audit_baseline_sha": "abc123"}, attributed={self.TIP})
+        self.assertEqual(code, 2)
+        self.assertIn("audit_baseline_sha in policy is invalid", output)
 
     def test_ancestor_missing_from_the_listing_is_fetched_directly(self):
         # A merge that pulled in a long branch fills the recent listing with
@@ -2487,6 +2544,226 @@ class DefaultRepoTests(unittest.TestCase):
                 fake_proc = mock.Mock(stdout=remote_url)
                 with mock.patch.object(gate.subprocess, "run", return_value=fake_proc):
                     self.assertEqual(gate.default_repo(), expected)
+
+
+class MergeSignerTests(unittest.TestCase):
+    HEAD = "a" * 40
+    BASE = "c" * 40
+    MERGE = "b" * 40
+
+    def _fixtures(self, policy):
+        pull = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": self.HEAD, "ref": "feat/x", "repo": {"full_name": "o/r"}},
+            "base": {"ref": "main"},
+            "user": {"login": "contributor"},
+            "changed_files": 1,
+            "body": "",
+            "labels": [],
+        }
+        app_file = {
+            "filename": "app.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "patch": "@@ -1 +1 @@\n+one\n",
+        }
+        claude_comment = {
+            "user": {"login": "claude[bot]"},
+            "updated_at": "2026-11-14T09:00:00Z",
+            "body": '<!-- ai-review-receipt:v1 {"review":{"provider":"claude","commit_sha":"'
+            + self.HEAD
+            + '","status":"completed","unresolved_findings":0,"coverage":"complete"}} -->',
+        }
+        tree_payload = {
+            "truncated": False,
+            "tree": [{"path": "app.py", "mode": "100644", "type": "blob"}],
+        }
+        verdict = {
+            "repo": "o/r",
+            "pr": 7,
+            "head_sha": self.HEAD,
+            "base_ref": "main",
+            "policy_ref": "main",
+            "base_sha": self.BASE,
+            "tier": "T1",
+            "codex": "success",
+            "review_providers": ["claude"],
+            "label": None,
+            "confirmed_by_owner": False,
+            "checks": "skipped",
+            "required_checks": [],
+            "checks_note": "not required by policy",
+            "bootstrap": False,
+            "body_sha256": gate.hashlib.sha256(b"").hexdigest(),
+            "policy_sha256": policy["_sha256"],
+            "verdict": "pass",
+            "reasons": [],
+            "unscanned": [],
+            "merge_method": "squash",
+        }
+        return pull, app_file, claude_comment, tree_payload, verdict
+
+    def test_merge_refuses_unauthorized_or_unidentified_caller_before_put(self):
+        base_policy = {
+            "owner_login": "owner",
+            "codex_required": False,
+            "ai_review_providers": ["claude"],
+            "require_checks": False,
+            "_source": "main",
+            "_sha256": "p-signer",
+        }
+        pull, app_file, claude_comment, tree_payload, verdict = self._fixtures(base_policy)
+
+        for label, user_response, policy_override in (
+            ("collaborator", {"login": "collaborator"}, {}),
+            ("missing_login", {}, {}),
+            ("empty_login", {"login": "   "}, {}),
+            ("non_dict", None, {}),
+            ("api_error", gate.ApiError(403, "Resource not accessible by integration"), {}),
+            ("no_policy_signer", {"login": "owner"}, {"owner_login": ""}),
+        ):
+            with self.subTest(case=label):
+                calls = []
+                active_policy = {**base_policy, **policy_override}
+
+                def fake_request(method, path, body=None, params=None, allow=()):
+                    calls.append((method, path))
+                    if path == "/repos/o/r/pulls/7":
+                        return pull
+                    if path == "/user":
+                        if isinstance(user_response, Exception):
+                            raise user_response
+                        return user_response
+                    if path == "/repos/o/r/pulls/7/merge":
+                        raise AssertionError("PUT merge must not be issued for invalid verdict signer")
+                    return None
+
+                def fake_paginate(path, params=None):
+                    if path.endswith("/comments"):
+                        return [claude_comment]
+                    return []
+
+                with mock.patch.object(gate, "request", side_effect=fake_request), \
+                     mock.patch.object(gate, "load_policy", return_value=active_policy), \
+                     mock.patch.object(gate, "verify_script", return_value=None), \
+                     mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
+                     mock.patch.object(gate, "shared_head", return_value=False), \
+                     mock.patch.object(gate, "paginate", side_effect=fake_paginate):
+                    with self.assertRaises(gate.Refusal):
+                        gate.merge("o/r", dict(verdict))
+                self.assertFalse(any(m == "PUT" and p.endswith("/merge") for m, p in calls))
+
+        # CLI: --dry-run does not require /user, while non-dry-run refuses collaborator before PUT /merge.
+        cli_calls = []
+
+        def cli_request(method, path, body=None, params=None, allow=()):
+            cli_calls.append((method, path))
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == "/repos/o/r/pulls/7":
+                return pull
+            if path == f"/repos/o/r/git/trees/{self.HEAD}":
+                return tree_payload
+            if path == "/user":
+                return {"login": "collaborator"}
+            if path == "/repos/o/r/pulls/7/merge":
+                raise AssertionError("CLI merge must not execute PUT /merge for collaborator")
+            return None
+
+        def cli_paginate(path, params=None):
+            if path.endswith("/files"):
+                return [app_file]
+            if path.endswith("/comments"):
+                return [claude_comment]
+            return []
+
+        with mock.patch.object(gate, "request", side_effect=cli_request), \
+             mock.patch.object(gate, "load_policy", return_value=base_policy), \
+             mock.patch.object(gate, "verify_script", return_value=None), \
+             mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
+             mock.patch.object(gate, "shared_head", return_value=False), \
+             mock.patch.object(gate, "base_action_files", return_value=set()), \
+             mock.patch.object(gate, "paginate", side_effect=cli_paginate):
+            dry_out = io.StringIO()
+            with mock.patch.object(gate.sys, "argv", ["merge_gate.py", "--repo", "o/r", "--pr", "7", "--dry-run"]), \
+                 contextlib.redirect_stdout(dry_out):
+                self.assertEqual(gate.main(), 0)
+            self.assertFalse(any(p == "/user" for _, p in cli_calls))
+
+            err = io.StringIO()
+            with mock.patch.object(gate.sys, "argv", ["merge_gate.py", "--repo", "o/r", "--pr", "7"]), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                self.assertEqual(gate.main(), 2)
+            self.assertIn("not an audit-accepted verdict signer", err.getvalue())
+            self.assertFalse(any(m == "PUT" and p.endswith("/merge") for m, p in cli_calls))
+
+    def test_merge_and_audit_share_verdict_signers_policy(self):
+        policy = {
+            "owner_login": "owner",
+            "verdict_signers": ["release-bot"],
+            "codex_required": False,
+            "ai_review_providers": ["claude"],
+            "require_checks": False,
+            "audit_since": "",
+            "audit_ignore_prs": [],
+            "_source": "main",
+            "_sha256": "p-signer",
+        }
+        pull, _, claude_comment, _, verdict = self._fixtures(policy)
+
+        for caller_login in ("owner", "release-bot"):
+            with self.subTest(caller=caller_login):
+                posted = []
+
+                def merge_request(method, path, body=None, params=None, allow=()):
+                    if path == "/repos/o/r/pulls/7":
+                        return pull
+                    if path == "/user":
+                        return {"login": caller_login}
+                    if method == "PUT" and path == "/repos/o/r/pulls/7/merge":
+                        return {"merged": True, "sha": self.MERGE}
+                    if method == "POST" and path == "/repos/o/r/issues/7/comments":
+                        posted.append(body["body"])
+                        return {"id": 1}
+                    return None
+
+                with mock.patch.object(gate, "request", side_effect=merge_request), \
+                     mock.patch.object(gate, "load_policy", return_value=policy), \
+                     mock.patch.object(gate, "verify_script", return_value=None), \
+                     mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
+                     mock.patch.object(gate, "shared_head", return_value=False), \
+                     mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: [claude_comment] if p.endswith("/comments") else []):
+                    result = gate.merge("o/r", dict(verdict))
+                self.assertEqual(result["sha"], self.MERGE)
+                self.assertEqual(len(posted), 1)
+
+                merged_pull = {
+                    "number": 7,
+                    "merged_at": "2026-11-14T10:00:00Z",
+                    "base": {"ref": "main"},
+                    "head": {"sha": self.HEAD},
+                    "merge_commit_sha": self.MERGE,
+                }
+                audit_comments = [{"user": {"login": caller_login}, "body": posted[0]}]
+
+                def audit_request(method, path, body=None, params=None, allow=()):
+                    if path == "/repos/o/r":
+                        return {"default_branch": "main"}
+                    if path == "/repos/o/r/pulls":
+                        return [merged_pull] if params and params.get("page") == 1 else []
+                    if path == "/repos/o/r/commits":
+                        return []
+                    return []
+
+                with mock.patch.object(gate, "request", side_effect=audit_request), \
+                     mock.patch.object(gate, "paginate", lambda path, params=None: audit_comments if path.endswith("/comments") else []), \
+                     mock.patch.object(gate, "load_policy", return_value=policy), \
+                     mock.patch.object(gate, "verify_script", return_value=None):
+                    self.assertEqual(gate.audit("o/r", 20, False), 0)
 
 
 if __name__ == "__main__":
