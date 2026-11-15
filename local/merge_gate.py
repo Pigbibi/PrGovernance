@@ -1742,9 +1742,15 @@ def _canonical_commit_files(
     files = commit_detail.get("files")
     commit_tree = _commit_tree_sha(commit_detail)
     parent_tree = _commit_tree_sha(parent_commit) if isinstance(parent_commit, dict) else ""
-    if not isinstance(files, list) or not (0 < len(files) < 300) or not commit_tree:
+    if (
+        commit_detail.get("_files_complete") is not _FILES_COMPLETE_TOKEN
+        or not isinstance(files, list)
+        or not (0 < len(files) <= 3000)
+        or not commit_tree
+    ):
         return None
     normalized: list[tuple[Any, ...]] = []
+    covered_paths: set[str] = set()
     for entry in files:
         if not isinstance(entry, dict):
             return None
@@ -1815,19 +1821,92 @@ def _canonical_commit_files(
             proof = ("patch", patch)
         else:
             return None
+        covered_paths.add(filename)
+        if isinstance(previous, str) and previous:
+            covered_paths.add(previous)
         normalized.append((filename, previous, status, additions, deletions, changes, old_mode, new_mode, proof))
+    parent_map = (
+        {}
+        if parent_commit is None
+        else (_fetch_tree_map(repo, parent_tree, recursive=True, tree_cache=tree_cache) if parent_tree else None)
+    )
+    commit_map = _fetch_tree_map(repo, commit_tree, recursive=True, tree_cache=tree_cache)
+    if isinstance(parent_map, dict) and isinstance(commit_map, dict):
+        for path in set(parent_map) | set(commit_map):
+            p_entry = parent_map.get(path)
+            c_entry = commit_map.get(path)
+            p_file = p_entry if (p_entry and p_entry[0] in ("blob", "commit")) else None
+            c_file = c_entry if (c_entry and c_entry[0] in ("blob", "commit")) else None
+            if p_file != c_file and path not in covered_paths:
+                return None
     normalized.sort()
     return normalized
 
 
+_FILES_COMPLETE_TOKEN = object()
+
+
 def _resolve_commit_detail(repo: str, commit: dict[str, Any]) -> dict[str, Any] | None:
-    if isinstance(commit.get("files"), list):
+    if commit.get("_files_complete") is _FILES_COMPLETE_TOKEN and isinstance(commit.get("files"), list):
         return commit
     sha = commit.get("sha")
     if not isinstance(sha, str) or not sha:
         return None
-    detail = request("GET", f"/repos/{repo}/commits/{sha}", allow=(404,))
-    return detail if isinstance(detail, dict) else None
+    base_detail: dict[str, Any] | None = None
+    all_files: list[dict[str, Any]] = []
+    seen_page_keys: tuple[tuple[str, str, str], ...] | None = None
+    for page in range(1, 31):
+        detail = request(
+            "GET",
+            f"/repos/{repo}/commits/{sha}",
+            params={"per_page": 100, "page": page},
+            allow=(404,),
+        )
+        if not isinstance(detail, dict):
+            return None
+        chunk = detail.get("files")
+        if not isinstance(chunk, list):
+            return None
+        if base_detail is None:
+            base_detail = detail
+        if not chunk:
+            break
+        page_keys: list[tuple[str, str, str]] = []
+        for item in chunk:
+            if not isinstance(item, dict):
+                return None
+            fn = item.get("filename")
+            st = item.get("status")
+            if not isinstance(fn, str) or not fn or not isinstance(st, str) or not st:
+                return None
+            page_keys.append((fn, st, str(item.get("sha") or "")))
+        keys_tuple = tuple(page_keys)
+        if page > 1 and keys_tuple == seen_page_keys:
+            return None
+        seen_page_keys = keys_tuple
+        all_files.extend(chunk)
+        if len(all_files) > 3000:
+            return None
+        if len(chunk) < 30:
+            break
+        if page == 30:
+            return None
+    if base_detail is None:
+        return None
+    stats = base_detail.get("stats")
+    if isinstance(stats, dict) and "total" in stats and stats["total"] is not None:
+        total = stats["total"]
+        if not isinstance(total, int) or isinstance(total, bool):
+            return None
+        total_changes = 0
+        for item in all_files:
+            ch = item.get("changes")
+            if not isinstance(ch, int) or isinstance(ch, bool) or ch < 0:
+                return None
+            total_changes += ch
+        if total != total_changes:
+            return None
+    return {**base_detail, "files": all_files, "_files_complete": _FILES_COMPLETE_TOKEN}
 
 
 def _rebased_chain_content_matches(

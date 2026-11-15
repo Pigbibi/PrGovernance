@@ -1168,6 +1168,85 @@ class DirectPushAuditTests(unittest.TestCase):
             self.assertEqual(len(findings), 1)
             self.assertIn(r1[:7], findings[0])
 
+        # Case 7: multi-page /commits/{sha} file lists and tree-diff omissions fail closed.
+        sample_file = rebased_details[r1]["files"][0]
+        page1_files = [
+            {**sample_file, "filename": f"f{i:02d}.py", "sha": f"{i + 1:040x}"}
+            for i in range(30)
+        ]
+        extra_file = [{**sample_file, "filename": "extra.py", "sha": "f" * 40}]
+        extra_paths = [f"f{i:02d}.py" for i in range(30)] + ["extra.py"]
+        case7_trees = {
+            sha: {
+                "truncated": False,
+                "tree": [
+                    *trees[sha]["tree"],
+                    *[
+                        {
+                            "path": path,
+                            "type": "blob",
+                            "mode": "100644",
+                            "sha": "e" * 40 if sha in (t_r1, t_r2, t_p0, t_p1) else blob_sha,
+                        }
+                        for path in extra_paths
+                    ],
+                ],
+            }
+            for sha in trees
+        }
+
+        def make_paginated_request(*, p0_include_extra, trees_override=case7_trees):
+            def _req(method, path, body=None, params=None, allow=()):
+                page = params.get("page") if isinstance(params, dict) else None
+                if path == f"/repos/o/r/commits/{r1}":
+                    chunk = page1_files if page == 1 else (extra_file if page == 2 else [])
+                    return {**rebased_details[r1], "files": chunk}
+                if path == f"/repos/o/r/commits/{p0}":
+                    if page == 1:
+                        chunk = page1_files
+                    elif page == 2 and p0_include_extra:
+                        chunk = extra_file
+                    else:
+                        chunk = []
+                    return {**rebased_details[p0], "files": chunk}
+                if path.startswith("/repos/o/r/git/trees/"):
+                    return trees_override.get(path.rsplit("/", 1)[-1])
+                return request_case2(method, path, body=body, params=params, allow=allow)
+            return _req
+
+        # 7a: 31st file present on r1 (page 2) but missing on p0 must fail closed.
+        with mock.patch.object(gate, "request", make_paginated_request(p0_include_extra=False)), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: []):
+            findings = gate.scan_direct_pushes(
+                "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+            )
+        self.assertEqual(len(findings), 1)
+        self.assertIn(r1[:7], findings[0])
+
+        # 7a-ok: once page 2 of p0 includes the 31st file too, equivalence holds.
+        with mock.patch.object(gate, "request", make_paginated_request(p0_include_extra=True)), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: []):
+            findings = gate.scan_direct_pushes(
+                "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+            )
+        self.assertEqual(findings, [])
+
+        # 7b: omitted changed blob between t_root and t_r1 must fail closed against tree diff.
+        trees_with_hidden = {
+            **case7_trees,
+            t_r1: {
+                "truncated": False,
+                "tree": [*case7_trees[t_r1]["tree"], {"path": "hidden.py", "type": "blob", "mode": "100644", "sha": "d" * 40}],
+            },
+        }
+        with mock.patch.object(gate, "request", make_paginated_request(p0_include_extra=True, trees_override=trees_with_hidden)), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: []):
+            findings = gate.scan_direct_pushes(
+                "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+            )
+        self.assertEqual(len(findings), 1)
+        self.assertIn(r1[:7], findings[0])
+
     def test_squash_or_divergent_rebase_does_not_exempt_parent_commits(self):
         r1 = "3" * 40
         unrelated = "5" * 40
