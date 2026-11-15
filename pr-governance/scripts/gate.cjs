@@ -10,11 +10,16 @@ const SCHEMA = 'pr-governance/v3';
 const MODES = ['enforce', 'local', 'report-only'];
 const POLICY_FIELDS = ['version', 'mode', 'reviewer', 'r0_paths', 'r2_paths',
   'dependabot_template_exemption', 'max_evidence_age_hours'];
-const POLICY_OPTIONAL_FIELDS = ['owner'];
+const POLICY_OPTIONAL_FIELDS = ['owner', 'reviewers', 'review_routing'];
 const REVIEWER_FIELDS = ['provider', 'app_id', 'user_id', 'login'];
 const OWNER_FIELDS = ['user_id', 'login'];
-const PROVIDERS = ['codex'];
-const MARKER_NAMES = ['codex-review-receipt:v1', 'codex-review-state:v1'];
+const PROVIDERS = ['claude', 'codex', 'cursor'];
+const MARKER_NAMES = [
+  'ai-review-receipt:v1',
+  'codex-review-receipt:v1',
+  'codex-review-state:v1',
+];
+const ROUTING_FIELDS = ['dispatch_mentions'];
 const COMPLETE_COVERAGE = ['complete', 'completed', 'full', 'reported_complete', 'all'];
 const DEPENDABOT = 'dependabot[bot]';
 const CLEARING_LABELS = ['owner-approved', 'agent-approved'];
@@ -117,16 +122,40 @@ function sameKeys(object, expected, label, optional = []) {
 
 const isPositiveId = value => Number.isSafeInteger(value) && value > 0;
 
+function validateReviewer(reviewer, label) {
+  sameKeys(reviewer, REVIEWER_FIELDS, label);
+  assert(PROVIDERS.includes(reviewer.provider), `Unsupported reviewer provider: ${String(reviewer.provider)}`);
+  assert(isPositiveId(reviewer.app_id), `Invalid ${label} app id`);
+  assert(isPositiveId(reviewer.user_id), `Invalid ${label} user id`);
+  assert(typeof reviewer.login === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]*\[bot\]$/.test(reviewer.login),
+    `Invalid ${label} login`);
+}
+
+const sameReviewer = (left, right) => left.provider === right.provider
+  && left.app_id === right.app_id
+  && left.user_id === right.user_id
+  && normalizeLogin(left.login) === normalizeLogin(right.login);
+
+function reviewerChain(policy) {
+  const chain = Array.isArray(policy.reviewers) && policy.reviewers.length
+    ? policy.reviewers
+    : [policy.reviewer];
+  for (const entry of chain) validateReviewer(entry, 'reviewer');
+  assert(sameReviewer(chain[0], policy.reviewer), 'reviewer must match reviewers[0]');
+  const ids = new Set();
+  for (const entry of chain) {
+    assert(!ids.has(entry.user_id), 'Duplicate reviewer user id in reviewers');
+    ids.add(entry.user_id);
+  }
+  return chain;
+}
+
 function validatePolicy(policy) {
   sameKeys(policy, POLICY_FIELDS, 'policy', POLICY_OPTIONAL_FIELDS);
   assert(policy.version === SCHEMA, `Unsupported policy version: ${String(policy.version)}`);
   assert(MODES.includes(policy.mode), `Unsupported policy mode: ${String(policy.mode)}`);
-  sameKeys(policy.reviewer, REVIEWER_FIELDS, 'reviewer');
-  assert(PROVIDERS.includes(policy.reviewer.provider), `Unsupported reviewer provider: ${String(policy.reviewer.provider)}`);
-  assert(isPositiveId(policy.reviewer.app_id), 'Invalid reviewer app id');
-  assert(isPositiveId(policy.reviewer.user_id), 'Invalid reviewer user id');
-  assert(typeof policy.reviewer.login === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]*\[bot\]$/.test(policy.reviewer.login),
-    'Invalid reviewer login');
+  validateReviewer(policy.reviewer, 'reviewer');
+  if (policy.reviewers !== undefined) reviewerChain(policy);
   // The owner comes from protected repository variables, so the committed
   // policy may leave it out. When it is present, it must be well formed.
   if (policy.owner !== undefined) {
@@ -147,6 +176,14 @@ function validatePolicy(policy) {
   assert(typeof policy.dependabot_template_exemption === 'boolean', 'Invalid dependabot_template_exemption');
   assert(typeof policy.max_evidence_age_hours === 'number' && policy.max_evidence_age_hours >= 1
     && policy.max_evidence_age_hours <= 720, 'Invalid max_evidence_age_hours');
+  if (policy.review_routing !== undefined) {
+    sameKeys(policy.review_routing, ROUTING_FIELDS, 'review_routing');
+    const mentions = policy.review_routing.dispatch_mentions;
+    assert(Array.isArray(mentions) && mentions.length > 0, 'Invalid dispatch_mentions');
+    for (const mention of mentions) {
+      assert(typeof mention === 'string' && mention.length > 0, 'Invalid dispatch mention');
+    }
+  }
   return policy;
 }
 
@@ -331,16 +368,22 @@ const REVIEW_TEXT = {
 };
 
 function normalizeMarker(format, payload) {
-  const review = format === 'codex-review-receipt:v1' ? payload?.review : payload?.code_review;
+  const receipt = format === 'ai-review-receipt:v1' || format === 'codex-review-receipt:v1';
+  const review = receipt ? payload?.review : payload?.code_review;
   if (!review || typeof review !== 'object' || Array.isArray(review)) return null;
   if (typeof review.commit_sha !== 'string') return null;
-  if (format === 'codex-review-receipt:v1') {
+  if (receipt) {
     const unresolved = review.unresolved_findings;
     let flagged = null;
     if (typeof unresolved === 'boolean') flagged = unresolved;
     else if (Number.isSafeInteger(unresolved) && unresolved >= 0) flagged = unresolved > 0;
     const coverage = typeof review.coverage === 'string' ? review.coverage.trim().toLowerCase() : '';
-    return { commit_sha: review.commit_sha, status: 'completed', unresolved: flagged,
+    // Legacy codex-review-receipt:v1 often omits status and means completed; an
+    // explicit non-completed status must stay pending/running instead of passing.
+    const status = typeof review.status === 'string' && review.status
+      ? review.status
+      : 'completed';
+    return { commit_sha: review.commit_sha, status, unresolved: flagged,
       coverage: COMPLETE_COVERAGE.includes(coverage) ? 'complete' : 'partial', coverage_raw: coverage || null };
   }
   const unresolved = review.has_unresolved_findings;
@@ -353,12 +396,18 @@ function normalizeMarker(format, payload) {
   };
 }
 
+function matchesAnyReviewer(user, chain) {
+  return chain.some(reviewer => matchesReviewer(user, reviewer));
+}
+
 function reviewerEvidence(snapshot, policy, now) {
-  const reviewer = policy.reviewer;
-  const empty = { provider: reviewer.provider, state: 'pending', reason: 'review_pending', comment_id: null,
+  const chain = reviewerChain(policy);
+  const primary = chain[0];
+  const empty = { provider: primary.provider, state: 'pending', reason: 'review_pending', comment_id: null,
     format: null, commit_sha: null, coverage: null, unresolved: null };
   const candidates = (snapshot.comments || [])
-    .filter(comment => matchesReviewer(comment.user, reviewer) && typeof comment.body === 'string' && carriesMarker(comment.body))
+    .filter(comment => matchesAnyReviewer(comment.user, chain) && typeof comment.body === 'string'
+      && carriesMarker(comment.body))
     .map(comment => {
       assert(Number.isSafeInteger(comment.id) && comment.id > 0, 'Unknown comment metadata');
       return { comment, stamp: Date.parse(comment.updated_at) };
@@ -382,8 +431,9 @@ function reviewerEvidence(snapshot, policy, now) {
   }
   const evidence = normalizeMarker(found[0].name, parsed);
   if (!evidence) return { ...bound, state: 'failure', reason: 'review_malformed' };
-  Object.assign(bound, { format: found[0].name, commit_sha: evidence.commit_sha,
-    coverage: evidence.coverage, unresolved: evidence.unresolved });
+  const matched = chain.find(reviewer => matchesReviewer(comment.user, reviewer));
+  Object.assign(bound, { provider: matched?.provider ?? primary.provider, format: found[0].name,
+    commit_sha: evidence.commit_sha, coverage: evidence.coverage, unresolved: evidence.unresolved });
   if (evidence.status !== 'completed') return { ...bound, state: 'pending', reason: 'review_running' };
   if (evidence.commit_sha !== snapshot.pr.head.sha) return { ...bound, state: 'failure', reason: 'review_stale' };
   if (evidence.unresolved === true) return { ...bound, state: 'failure', reason: 'review_findings' };
@@ -396,8 +446,9 @@ function reviewerEvidence(snapshot, policy, now) {
 }
 
 function unresolvedReviewerThreads(snapshot, policy) {
+  const chain = reviewerChain(policy);
   return (snapshot.threads || [])
-    .filter(thread => thread.isResolved !== true && matchesThreadAuthor(thread.author, policy.reviewer))
+    .filter(thread => thread.isResolved !== true && chain.some(reviewer => matchesThreadAuthor(thread.author, reviewer)))
     .map(thread => thread.id)
     .sort();
 }
@@ -563,7 +614,7 @@ function completeTemplate(body) {
 module.exports = {
   SCHEMA, MODES, CLEARING_LABELS, MARKER_NAMES, REVIEW_TEXT,
   sha256Hex, canonical, digest, isSha,
-  validatePolicy, pathTier, completePatch, classify, completeTemplate, binding,
-  stableComment, stableThread, matchesReviewer, matchesThreadAuthor, normalizeLogin,
+  validatePolicy, reviewerChain, validateReviewer, pathTier, completePatch, classify, completeTemplate, binding,
+  stableComment, stableThread, matchesReviewer, matchesAnyReviewer, matchesThreadAuthor, normalizeLogin,
   reviewerEvidence, dependabotEvidence, labelEvidence, templateVerdict, evaluate,
 };

@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const gate = require('./gate.cjs');
 const {
-  fixture, receiptMarker, stateMarker, thread, labelEvent, clearRecord,
+  fixture, receiptMarker, stateMarker, thread, labelEvent, clearRecord, rawComment,
   HEAD, BASE, POLICY_SHA, NOW, COMPLETE_TEMPLATE,
 } = require('./fixtures.cjs');
 
@@ -31,6 +31,8 @@ test('the shipped default policy validates', () => {
   assert.equal(shipped.version, 'pr-governance/v3');
   assert.equal(shipped.mode, 'enforce');
   assert.equal(shipped.reviewer.provider, 'codex');
+  assert.equal(shipped.reviewers, undefined);
+  assert.equal(shipped.review_routing.dispatch_mentions[0], '@codex review');
 });
 
 test('the owner is optional and resolved from protected variables', () => {
@@ -47,7 +49,7 @@ test('the schema file lists exactly the fields the evaluator enforces', () => {
   const declared = Object.keys(schema.properties).sort();
   const validated = ['version', 'mode', 'reviewer', 'r0_paths', 'r2_paths',
     'dependabot_template_exemption', 'max_evidence_age_hours'].sort();
-  assert.deepEqual(declared, [...validated, 'owner'].sort());
+  assert.deepEqual(declared, [...validated, 'owner', 'reviewers', 'review_routing'].sort());
   assert.deepEqual([...schema.required].sort(), validated);
   assert.deepEqual([...schema.properties.mode.enum].sort(), ['enforce', 'local', 'report-only']);
   assert.deepEqual(schema.properties.reviewer.required.sort(), ['app_id', 'login', 'provider', 'user_id']);
@@ -383,4 +385,42 @@ test('the mode is carried into the result without changing the verdict', () => {
     assert.equal(evaluate(f).mode, mode);
     assert.equal(evaluate(f).allowed, true);
   }
+});
+
+test('a fallback claude receipt satisfies ai-review when configured', () => {
+  const f = fixture();
+  const claude = { provider: 'claude', app_id: 1236702, user_id: 209825114, login: 'claude[bot]' };
+  f.policy.reviewers = [f.policy.reviewer, claude];
+  rawComment(f, `<!-- codex-review-state:v1 ${JSON.stringify({
+    code_review: { commit_sha: HEAD, status: 'completed', has_unresolved_findings: false },
+    security_review: {},
+  })} -->`, { user: { id: claude.user_id, login: claude.login, type: 'Bot' } });
+  const result = evaluate(f);
+  assert.equal(result.review.state, 'success');
+  assert.equal(result.review.provider, 'claude');
+});
+
+
+test('an in-progress ai-review-receipt stays pending', () => {
+  const f = fixture();
+  const cursor = { provider: 'cursor', app_id: 1210556, user_id: 206951365, login: 'cursor[bot]' };
+  f.policy.reviewers = [f.policy.reviewer, cursor];
+  rawComment(f, `<!-- ai-review-receipt:v1 ${JSON.stringify({
+    review: { provider: 'cursor', commit_sha: HEAD, coverage: 'complete', unresolved_findings: false, status: 'in_progress' },
+  })} -->`, { user: { id: cursor.user_id, login: cursor.login, type: 'Bot' } });
+  const result = evaluate(f);
+  assert.equal(result.review.state, 'pending');
+  assert.equal(result.review.reason, 'review_running');
+});
+
+test('ai-review-receipt is accepted from any configured reviewer', () => {
+  const f = fixture();
+  const cursor = { provider: 'cursor', app_id: 1210556, user_id: 206951365, login: 'cursor[bot]' };
+  f.policy.reviewers = [f.policy.reviewer, cursor];
+  rawComment(f, `<!-- ai-review-receipt:v1 ${JSON.stringify({
+    review: { provider: 'cursor', commit_sha: HEAD, coverage: 'complete', unresolved_findings: false },
+  })} -->`, { user: { id: cursor.user_id, login: cursor.login, type: 'Bot' } });
+  const result = evaluate(f);
+  assert.equal(result.review.state, 'success');
+  assert.equal(result.review.provider, 'cursor');
 });

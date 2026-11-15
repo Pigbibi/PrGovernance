@@ -1,8 +1,9 @@
 # Organization PR governance
 
 One action and four caller workflows shared by every public repository in the
-organization. The reviewer is Codex; the coding agent may be anything. No
-workflow identifies or depends on the agent that wrote a pull request.
+organization. AI review accepts receipts from **Codex → Claude → Cursor** (in
+dispatch order); the coding agent may be anything. No workflow identifies or
+depends on the agent that wrote a pull request.
 
 ## What is enforced
 
@@ -10,9 +11,10 @@ A pull request may merge when all of these hold:
 
 - `pr-template` — the body fills the AI assistance, what changed and how
   verified sections.
-- `ai-review` — the newest Codex receipt names the current head, reports a
-  completed review, has no unresolved finding, and the head contains the
-  current base head.
+- `ai-review` — the newest receipt from a configured reviewer bot names the
+  current head, reports a completed review, has no unresolved finding, and the
+  head contains the current base head. Supported markers:
+  `ai-review-receipt:v1`, `codex-review-receipt:v1`, `codex-review-state:v1`.
 - `risk-gate` — the resolved risk tier allows the path. Low risk passes on the
   reviewer receipt. High risk also needs one clearing label that was recorded
   on this exact head.
@@ -71,15 +73,18 @@ organization community-health files.
    variables and replaces `owner` when they are set. A repository whose content
    rules keep accounts out of public source may also leave `reviewer` out and
    set `RISK_GATE_REVIEWER_APP_ID`, `RISK_GATE_REVIEWER_USER_ID` and
-   `RISK_GATE_REVIEWER_LOGIN` instead; a partial set fails closed.
+   `RISK_GATE_REVIEWER_LOGIN` instead; or set organization variable
+   `GOVERNANCE_REVIEWERS_JSON` to the full ordered chain (see
+   `reviewers.example.json`). A partial set fails closed.
 2. Copy `templates/risk-gate.yml`, `templates/codex-nudge.yml`,
    `templates/gitleaks.yml` and `templates/weekly-secret-scan.yml` into
-   `.github/workflows/`, replacing `__GOVERNANCE_REPO__` with the
-   `owner/repository` of this governance repository and `__GOVERNANCE_SHA__`
-   with the full commit SHA at the head of `v1`. Copy
-   `templates/pr-review-signal.yml` unchanged as well: review events on fork
-   and Dependabot pull requests get a read-only token, so the gate is started
-   by that workflow's completion instead.
+   `.github/workflows/`, replacing `__GOVERNANCE_REPO__` with
+   `Pigbibi/PrGovernance` and `__GOVERNANCE_SHA__` with the full 40-character
+   commit SHA from `Pigbibi/PrGovernance` `main`. Keep `codex-nudge.yml`'s
+   `pull-requests: write` and `issues: write`: posting the review request
+   comment on a pull request needs both. Copy `templates/pr-review-signal.yml`
+   unchanged as well: review events on fork and Dependabot pull requests get a
+   read-only token, so the gate is started by that workflow's completion instead.
 3. Add the required contexts to branch protection on the default branch:
    `pr-template`, `ai-review`, `risk-gate`, `Gitleaks`, and the repository's
    own checks. Keep `strict` (require branches to be up to date) and
@@ -95,8 +100,9 @@ reviewer follows the same rule through the `RISK_GATE_REVIEWER_*` variables.
 ## Trust model
 
 - Workflows never check out or execute pull request code.
-- The action is pinned to a full commit SHA of this repository, not by the
-  repository under judgement. Update the pins after `v1` moves.
+- The action is pinned to a full commit SHA of `Pigbibi/PrGovernance`, not
+  selected by the pull request under review. Update downstream SHA pins after
+  changes merge to `main`.
 - The policy is read from the default branch head, so a pull request cannot
   change the rules that judge it.
 - Reviewer evidence is a marker comment written by the configured reviewer
@@ -135,23 +141,14 @@ action: the consumer must first adopt the reviewed fixed action revision.
 
 ## Changing the shared action
 
-Open a pull request against `v1`. The `test` check must pass. Merging changes
-the behavior of every consumer at its next run, so the digest of the policy is
-part of every receipt: a policy change invalidates older receipts and asks for
-a fresh review instead of silently reusing one.
+Open a pull request against `main` in `Pigbibi/PrGovernance`. All CI tests must
+pass before merging. Merging updates the canonical action; downstream
+repositories adopt changes explicitly by bumping their pinned SHA.
 
 ## Private repositories
 
 GitHub Free does not provide branch protection or secret scanning for private
 repositories, and hosted Actions may be billing-blocked. Private repositories
-use a local enforcement track instead: Git hooks that reject staged credentials,
-unconventional commit headers, direct pushes to a protected branch, and
-non-fast-forward pushes, plus an audit over the tracked tree.
-
-
-## Twin repositories
-
-`pr-governance/` is byte-identical in `Pigbibi/PrGovernance`, `GdeiAssistant/.github`
-and `QuantStrategyLab/.github`; `VERSION` names the shared revision. Each
-repository runs `scripts/check-twin-drift.sh` weekly and on demand. A change to
-any shared file is applied to all three before the drift check can pass.
+use the local enforcement track instead: Git hooks that reject staged
+credentials, unconventional commit headers, direct pushes to a protected branch,
+and non-fast-forward pushes, plus an audit over the tracked tree.

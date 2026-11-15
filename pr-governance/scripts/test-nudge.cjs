@@ -3,8 +3,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { run, marker } = require('./nudge.cjs');
+const defaults = require('../policy.default.json');
 
 const HEAD = 'a'.repeat(40);
+const codex = defaults.reviewer;
 const OLD = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 const core = { info() {} };
 
@@ -46,7 +48,7 @@ test('does not repeat the request for the same head', async () => {
 test('does not request a review twice when a receipt exists', async () => {
   const h = harness({
     comments: [{
-      user: { login: 'chatgpt-codex-connector[bot]' },
+      user: { id: codex.user_id, login: codex.login },
       body: `<!-- codex-review-state:v1 {"code_review":{"status":"completed","commit_sha":"${HEAD}"}} -->`,
     }],
   });
@@ -56,7 +58,10 @@ test('does not request a review twice when a receipt exists', async () => {
 
 test('accepts the legacy receipt marker', async () => {
   const h = harness({
-    comments: [{ user: { login: 'chatgpt-codex-connector' }, body: `codex-review-receipt:v1 ${HEAD}` }],
+    comments: [{
+      user: { id: codex.user_id, login: 'chatgpt-codex-connector' },
+      body: `<!-- codex-review-receipt:v1 {"review":{"commit_sha":"${HEAD}","coverage":"complete","unresolved_findings":false}} -->`,
+    }],
   });
   await run({ ...h, core });
   assert.equal(h.posted.length, 0);
@@ -74,4 +79,18 @@ test('skips drafts and closed pull requests', async () => {
     await run({ ...h, core });
     assert.equal(h.posted.length, 0);
   }
+});
+
+test('reports a clear error when commenting is forbidden', async () => {
+  const h = harness();
+  h.github.rest.issues.createComment = async () => {
+    const err = new Error('Resource not accessible by integration');
+    err.status = 403;
+    throw err;
+  };
+  await assert.rejects(
+    () => run({ ...h, core }),
+    /pull-requests: write/
+  );
+  assert.equal(h.posted.length, 0);
 });

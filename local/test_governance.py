@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -945,6 +946,170 @@ class RepositoryTests(unittest.TestCase):
         result = self.cli("install")
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing file commit-msg", result.stderr)
+
+    def test_install_without_include_merge_gate_skips_repo_files(self):
+        local_dir = Path(__file__).resolve().parent
+        result = self.cli("install", "--source", str(local_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        configured = Path(run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip())
+        for src_name, _ in governance.MERGE_GATE_FILES:
+            self.assertFalse((configured / src_name).exists(), src_name)
+        self.assertFalse((Path(self.root) / "governance").exists())
+        self.assertFalse((Path(self.root) / "scripts").exists())
+
+    def test_install_with_include_merge_gate_installs_outside_worktree(self):
+        local_dir = Path(__file__).resolve().parent
+        result = self.cli("install", "--source", str(local_dir), "--include-merge-gate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        configured = Path(run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip())
+        self.assertTrue((configured / "governance.py").is_file())
+        for src_name, _dest_rel in governance.MERGE_GATE_FILES:
+            dest = configured / src_name
+            self.assertTrue(dest.is_file(), src_name)
+            self.assertEqual(dest.read_bytes(), (local_dir / src_name).read_bytes(), src_name)
+        # Never modify or create tracked worktree files during install.
+        self.assertFalse((Path(self.root) / "governance").exists())
+        self.assertFalse((Path(self.root) / "scripts").exists())
+        # Verify the installed test_merge_gate.py discovers sibling merge_gate.py cleanly.
+        test_run = run(sys.executable, "-m", "unittest", "discover",
+                       "-s", str(configured), "-p", "test_merge_gate.py")
+        self.assertEqual(test_run.returncode, 0, test_run.stderr)
+        verified = self.cli("verify", "--source", str(local_dir), "--include-merge-gate")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+        # Tampering with .git/governance/merge_gate.py is caught by verify.
+        (configured / "merge_gate.py").write_text("# tampered\n")
+        tampered = self.cli("verify", "--source", str(local_dir), "--include-merge-gate")
+        self.assertEqual(tampered.returncode, 1)
+        self.assertIn("merge_gate.py", tampered.stderr)
+        self.assertIn("differs from", tampered.stderr)
+
+    def test_install_with_include_merge_gate_refuses_incomplete_source(self):
+        with tempfile.TemporaryDirectory() as trusted:
+            for name in governance.HOOK_FILES:
+                (Path(trusted) / name).write_text("#!/bin/sh\n")
+            result = self.cli("install", "--source", trusted, "--include-merge-gate")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("missing file merge_gate.py", result.stderr)
+            self.assertFalse((Path(self.root) / ".git" / "governance").exists())
+            self.assertFalse((Path(self.root) / "governance").exists())
+
+    def test_install_with_include_merge_gate_refuses_symlink_destination(self):
+        local_dir = Path(__file__).resolve().parent
+        outside = self.write("outside.py", "# target\n")
+        dest = Path(self.root) / ".git" / "governance" / "merge_gate.py"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.symlink_to(outside)
+        result = self.cli("install", "--source", str(local_dir), "--include-merge-gate")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not a regular file", result.stderr)
+        self.assertFalse((Path(self.root) / ".git" / "governance" / "governance.py").exists())
+        self.assertFalse((Path(self.root) / "governance").exists())
+
+    def test_vendor_copies_canonical_merge_gate_files_and_refuses_symlinks(self):
+        local_dir = Path(__file__).resolve().parent
+        outside = self.write("outside.py", "# target\n")
+        symlink_dest = Path(self.root) / "governance" / "merge_gate.py"
+        symlink_dest.parent.mkdir(parents=True, exist_ok=True)
+        symlink_dest.symlink_to(outside)
+        refused = self.cli("vendor", "--source", str(local_dir))
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("not a regular file", refused.stderr)
+        self.assertFalse((Path(self.root) / "scripts").exists())
+
+        symlink_dest.unlink()
+        result = self.cli("vendor", "--source", str(local_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for src_name, dest_rel in governance.MERGE_GATE_FILES:
+            dest = Path(self.root) / dest_rel
+            self.assertTrue(dest.is_file(), dest_rel)
+            self.assertEqual(dest.read_bytes(), (local_dir / src_name).read_bytes(), dest_rel)
+        self.assertFalse((Path(self.root) / ".git" / "governance").exists())
+        test_run = run(sys.executable, "-m", "unittest", "discover",
+                       "-s", str(Path(self.root) / "governance" / "tests"), "-p", "test_*.py")
+        self.assertEqual(test_run.returncode, 0, test_run.stderr)
+
+    def test_verify_detects_installed_vs_vendored_merge_gate_drift(self):
+        local_dir = self._seed_canonical_repo()
+        githooks_dir = Path(self.root) / ".githooks"
+        for name in governance.HOOK_FILES:
+            (githooks_dir / name).write_bytes((local_dir / name).read_bytes())
+        result = self.cli("install", "--source", str(local_dir), "--include-merge-gate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(governance.verify(self.root), [])
+
+        configured = Path(run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip())
+        (configured / "merge_gate.py").write_bytes((local_dir / "merge_gate.py").read_bytes() + b"\n# drift\n")
+        problems = governance.verify(self.root)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("merge_gate.py", problems[0])
+        self.assertIn("differs from", problems[0])
+
+    def _seed_canonical_repo(self):
+        local_dir = Path(__file__).resolve().parent
+        githooks_gov = Path(self.root) / ".githooks" / "governance.py"
+        githooks_gov.parent.mkdir(parents=True, exist_ok=True)
+        githooks_gov.write_bytes((local_dir / "governance.py").read_bytes())
+        result = self.cli("vendor", "--source", str(local_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return local_dir
+
+    def test_check_drift_passes_when_all_files_match(self):
+        local_dir = self._seed_canonical_repo()
+        result = self.cli("check-drift", "--source", str(local_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+
+    def test_check_drift_reports_modified_file_with_sha_and_diff(self):
+        local_dir = self._seed_canonical_repo()
+        for _src_name, dest_rel in governance.DRIFT_FILES:
+            with self.subTest(dest_rel=dest_rel):
+                target = Path(self.root) / dest_rel
+                original = target.read_bytes()
+                try:
+                    target.write_bytes(original + b"\n# drifted line\n")
+                    result = self.cli("check-drift", "--source", str(local_dir))
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(dest_rel, result.stderr)
+                    self.assertIn("sha256", result.stderr)
+                    self.assertIn("+# drifted line", result.stderr)
+                finally:
+                    target.write_bytes(original)
+
+    def test_check_drift_reports_missing_and_symlinked_files(self):
+        local_dir = self._seed_canonical_repo()
+        hygiene = Path(self.root) / "scripts" / "check_hygiene.py"
+        hygiene.unlink()
+        missing = self.cli("check-drift", "--source", str(local_dir))
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("scripts/check_hygiene.py", missing.stderr)
+
+        hygiene.symlink_to(local_dir / "check_hygiene.py")
+        symlinked = self.cli("check-drift", "--source", str(local_dir))
+        self.assertEqual(symlinked.returncode, 1)
+        self.assertIn("scripts/check_hygiene.py", symlinked.stderr)
+
+    def test_check_drift_reports_symlinked_ancestor_directory(self):
+        local_dir = self._seed_canonical_repo()
+        gov_dir = Path(self.root) / "governance"
+        external_dir = Path(self.root).parent / "external-governance"
+        (external_dir / "tests").mkdir(parents=True, exist_ok=True)
+        (external_dir / "merge_gate.py").write_text((gov_dir / "merge_gate.py").read_text())
+        (external_dir / "tests" / "test_merge_gate.py").write_text(
+            (gov_dir / "tests" / "test_merge_gate.py").read_text()
+        )
+        shutil.rmtree(gov_dir)
+        gov_dir.symlink_to(external_dir)
+
+        result = self.cli("check-drift", "--source", str(local_dir))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("governance/merge_gate.py", result.stderr)
+        self.assertIn("not a regular directory", result.stderr)
+
+    def test_check_drift_reports_missing_source_directory(self):
+        result = self.cli("check-drift", "--source", str(Path(self.root) / "no-such-dir"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("source directory does not exist", result.stderr)
 
 
 if __name__ == "__main__":

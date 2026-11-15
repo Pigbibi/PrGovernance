@@ -50,6 +50,12 @@ regexTarget = "secret"
 paths = ['''^tests/''']
 regexes = ['''(?i)^(?:test|fake|dummy|example)[_.-][a-z0-9_.-]+$''']
 
+[[rules.allowlists]]
+description = "i18n message catalogs only: keys may use token/password wording for UX copy, not credentials"
+paths = [
+  '''(?:^|/)src/(?:main|test)/resources/i18n/''',
+]
+
 [[allowlists]]
 description = "Explicit placeholder values, never a blanket source-path exclusion"
 regexTarget = "secret"
