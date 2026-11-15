@@ -1,0 +1,34 @@
+name: Bug report
+description: Report unexpected behavior in pr-governance or local hook enforcement
+title: "[Bug]: "
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: Concise summary of the observable behavior and expected verdict.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: Minimal workflow configuration, fixture, or CLI command that reproduces the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Runner OS, Node/Python version, and commit SHA pinned.
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed credentials, tokens, and real account identifiers.
+          required: true
+        - label: This is not a security vulnerability (see SECURITY.md).
+          required: true

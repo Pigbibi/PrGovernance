@@ -1,2 +1,33 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# AI assistant / agent local state
+.claude/
+.codex/
+.cursor/
+.cursorrules
+.worktrees/
+worktrees/
+
+# Keep AI rule entrypoints tracked even when global gitignore excludes Markdown
+!AGENTS.md
+!CLAUDE.md
+
+# Local working notes & internal process records (never commit)
+.local/
+ops-notes/
+*.local.md
+*.internal.md
+*[Aa][Uu][Dd][Ii][Tt]*.md
+*[Hh][Aa][Nn][Dd][Oo][Ff][Ff]*.md
+*-[Rr][Ee][Vv][Ii][Ee][Ww]-*.md
+*_[Rr][Ee][Vv][Ii][Ee][Ww]_*.md
+docs/audits/
+docs/plans/
+docs/handoffs/
+docs/superpowers/
+docs/changes/
+docs/acceptance-policy.md
