@@ -78,9 +78,9 @@ organization community-health files.
    `reviewers.example.json`). A partial set fails closed.
 2. Copy `templates/risk-gate.yml`, `templates/codex-nudge.yml`,
    `templates/gitleaks.yml` and `templates/weekly-secret-scan.yml` into
-   `.github/workflows/`, replacing `__GOVERNANCE_REPO__` with the
-   `owner/repository` of this governance repository and `__GOVERNANCE_SHA__`
-   with the full commit SHA at the head of `v1`. Keep `codex-nudge.yml`'s
+   `.github/workflows/`, replacing `__GOVERNANCE_REPO__` with
+   `Pigbibi/PrGovernance` and `__GOVERNANCE_SHA__` with the full 40-character
+   commit SHA from `Pigbibi/PrGovernance` `main`. Keep `codex-nudge.yml`'s
    `pull-requests: write` and `issues: write`: posting the review request
    comment on a pull request needs both. Copy `templates/pr-review-signal.yml`
    unchanged as well: review events on fork and Dependabot pull requests get a
@@ -100,8 +100,9 @@ reviewer follows the same rule through the `RISK_GATE_REVIEWER_*` variables.
 ## Trust model
 
 - Workflows never check out or execute pull request code.
-- The action is pinned to a full commit SHA of this repository, not by the
-  repository under judgement. Update the pins after `v1` moves.
+- The action is pinned to a full commit SHA of `Pigbibi/PrGovernance`, not
+  selected by the pull request under review. Update downstream SHA pins after
+  changes merge to `main`.
 - The policy is read from the default branch head, so a pull request cannot
   change the rules that judge it.
 - Reviewer evidence is a marker comment written by the configured reviewer
@@ -140,23 +141,14 @@ action: the consumer must first adopt the reviewed fixed action revision.
 
 ## Changing the shared action
 
-Open a pull request against `v1`. The `test` check must pass. Merging changes
-the behavior of every consumer at its next run, so the digest of the policy is
-part of every receipt: a policy change invalidates older receipts and asks for
-a fresh review instead of silently reusing one.
+Open a pull request against `main` in `Pigbibi/PrGovernance`. All CI tests must
+pass before merging. Merging updates the canonical action; downstream
+repositories adopt changes explicitly by bumping their pinned SHA.
 
 ## Private repositories
 
 GitHub Free does not provide branch protection or secret scanning for private
 repositories, and hosted Actions may be billing-blocked. Private repositories
-use a local enforcement track instead: Git hooks that reject staged credentials,
-unconventional commit headers, direct pushes to a protected branch, and
-non-fast-forward pushes, plus an audit over the tracked tree.
-
-
-## Twin repositories
-
-`pr-governance/` is byte-identical in `Pigbibi/PrGovernance`, `GdeiAssistant/.github`
-and `QuantStrategyLab/.github`; `VERSION` names the shared revision. Each
-repository runs `scripts/check-twin-drift.sh` weekly and on demand. A change to
-any shared file is applied to all three before the drift check can pass.
+use the local enforcement track instead: Git hooks that reject staged
+credentials, unconventional commit headers, direct pushes to a protected branch,
+and non-fast-forward pushes, plus an audit over the tracked tree.
