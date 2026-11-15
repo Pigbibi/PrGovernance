@@ -170,6 +170,24 @@ class TierTests(unittest.TestCase):
         allowed = {".github/workflows/unit-tests.yml"}
         self.assertEqual(gate.classify(files, True, allowed, ()), ("T1", True))
 
+    def test_extra_protected_paths_match_mixed_case_and_normalized_paths_consistently(self):
+        extra = ("src/PaymentService/", "docs/RestrictedNote.md", "")
+        for name in (
+            "src/PaymentService/reader.py",
+            "src/payment_service/reader.py",
+            "docs/RestrictedNote.md",
+        ):
+            with self.subTest(protected=name):
+                self.assertTrue(gate.is_protected(name, extra))
+                self.assertEqual(gate.classify([changed(name)], False, set(), extra), ("T2", False))
+        for name, expected_tier in (
+            ("src/PaymentServiceExtra/reader.py", "T1"),
+            ("docs/public.md", "T0"),
+        ):
+            with self.subTest(unprotected=name):
+                self.assertFalse(gate.is_protected(name, extra))
+                self.assertEqual(gate.classify([changed(name)], False, set(), extra), (expected_tier, False))
+
 
 class SecretTests(unittest.TestCase):
     def test_high_signal_keys_are_found(self):
@@ -1491,6 +1509,76 @@ class AiReviewReceiptTests(unittest.TestCase):
                 state_with_cursor, _ = self.verdict([ambiguous, cursor_good])
                 self.assertEqual(state_with_cursor, "failure")
 
+    def test_delayed_stale_receipt_does_not_replace_current_head_finding(self):
+        codex_head_bad = self.comment(
+            "chatgpt-codex-connector[bot]",
+            "codex-review-state:v1",
+            {
+                "code_review": {
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "has_unresolved_findings": True,
+                }
+            },
+            updated_at="2026-11-14T08:00:00Z",
+        )
+        claude_head_good = self.comment(
+            "claude[bot]",
+            "ai-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+            updated_at="2026-11-14T09:00:00Z",
+        )
+        codex_delayed_stale_clean = self.comment(
+            "chatgpt-codex-connector[bot]",
+            "codex-review-state:v1",
+            {
+                "code_review": {
+                    "commit_sha": "e" * 40,
+                    "status": "completed",
+                    "has_unresolved_findings": False,
+                }
+            },
+            updated_at="2026-11-14T10:00:00Z",
+        )
+        with mock.patch.object(
+            gate, "paginate", return_value=[codex_head_bad, claude_head_good, codex_delayed_stale_clean]
+        ):
+            state, note = gate.ai_review_verdict(
+                "o/r", 7, self.HEAD, allowed_providers={"codex", "claude"}
+            )
+        self.assertEqual(state, "failure")
+        self.assertIn("unresolved findings", note)
+
+        codex_head_resolved = self.comment(
+            "chatgpt-codex-connector[bot]",
+            "codex-review-state:v1",
+            {
+                "code_review": {
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "has_unresolved_findings": False,
+                }
+            },
+            updated_at="2026-11-14T11:00:00Z",
+        )
+        with mock.patch.object(
+            gate,
+            "paginate",
+            return_value=[codex_head_bad, claude_head_good, codex_delayed_stale_clean, codex_head_resolved],
+        ):
+            state, _ = gate.ai_review_verdict(
+                "o/r", 7, self.HEAD, allowed_providers={"codex", "claude"}
+            )
+        self.assertEqual(state, "success")
+
 
 class ClearingLabelTests(unittest.TestCase):
     HEAD = "a" * 40
@@ -1885,6 +1973,113 @@ class EvaluatePolicyTests(unittest.TestCase):
         self.assertEqual(missing_verdict["verdict"], "fail")
         self.assertEqual(missing_verdict["tier"], "T2")
         self.assertIn("Cannot verify Git tree modes for changed files", missing_reasons)
+
+    def test_missing_default_policy_fails_closed_without_head_fallback_and_accepts_policy_file(self):
+        pull = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "head": {"sha": self.HEAD, "ref": "feat/x", "repo": {"full_name": "o/r"}},
+            "base": {"ref": "main"},
+            "user": {"login": "contributor"},
+            "changed_files": 1,
+            "body": "## AI assistance\nCodex\n\n## What changed\nBootstrap\n\n## How verified\nTested\n",
+            "labels": [{"name": "owner-approved"}],
+        }
+        doc_file = {
+            "filename": "governance/policy.json",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "patch": '@@ -0,0 +1 @@\n+{"owner_login":"owner"}\n',
+        }
+        tree_payload = {
+            "truncated": False,
+            "tree": [{"path": "governance/policy.json", "mode": "100644", "type": "blob"}],
+        }
+        policy_refs_seen = []
+
+        def fake_request(method, path, params=None, **kwargs):
+            if path == "/repos/o/r/pulls/7":
+                return pull
+            if path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if path == "/repos/o/r/contents/governance/policy.json":
+                ref = (params or {}).get("ref")
+                policy_refs_seen.append(ref)
+                if ref == self.HEAD:
+                    raise AssertionError("Must never load bootstrap policy from PR head")
+                return None
+            if path == "/repos/o/r/contents/governance/merge_gate.py":
+                return None
+            if path == "/repos/o/r/contents/.github/scripts/dependabot-policy.json":
+                return None
+            if path == f"/repos/o/r/git/trees/{self.HEAD}":
+                return tree_payload
+            return None
+
+        with mock.patch.object(gate, "request", side_effect=fake_request):
+            with self.assertRaises(gate.Refusal) as ctx:
+                gate.evaluate("o/r", 7)
+        self.assertIn("--policy-file", str(ctx.exception))
+        self.assertEqual(policy_refs_seen, ["main"])
+
+        trusted_policy = {
+            "owner_login": "owner",
+            "codex_required": False,
+            "require_checks": False,
+        }
+        raw_policy = json.dumps(trusted_policy).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = Path(tmp) / "bootstrap-policy.json"
+            policy_path.write_bytes(raw_policy)
+            with mock.patch.object(gate, "request", side_effect=fake_request), \
+                 mock.patch.object(gate, "head_contains_base", return_value=(True, self.BASE)), \
+                 mock.patch.object(gate, "shared_head", return_value=False), \
+                 mock.patch.object(gate, "paginate", side_effect=lambda p, params=None: [doc_file] if p.endswith("/files") else []), \
+                 mock.patch.object(gate, "live_label", return_value="owner-approved"):
+                verdict, reasons = gate.evaluate("o/r", 7, policy_file=str(policy_path))
+                self.assertEqual(reasons, [])
+                self.assertEqual(verdict["verdict"], "pass")
+                self.assertTrue(verdict["bootstrap"])
+                self.assertEqual(verdict["policy_sha256"], gate.hashlib.sha256(raw_policy).hexdigest())
+
+                # Revalidation with trusted --policy-file succeeds, while omitting it fails closed.
+                gate.revalidate("o/r", verdict, policy_file=str(policy_path))
+                with self.assertRaises(gate.Refusal):
+                    gate.revalidate("o/r", verdict)
+
+                out = io.StringIO()
+                with mock.patch.object(gate.sys, "argv", [
+                    "merge_gate.py", "--repo", "o/r", "--pr", "7", "--dry-run", "--policy-file", str(policy_path)
+                ]), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    code = gate.main()
+                self.assertEqual(code, 0)
+                self.assertTrue(json.loads(out.getvalue())["bootstrap"])
+
+        with mock.patch.object(gate.sys, "argv", [
+            "merge_gate.py", "--repo", "o/r", "--pr", "7", "--policy-ref", "refs/tags/trusted"
+        ]), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as sys_exit:
+                gate.main()
+        self.assertEqual(sys_exit.exception.code, 2)
+
+
+class DefaultRepoTests(unittest.TestCase):
+    def test_default_repo_handles_dotted_names(self):
+        cases = (
+            ("git@github.com:synthetic-owner/service.api.git\n", "synthetic-owner/service.api"),
+            ("git@github.com:synthetic-owner/service.api\n", "synthetic-owner/service.api"),
+            ("https://github.com/synthetic-owner/service.api.git\n", "synthetic-owner/service.api"),
+            ("https://github.com/Pigbibi/PrGovernance.git\n", "Pigbibi/PrGovernance"),
+            ("https://gitlab.example.com/owner/repo.git\n", None),
+        )
+        for remote_url, expected in cases:
+            with self.subTest(remote_url=remote_url.strip()):
+                fake_proc = mock.Mock(stdout=remote_url)
+                with mock.patch.object(gate.subprocess, "run", return_value=fake_proc):
+                    self.assertEqual(gate.default_repo(), expected)
 
 
 if __name__ == "__main__":

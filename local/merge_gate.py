@@ -213,27 +213,36 @@ def paginate(path: str, params: dict[str, Any] | None = None) -> list[dict[str, 
         page += 1
 
 
-def load_policy(repo: str, ref: str, fallback: str | None = None) -> dict[str, Any]:
+def _load_policy_file(policy_file: str) -> dict[str, Any]:
+    try:
+        raw = Path(policy_file).read_bytes()
+        policy = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise Refusal(f"Cannot read policy file {policy_file}: {exc}") from exc
+    if not isinstance(policy, dict):
+        raise Refusal(f"Policy file {policy_file} must contain a JSON object")
+    policy["_sha256"] = hashlib.sha256(raw).hexdigest()
+    policy["_source"] = f"file:{policy_file}"
+    return policy
+
+
+def load_policy(repo: str, ref: str) -> dict[str, Any]:
     data = request(
         "GET",
         f"/repos/{repo}/contents/governance/policy.json",
         params={"ref": ref},
-        allow=(404,) if fallback else (),
+        allow=(404,),
     )
-    source = ref
-    if not data and fallback:
-        # Bootstrap only: the default branch has no policy yet, so the first
-        # governing pull request carries it. Every later verdict reads base.
-        data = request(
-            "GET",
-            f"/repos/{repo}/contents/governance/policy.json",
-            params={"ref": fallback},
+    if not data:
+        raise Refusal(
+            f"No governance/policy.json on {ref}; pass a trusted --policy-file to bootstrap"
         )
-        source = fallback
     raw = base64.b64decode(data["content"])
     policy = json.loads(raw)
+    if not isinstance(policy, dict):
+        raise Refusal(f"governance/policy.json on {ref} must contain a JSON object")
     policy["_sha256"] = hashlib.sha256(raw).hexdigest()
-    policy["_source"] = source
+    policy["_source"] = ref
     return policy
 
 
@@ -284,9 +293,18 @@ def is_keyword(path: str) -> bool:
     return any(pattern.search(candidate) for pattern in KEYWORD_PATHS)
 
 
-def is_protected(path: str, extra: tuple[str, ...]) -> bool:
+def _matches_extra_protected(path: str, extra: tuple[str, ...]) -> bool:
     candidate = normalized(path)
-    if any(candidate.startswith(prefix) for prefix in extra):
+    return any(
+        isinstance(prefix, str)
+        and bool(prefix)
+        and (path.startswith(prefix) or candidate.startswith(normalized(prefix)))
+        for prefix in extra
+    )
+
+
+def is_protected(path: str, extra: tuple[str, ...]) -> bool:
+    if _matches_extra_protected(path, extra):
         return True
     return is_structural(path) or is_keyword(path)
 
@@ -365,7 +383,7 @@ def classify(
     )
     if fast_path:
         return "T1", True
-    if any(is_structural(name) or normalized(name).startswith(extra) for name in names):
+    if any(is_structural(name) or _matches_extra_protected(name, extra) for name in names):
         return "T2", False
     if files and all(is_t0(file) for file in files):
         return "T0", False
@@ -573,9 +591,13 @@ def ai_review_verdict(
     if not active:
         return "pending", "No AI review providers configured"
     comments = paginate(f"/repos/{repo}/issues/{number}/comments")
-    # Track the latest receipt per allowed provider so one provider's clean head
-    # receipt cannot mask another provider's unresolved findings on the same head.
-    latest_by_provider: dict[str, tuple[dt.datetime, str, int, int, int, str]] = {}
+    # Track the latest receipt per allowed provider, preferring current-head or
+    # unparseable receipts (`on_head is not False`) over delayed stale-commit
+    # receipts so a later off-head comment cannot mask current-head findings.
+    latest_by_provider: dict[
+        str,
+        tuple[int, dt.datetime, str, int, int, str, str, bool | None, bool],
+    ] = {}
     for seq_idx, comment in enumerate(comments):
         login = (comment.get("user") or {}).get("login", "")
         binding = REVIEWER_PROVIDERS.get(login)
@@ -597,25 +619,52 @@ def ai_review_verdict(
         cid = comment_id if isinstance(comment_id, int) and not isinstance(comment_id, bool) else 0
         parsed_ts = _parse_iso_timestamp(updated_at) or _EPOCH_MIN
         if len(matches) > 1 or matches[0][0] not in allowed_indices:
-            candidate = (parsed_ts, updated_at, cid, seq_idx, -1, "")
+            marker_index, payload_raw = -1, ""
         else:
             marker_index, payload_raw = matches[0]
-            candidate = (parsed_ts, updated_at, cid, seq_idx, marker_index, payload_raw)
+        state, note, on_head, provider_ok = _judge_provider_receipt(
+            login_provider, marker_index, payload_raw, head
+        )
+        head_rank = 1 if on_head is not False else 0
+        candidate = (
+            head_rank,
+            parsed_ts,
+            updated_at,
+            cid,
+            seq_idx,
+            state,
+            note,
+            on_head,
+            provider_ok,
+        )
         prev = latest_by_provider.get(login_provider)
-        if prev is None or candidate[:4] > prev[:4]:
+        if prev is None or candidate[:5] > prev[:5]:
             latest_by_provider[login_provider] = candidate
     if not latest_by_provider:
         return "pending", "No AI review receipt on this pull request"
 
-    judged: list[tuple[tuple[dt.datetime, str, int, int], tuple[dt.datetime, str], str, str, str, bool | None, bool]] = []
-    for login_provider, item in latest_by_provider.items():
-        parsed_ts, updated_at, cid, seq_idx, marker_index, raw = item
-        state, note, on_head, provider_ok = _judge_provider_receipt(
-            login_provider, marker_index, raw, head
+    judged = [
+        (
+            (parsed_ts, updated_at, cid, seq_idx),
+            (parsed_ts, updated_at),
+            login_provider,
+            state,
+            note,
+            on_head,
+            provider_ok,
         )
-        judged.append(
-            ((parsed_ts, updated_at, cid, seq_idx), (parsed_ts, updated_at), login_provider, state, note, on_head, provider_ok)
-        )
+        for login_provider, (
+            _head_rank,
+            parsed_ts,
+            updated_at,
+            cid,
+            seq_idx,
+            state,
+            note,
+            on_head,
+            provider_ok,
+        ) in latest_by_provider.items()
+    ]
 
     judged.sort(key=lambda entry: entry[0], reverse=True)
     passing_head = [e for e in judged if e[5] is True and e[3] == "success"]
@@ -638,6 +687,8 @@ def ai_review_verdict(
 
     if failing_head:
         return failing_head[0][3], failing_head[0][4]
+    if pending_head:
+        return pending_head[0][3], pending_head[0][4]
     return judged[0][3], judged[0][4]
 
 
@@ -1022,7 +1073,7 @@ def symlink_entries(
     return flagged, True
 
 
-def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
+def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[dict[str, Any], list[str]]:
     pull = request("GET", f"/repos/{repo}/pulls/{number}")
     if pull.get("state") != "open":
         raise Refusal(f"Pull request #{number} is {pull.get('state')}, not open")
@@ -1031,10 +1082,16 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
     head = pull["head"]["sha"]
     base_ref = pull["base"]["ref"]
     policy_ref = request("GET", f"/repos/{repo}")["default_branch"]
-    policy = load_policy(repo, policy_ref, fallback=head)
-    bootstrap = policy["_source"] != policy_ref
-    if bootstrap:
-        print("warning: no policy on the default branch; reading the head (bootstrap)", file=sys.stderr)
+    if policy_file:
+        policy = _load_policy_file(policy_file)
+        bootstrap = True
+        print(
+            f"warning: using trusted --policy-file ({policy_file}) instead of {policy_ref} (bootstrap)",
+            file=sys.stderr,
+        )
+    else:
+        policy = load_policy(repo, policy_ref)
+        bootstrap = False
     verify_script(repo, policy_ref)
     files = paginate(f"/repos/{repo}/pulls/{number}/files")
     reasons: list[str] = []
@@ -1125,14 +1182,14 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
             )
             checks_note = (
                 "The merge entry is not on the default branch yet; the contexts come from "
-                "the policy in this pull request"
+                "the trusted --policy-file"
                 if bootstrap else ""
             )
     else:
         checks = "skipped"
         checks_note = policy.get("checks_disabled_reason") or "not required by policy"
         if bootstrap:
-            checks_note += " (policy read from the pull request; the entry is not installed yet)"
+            checks_note += " (policy read from --policy-file; the entry is not installed yet)"
     verdict = {
         "repo": repo,
         "pr": number,
@@ -1159,7 +1216,7 @@ def evaluate(repo: str, number: int) -> tuple[dict[str, Any], list[str]]:
     return verdict, reasons
 
 
-def revalidate(repo: str, verdict: dict[str, Any]) -> None:
+def revalidate(repo: str, verdict: dict[str, Any], policy_file: str | None = None) -> None:
     pull = request("GET", f"/repos/{repo}/pulls/{verdict['pr']}")
     if pull.get("state") != "open":
         raise Refusal("Pull request is no longer open; re-run the gate")
@@ -1170,11 +1227,7 @@ def revalidate(repo: str, verdict: dict[str, Any]) -> None:
     if hashlib.sha256((pull.get("body") or "").encode()).hexdigest() != verdict.get("body_sha256"):
         raise Refusal("Pull request body changed since the verdict; re-run the gate")
     policy_ref = verdict.get("policy_ref") or verdict["base_ref"]
-    policy = load_policy(
-        repo,
-        policy_ref,
-        fallback=verdict["head_sha"] if verdict.get("bootstrap") else None,
-    )
+    policy = _load_policy_file(policy_file) if policy_file else load_policy(repo, policy_ref)
     if policy.get("_sha256") != verdict.get("policy_sha256"):
         raise Refusal("Policy changed since the verdict; re-run the gate")
     verify_script(repo, policy_ref)
@@ -1241,10 +1294,10 @@ def merge_lock(repo: str, base_ref: str):
         handle.close()
 
 
-def merge(repo: str, verdict: dict[str, Any]) -> dict[str, Any]:
+def merge(repo: str, verdict: dict[str, Any], policy_file: str | None = None) -> dict[str, Any]:
     number = verdict["pr"]
     with merge_lock(repo, verdict["base_ref"]):
-        revalidate(repo, verdict)
+        revalidate(repo, verdict, policy_file=policy_file)
         result = request(
             "PUT",
             f"/repos/{repo}/pulls/{number}/merge",
@@ -1340,12 +1393,7 @@ def audit(
     info = request("GET", f"/repos/{repo}")
     default = info["default_branch"]
     if policy_file:
-        try:
-            policy = json.loads(Path(policy_file).read_bytes())
-        except (OSError, ValueError) as exc:
-            raise Refusal(f"Cannot read policy file {policy_file}: {exc}") from exc
-        if not isinstance(policy, dict):
-            raise Refusal(f"Policy file {policy_file} must contain a JSON object")
+        policy = _load_policy_file(policy_file)
         verify_script(repo, default)
         trusted_policy = True
     elif policy_ref:
@@ -1465,7 +1513,7 @@ def default_repo() -> str | None:
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return None
-    match = re.search(r"github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?$", url)
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
     return match.group(1) if match else None
 
 
@@ -1479,14 +1527,17 @@ def main() -> int:
     parser.add_argument("--strict-direct", action="store_true",
                         help="force the strict direct-push audit even if the policy relaxes it")
     parser.add_argument("--policy-ref", help="trusted git ref for audit policy and script verification")
-    parser.add_argument("--policy-file", help="trusted local policy JSON file for audit")
+    parser.add_argument(
+        "--policy-file",
+        help="trusted local policy JSON file (outside the PR worktree) for --audit or --pr bootstrap",
+    )
     args = parser.parse_args()
     if not args.repo:
         parser.error("--repo is required outside a git checkout")
     if args.policy_ref and args.policy_file:
         parser.error("--policy-ref and --policy-file cannot be used together")
-    if not args.audit and (args.policy_ref or args.policy_file):
-        parser.error("--policy-ref and --policy-file apply only to --audit")
+    if not args.audit and args.policy_ref:
+        parser.error("--policy-ref applies only to --audit")
     try:
         if args.audit:
             return audit(
@@ -1498,13 +1549,13 @@ def main() -> int:
             )
         if not args.pr:
             parser.error("--pr is required unless --audit is used")
-        verdict, reasons = evaluate(args.repo, args.pr)
+        verdict, reasons = evaluate(args.repo, args.pr, policy_file=args.policy_file)
         print(json.dumps(verdict, indent=2, ensure_ascii=False))
         if reasons:
             return 2
         if args.dry_run:
             return 0
-        merge(args.repo, verdict)
+        merge(args.repo, verdict, policy_file=args.policy_file)
         print(f"merged #{args.pr} at {verdict['head_sha'][:7]}")
         return 0
     except Refusal as exc:

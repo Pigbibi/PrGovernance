@@ -356,32 +356,63 @@ DRIFT_FILES = (
 )
 
 
-def verify(root):
+def verify(root, source=None, include_merge_gate=False):
     root = repository_root(root)
-    source = Path(root) / ".githooks"
+    hook_source = Path(source) if source else Path(root) / ".githooks"
     names = list(HOOK_FILES)
-    missing = [name for name in names if not (source / name).is_file()]
+    missing = [name for name in names if not (hook_source / name).is_file()]
     if missing:
-        return [f"missing file {name} in {source}" for name in missing]
+        return [f"missing file {name} in {hook_source}" for name in missing]
     target = Path(git_output(root, "rev-parse", "--path-format=absolute",
                              "--git-common-dir").strip()) / "governance"
-    policy = source / "governance.json"
+    policy = hook_source / "governance.json"
     expected_policy = policy.read_text() if policy.is_file() else "{}\n"
     problems = []
     for name in names:
         installed = target / name
-        if not installed.is_file():
+        if installed.is_symlink() or not installed.is_file():
             problems.append(f"{installed} is missing; run install")
             continue
-        if installed.read_bytes() != (source / name).read_bytes():
-            problems.append(f"{installed} differs from {source / name}; run install")
+        if installed.read_bytes() != (hook_source / name).read_bytes():
+            problems.append(f"{installed} differs from {hook_source / name}; run install")
         if not os.access(installed, os.X_OK):
             problems.append(f"{installed} is not executable; run install")
     installed_policy = target / "governance.json"
-    if not installed_policy.is_file():
+    if installed_policy.is_symlink() or not installed_policy.is_file():
         problems.append(f"{installed_policy} is missing; run install")
     elif installed_policy.read_text() != expected_policy:
         problems.append(f"{installed_policy} differs from {policy if policy.is_file() else 'the default policy'}; run install")
+    check_gate = include_merge_gate or any(
+        (target / src_name).exists() or (target / src_name).is_symlink()
+        for src_name, _ in MERGE_GATE_FILES
+    )
+    if check_gate:
+        root_path = Path(root)
+        for src_name, dest_rel in MERGE_GATE_FILES:
+            installed = target / src_name
+            if installed.is_symlink() or not installed.is_file():
+                problems.append(
+                    f"{installed} is missing or not a regular file; run install --include-merge-gate"
+                )
+                continue
+            if source is not None:
+                expected_file = hook_source / src_name
+                if not expected_file.is_file():
+                    problems.append(f"missing file {src_name} in {hook_source}")
+                elif installed.read_bytes() != expected_file.read_bytes():
+                    problems.append(
+                        f"{installed} differs from {expected_file}; run install --include-merge-gate"
+                    )
+            else:
+                repo_copy = root_path / dest_rel
+                if repo_copy.exists() or repo_copy.is_symlink():
+                    dest_error = _validate_regular_destination(root_path, dest_rel)
+                    if dest_error:
+                        problems.append(f"{dest_rel} invalid destination: {dest_error}")
+                    elif installed.read_bytes() != repo_copy.read_bytes():
+                        problems.append(
+                            f"{installed} differs from {repo_copy}; run install --include-merge-gate"
+                        )
     layout = repository_layout(root)
     worktrees = [str(path) for path in layout[2] if Path(path).is_dir()]
     enabled = git("-C", root, "config", "--bool", "--get", "extensions.worktreeConfig")
@@ -545,6 +576,36 @@ def check_drift(root, source=None):
     return problems
 
 
+def vendor(root, source=None):
+    """Copy canonical merge-gate files into the target repository worktree."""
+    root_path = Path(repository_root(root))
+    source_dir = Path(source) if source else Path(__file__).resolve().parent
+    if not root_path.is_dir():
+        return [f"target root does not exist: {root_path}"]
+    if not source_dir.is_dir():
+        return [f"source directory does not exist: {source_dir}"]
+    missing = [
+        f"missing canonical file {src_name} in {source_dir}"
+        for src_name, _ in MERGE_GATE_FILES
+        if not (source_dir / src_name).is_file()
+    ]
+    if missing:
+        return missing
+    dest_errors = [
+        error
+        for _, dest_rel in MERGE_GATE_FILES
+        for error in [_validate_regular_destination(root_path, dest_rel)]
+        if error
+    ]
+    if dest_errors:
+        return dest_errors
+    for src_name, dest_rel in MERGE_GATE_FILES:
+        dest = root_path / dest_rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_dir / src_name, dest)
+    return []
+
+
 def install(root, source=None, include_merge_gate=False):
     root = repository_root(root)
     source = Path(source) if source else Path(root) / ".githooks"
@@ -555,18 +616,19 @@ def install(root, source=None, include_merge_gate=False):
     missing = [name for name in required if not (source / name).is_file()]
     if missing:
         return [f"missing file {name} in {source}" for name in missing]
+    target = Path(git_output(root, "rev-parse", "--path-format=absolute",
+                             "--git-common-dir").strip()) / "governance"
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        return [f"{target} is not a regular directory"]
     if include_merge_gate:
-        root_path = Path(root)
         dest_errors = [
             error
-            for _, dest_rel in MERGE_GATE_FILES
-            for error in [_validate_regular_destination(root_path, dest_rel)]
+            for src_name, _ in MERGE_GATE_FILES
+            for error in [_validate_regular_destination(target, src_name)]
             if error
         ]
         if dest_errors:
             return dest_errors
-    target = Path(git_output(root, "rev-parse", "--path-format=absolute",
-                             "--git-common-dir").strip()) / "governance"
     layout = repository_layout(root)
     worktrees = [str(path) for path in layout[2] if Path(path).is_dir()]
     enabled = git("-C", root, "config", "--bool", "--get", "extensions.worktreeConfig")
@@ -608,11 +670,8 @@ def install(root, source=None, include_merge_gate=False):
             return [f"core.hooksPath for {worktree} is overridden by worktree or "
                     f"environment config: {configured or 'unset'}"]
     if include_merge_gate:
-        root_path = Path(root)
-        for src_name, dest_rel in MERGE_GATE_FILES:
-            dest = root_path / dest_rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source / src_name, dest)
+        for src_name, _ in MERGE_GATE_FILES:
+            shutil.copyfile(source / src_name, target / src_name)
     return []
 
 
@@ -625,21 +684,23 @@ def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",
                         choices=["audit", "pre-commit", "commit-msg", "pre-push", "install",
-                                 "verify", "check-drift"])
+                                 "vendor", "verify", "check-drift"])
     parser.add_argument("argument", nargs="?")
     parser.add_argument("--staged", action="store_true",
                         help="audit the index instead of the committed tree")
     parser.add_argument("--root", default=".")
     parser.add_argument("--source", help="directory to install the hooks from or compare against")
     parser.add_argument("--include-merge-gate", action="store_true",
-                        help="with install, also copy merge_gate.py, test_merge_gate.py, "
-                             "and check_hygiene.py into --root")
+                        help="with install or verify, include merge_gate.py, test_merge_gate.py, "
+                             "and check_hygiene.py inside the installed .git/governance directory")
     options = parser.parse_args(argv)
     root = repository_root(str(Path(options.root).resolve()))
     if options.command == "install":
         problems = install(root, options.source, include_merge_gate=options.include_merge_gate)
+    elif options.command == "vendor":
+        problems = vendor(root, options.source)
     elif options.command == "verify":
-        problems = verify(root)
+        problems = verify(root, options.source, include_merge_gate=options.include_merge_gate)
     elif options.command == "check-drift":
         problems = check_drift(root, options.source)
     else:

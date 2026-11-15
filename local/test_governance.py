@@ -951,23 +951,38 @@ class RepositoryTests(unittest.TestCase):
         local_dir = Path(__file__).resolve().parent
         result = self.cli("install", "--source", str(local_dir))
         self.assertEqual(result.returncode, 0, result.stderr)
+        configured = Path(run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip())
+        for src_name, _ in governance.MERGE_GATE_FILES:
+            self.assertFalse((configured / src_name).exists(), src_name)
         self.assertFalse((Path(self.root) / "governance").exists())
         self.assertFalse((Path(self.root) / "scripts").exists())
 
-    def test_install_with_include_merge_gate_copies_canonical_files(self):
+    def test_install_with_include_merge_gate_installs_outside_worktree(self):
         local_dir = Path(__file__).resolve().parent
         result = self.cli("install", "--source", str(local_dir), "--include-merge-gate")
         self.assertEqual(result.returncode, 0, result.stderr)
-        configured = run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip()
-        self.assertTrue((Path(configured) / "governance.py").is_file())
-        for src_name, dest_rel in governance.MERGE_GATE_FILES:
-            dest = Path(self.root) / dest_rel
-            self.assertTrue(dest.is_file(), dest_rel)
-            self.assertEqual(dest.read_bytes(), (local_dir / src_name).read_bytes(), dest_rel)
-        # Verify the installed test_merge_gate.py discovers ../merge_gate.py cleanly.
+        configured = Path(run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip())
+        self.assertTrue((configured / "governance.py").is_file())
+        for src_name, _dest_rel in governance.MERGE_GATE_FILES:
+            dest = configured / src_name
+            self.assertTrue(dest.is_file(), src_name)
+            self.assertEqual(dest.read_bytes(), (local_dir / src_name).read_bytes(), src_name)
+        # Never modify or create tracked worktree files during install.
+        self.assertFalse((Path(self.root) / "governance").exists())
+        self.assertFalse((Path(self.root) / "scripts").exists())
+        # Verify the installed test_merge_gate.py discovers sibling merge_gate.py cleanly.
         test_run = run(sys.executable, "-m", "unittest", "discover",
-                       "-s", str(Path(self.root) / "governance" / "tests"), "-p", "test_*.py")
+                       "-s", str(configured), "-p", "test_merge_gate.py")
         self.assertEqual(test_run.returncode, 0, test_run.stderr)
+        verified = self.cli("verify", "--source", str(local_dir), "--include-merge-gate")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+        # Tampering with .git/governance/merge_gate.py is caught by verify.
+        (configured / "merge_gate.py").write_text("# tampered\n")
+        tampered = self.cli("verify", "--source", str(local_dir), "--include-merge-gate")
+        self.assertEqual(tampered.returncode, 1)
+        self.assertIn("merge_gate.py", tampered.stderr)
+        self.assertIn("differs from", tampered.stderr)
 
     def test_install_with_include_merge_gate_refuses_incomplete_source(self):
         with tempfile.TemporaryDirectory() as trusted:
@@ -982,20 +997,60 @@ class RepositoryTests(unittest.TestCase):
     def test_install_with_include_merge_gate_refuses_symlink_destination(self):
         local_dir = Path(__file__).resolve().parent
         outside = self.write("outside.py", "# target\n")
-        dest = Path(self.root) / "governance" / "merge_gate.py"
+        dest = Path(self.root) / ".git" / "governance" / "merge_gate.py"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.symlink_to(outside)
         result = self.cli("install", "--source", str(local_dir), "--include-merge-gate")
         self.assertEqual(result.returncode, 1)
         self.assertIn("not a regular file", result.stderr)
+        self.assertFalse((Path(self.root) / ".git" / "governance" / "governance.py").exists())
+        self.assertFalse((Path(self.root) / "governance").exists())
+
+    def test_vendor_copies_canonical_merge_gate_files_and_refuses_symlinks(self):
+        local_dir = Path(__file__).resolve().parent
+        outside = self.write("outside.py", "# target\n")
+        symlink_dest = Path(self.root) / "governance" / "merge_gate.py"
+        symlink_dest.parent.mkdir(parents=True, exist_ok=True)
+        symlink_dest.symlink_to(outside)
+        refused = self.cli("vendor", "--source", str(local_dir))
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("not a regular file", refused.stderr)
+        self.assertFalse((Path(self.root) / "scripts").exists())
+
+        symlink_dest.unlink()
+        result = self.cli("vendor", "--source", str(local_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for src_name, dest_rel in governance.MERGE_GATE_FILES:
+            dest = Path(self.root) / dest_rel
+            self.assertTrue(dest.is_file(), dest_rel)
+            self.assertEqual(dest.read_bytes(), (local_dir / src_name).read_bytes(), dest_rel)
         self.assertFalse((Path(self.root) / ".git" / "governance").exists())
+        test_run = run(sys.executable, "-m", "unittest", "discover",
+                       "-s", str(Path(self.root) / "governance" / "tests"), "-p", "test_*.py")
+        self.assertEqual(test_run.returncode, 0, test_run.stderr)
+
+    def test_verify_detects_installed_vs_vendored_merge_gate_drift(self):
+        local_dir = self._seed_canonical_repo()
+        githooks_dir = Path(self.root) / ".githooks"
+        for name in governance.HOOK_FILES:
+            (githooks_dir / name).write_bytes((local_dir / name).read_bytes())
+        result = self.cli("install", "--source", str(local_dir), "--include-merge-gate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(governance.verify(self.root), [])
+
+        configured = Path(run("git", "-C", self.root, "config", "core.hooksPath").stdout.strip())
+        (configured / "merge_gate.py").write_bytes((local_dir / "merge_gate.py").read_bytes() + b"\n# drift\n")
+        problems = governance.verify(self.root)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("merge_gate.py", problems[0])
+        self.assertIn("differs from", problems[0])
 
     def _seed_canonical_repo(self):
         local_dir = Path(__file__).resolve().parent
         githooks_gov = Path(self.root) / ".githooks" / "governance.py"
         githooks_gov.parent.mkdir(parents=True, exist_ok=True)
         githooks_gov.write_bytes((local_dir / "governance.py").read_bytes())
-        result = self.cli("install", "--source", str(local_dir), "--include-merge-gate")
+        result = self.cli("vendor", "--source", str(local_dir))
         self.assertEqual(result.returncode, 0, result.stderr)
         return local_dir
 

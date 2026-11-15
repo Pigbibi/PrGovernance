@@ -50,17 +50,32 @@ python3 PrGovernance/local/governance.py install --root <repository> \
 ```
 
 To also install or update the canonical private-repository merge entry and
-hygiene checker (`governance/merge_gate.py`, `governance/tests/test_merge_gate.py`,
-and `scripts/check_hygiene.py`) in `<repository>`, pass `--include-merge-gate`:
+hygiene checker (`merge_gate.py`, `test_merge_gate.py`, and `check_hygiene.py`)
+into `.git/governance/` (outside the repository worktree), pass `--include-merge-gate`:
 
 ```sh
 python3 PrGovernance/local/governance.py install --root <repository> \
   --source PrGovernance/local --include-merge-gate
 ```
 
-`--include-merge-gate` keeps all hook installation behavior unchanged and refuses
-before making changes if any canonical source file is missing or if a target
-path is a symlink or non-regular file.
+Keeping the merge gate inside `.git/governance/` ensures that checking out a
+contributor branch cannot overwrite `merge_gate.py` before you invoke it.
+`--include-merge-gate` refuses before making changes if any canonical source file
+is missing or if a destination inside `.git/governance/` is a symlink or
+non-regular file.
+
+When a repository tracks vendored copies (`governance/merge_gate.py`,
+`governance/tests/test_merge_gate.py`, and `scripts/check_hygiene.py`), update
+them explicitly from a clean default-branch checkout with `vendor`:
+
+```sh
+python3 PrGovernance/local/governance.py vendor --root <repository> \
+  --source PrGovernance/local
+```
+
+`vendor` leaves `.git/governance/` untouched and refuses before writing if any
+canonical source file is missing or any worktree destination is a symlink or
+non-regular file.
 
 A repository that vendors `.githooks/` can instead run
 `python3 .githooks/governance.py install` once from the reviewed default branch.
@@ -97,6 +112,10 @@ python3 "$hooks/governance.py" pre-commit
 python3 "$hooks/governance.py" commit-msg FILE
 python3 "$hooks/governance.py" pre-push           # reads ref updates on stdin
 python3 "$hooks/governance.py" verify             # installed copy matches .githooks
+python3 "$hooks/governance.py" verify --source PrGovernance/local --include-merge-gate
+python3 "$hooks/merge_gate.py" --pr <number> --dry-run
+python3 PrGovernance/local/governance.py vendor --root <repository> \
+  --source PrGovernance/local                     # copy merge-gate files into worktree
 python3 PrGovernance/local/governance.py check-drift --root <repository> \
   --source PrGovernance/local                     # repository copies match canonical local/
 ```
@@ -104,12 +123,16 @@ python3 PrGovernance/local/governance.py check-drift --root <repository> \
 Every command exits non-zero and prints `governance: <finding>` on failure.
 
 `verify` compares the installed copy in the common git directory with the
-committed `.githooks/` source, checks that the hook scripts are executable, and
-checks that every worktree still resolves `core.hooksPath` there. A source
-without `governance.json` compares against the default policy `install` writes,
-so an optional policy file never makes a clone unverifiable. Run it after pulling a change to the
-vendored hooks, and before trusting a clone that was installed by someone else;
-a non-empty result means `install` must run again from a trusted copy.
+committed `.githooks/` source (or `--source` when given), checks that the hook
+scripts are executable, and checks that every worktree still resolves
+`core.hooksPath` there. When merge-gate files are installed in
+`.git/governance/` (or `--include-merge-gate` is passed), `verify` also checks
+that those files are regular non-symlink files and match `--source` (or the
+vendored repository copies if present). A source without `governance.json`
+compares against the default policy `install` writes, so an optional policy file
+never makes a clone unverifiable. Run it after pulling a change to the vendored
+hooks, and before trusting a clone that was installed by someone else; a
+non-empty result means `install` must run again from a trusted copy.
 
 `check-drift` compares the SHA-256 digest of `.githooks/governance.py`,
 `governance/merge_gate.py`, `governance/tests/test_merge_gate.py`, and
@@ -153,7 +176,7 @@ trusted copy.
 - The audit scans the current tree, not history. A credential removed from a
   file is still in the objects; rotate it if it ever appears in a finding.
 - Review before merge still applies: open a pull request, run `audit` from the
-  installed copy on the branch, and merge through `governance/merge_gate.py`
+  installed copy on the branch, and merge through `"$hooks/merge_gate.py"`
   only after it passes. By default (`"codex_required": true`), `merge_gate.py`
   strictly requires a Codex receipt (`codex-review-receipt:v1`,
   `codex-review-state:v1`, or `ai-review-receipt:v1` authored by
@@ -163,6 +186,11 @@ trusted copy.
   providers (`chatgpt-codex-connector[bot]`, `claude[bot]`, or `cursor[bot]`)
   with author-matched `ai-review-receipt:v1`, explicit complete coverage on
   receipt markers, and no unresolved findings on the current head.
+- If `governance/policy.json` is not on the repository default branch yet,
+  `merge_gate.py --pr <number>` refuses instead of falling back to the pull
+  request head. Pass an out-of-band trusted `--policy-file <path>` (outside the
+  pull request worktree) for first-time bootstrap, or merge after committing the
+  policy to the default branch.
 - On T2 pull requests, `owner-approved` requires `owner_login`. Optional
   `"agent_logins"` in the base `governance/policy.json` allowlists trusted
   non-owner agent GitHub logins allowed to apply `agent-approved`; when
