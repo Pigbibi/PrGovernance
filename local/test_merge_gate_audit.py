@@ -1247,6 +1247,54 @@ class DirectPushAuditTests(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertIn(r1[:7], findings[0])
 
+        # 7c: truncated recursive trees must fail closed when non-recursive fallback is missing/truncated
+        # or exposes an omitted file in a subdirectory.
+        trees_truncated_with_hidden = {
+            **trees_with_hidden,
+            t_r1: {
+                **trees_with_hidden[t_r1],
+                "truncated": True,
+            },
+        }
+        with mock.patch.object(gate, "request", make_paginated_request(p0_include_extra=True, trees_override=trees_truncated_with_hidden)), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: []):
+            findings = gate.scan_direct_pushes(
+                "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+            )
+        self.assertEqual(len(findings), 1)
+        self.assertIn(r1[:7], findings[0])
+
+        nested_hidden_sub = "e2" * 20
+
+        def truncated_fallback_hidden_request(method, path, body=None, params=None, allow=()):
+            if path == f"/repos/o/r/git/trees/{t_r1}" and params == {"recursive": "1"}:
+                return {"truncated": True, "tree": []}
+            if path == f"/repos/o/r/git/trees/{t_r1}" and not params:
+                return {
+                    "truncated": False,
+                    "tree": [
+                        *[
+                            {"path": p, "type": "blob", "mode": "100644", "sha": "e" * 40}
+                            for p in (*extra_paths, "a.py")
+                        ],
+                        {"path": "secret", "type": "tree", "mode": "040000", "sha": nested_hidden_sub},
+                    ],
+                }
+            if path == f"/repos/o/r/git/trees/{nested_hidden_sub}" and not params:
+                return {
+                    "truncated": False,
+                    "tree": [{"path": "hidden.py", "type": "blob", "mode": "100644", "sha": "d" * 40}],
+                }
+            return make_paginated_request(p0_include_extra=True)(method, path, body=body, params=params, allow=allow)
+
+        with mock.patch.object(gate, "request", truncated_fallback_hidden_request), \
+             mock.patch.object(gate, "paginate", lambda path, params=None: []):
+            findings = gate.scan_direct_pushes(
+                "o/r", "main", set(), {}, True, 20, listing=valid_tree_chain, signers={"synthetic-owner"}
+            )
+        self.assertEqual(len(findings), 1)
+        self.assertIn(r1[:7], findings[0])
+
     def test_squash_or_divergent_rebase_does_not_exempt_parent_commits(self):
         r1 = "3" * 40
         unrelated = "5" * 40

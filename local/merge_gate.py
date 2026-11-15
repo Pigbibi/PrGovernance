@@ -1671,9 +1671,10 @@ def _fetch_tree_map(
     if not isinstance(res, dict) or not isinstance(res.get("tree"), list):
         tree_cache[key] = None
         return None
-    if recursive and res.get("truncated") is True:
-        tree_cache[key] = "TRUNCATED"
-        return "TRUNCATED"
+    if res.get("truncated") is True:
+        result: dict[str, tuple[str, str, str]] | str | None = "TRUNCATED" if recursive else None
+        tree_cache[key] = result
+        return result
     path_key = "path"
     entries: dict[str, tuple[str, str, str]] = {}
     for item in res["tree"]:
@@ -1686,6 +1687,7 @@ def _fetch_tree_map(
         if (
             isinstance(p, str)
             and p
+            and (recursive or ("/" not in p and p not in (".", "..")))
             and isinstance(t, str)
             and isinstance(m, str)
             and isinstance(s, str)
@@ -1831,6 +1833,52 @@ def _canonical_commit_files(
         else (_fetch_tree_map(repo, parent_tree, recursive=True, tree_cache=tree_cache) if parent_tree else None)
     )
     commit_map = _fetch_tree_map(repo, commit_tree, recursive=True, tree_cache=tree_cache)
+    if _has_uncovered_tree_diff(
+        repo,
+        parent_tree,
+        commit_tree,
+        parent_map,
+        commit_map,
+        covered_paths,
+        tree_cache,
+    ):
+        return None
+    normalized.sort()
+    return normalized
+
+
+def _flat_tree_children(
+    flat_map: dict[str, tuple[str, str, str]],
+    prefix: str,
+) -> dict[str, tuple[str, str, str]]:
+    children: dict[str, tuple[str, str, str]] = {}
+    for full_path, entry in flat_map.items():
+        if not full_path.startswith(prefix):
+            continue
+        rel = full_path[len(prefix):]
+        if not rel:
+            continue
+        if "/" not in rel:
+            if rel not in (".", ".."):
+                children[rel] = entry
+            continue
+        subdir = rel.split("/", 1)[0]
+        if subdir and subdir not in (".", "..") and subdir not in children:
+            children[subdir] = ("tree", "040000", "")
+    return children
+
+
+def _has_uncovered_tree_diff(
+    repo: str,
+    parent_tree: str,
+    commit_tree: str,
+    parent_map: dict[str, tuple[str, str, str]] | str | None,
+    commit_map: dict[str, tuple[str, str, str]] | str | None,
+    covered_paths: set[str],
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> bool:
+    if parent_map is None or commit_map is None:
+        return True
     if isinstance(parent_map, dict) and isinstance(commit_map, dict):
         for path in set(parent_map) | set(commit_map):
             p_entry = parent_map.get(path)
@@ -1838,9 +1886,61 @@ def _canonical_commit_files(
             p_file = p_entry if (p_entry and p_entry[0] in ("blob", "commit")) else None
             c_file = c_entry if (c_entry and c_entry[0] in ("blob", "commit")) else None
             if p_file != c_file and path not in covered_paths:
-                return None
-    normalized.sort()
-    return normalized
+                return True
+        return False
+
+    stack: list[tuple[str, str, str]] = [("", parent_tree, commit_tree)]
+    seen: set[tuple[str, str, str]] = set()
+    visited = 0
+    while stack:
+        prefix, p_sha, c_sha = stack.pop()
+        if (prefix, p_sha, c_sha) in seen:
+            continue
+        seen.add((prefix, p_sha, c_sha))
+        visited += 1
+        if visited > 2000:
+            return True
+        if p_sha and c_sha and p_sha == c_sha:
+            continue
+        if isinstance(parent_map, dict):
+            p_children = _flat_tree_children(parent_map, prefix)
+        elif not p_sha:
+            p_children = {}
+        else:
+            loaded = _fetch_tree_map(repo, p_sha, recursive=False, tree_cache=tree_cache)
+            if not isinstance(loaded, dict):
+                return True
+            p_children = loaded
+
+        if isinstance(commit_map, dict):
+            c_children = _flat_tree_children(commit_map, prefix)
+        elif not c_sha:
+            c_children = {}
+        else:
+            loaded = _fetch_tree_map(repo, c_sha, recursive=False, tree_cache=tree_cache)
+            if not isinstance(loaded, dict):
+                return True
+            c_children = loaded
+
+        for name in set(p_children) | set(c_children):
+            full_path = f"{prefix}{name}"
+            p_entry = p_children.get(name)
+            c_entry = c_children.get(name)
+            p_file = p_entry if (p_entry and p_entry[0] in ("blob", "commit")) else None
+            c_file = c_entry if (c_entry and c_entry[0] in ("blob", "commit")) else None
+            if p_file != c_file and full_path not in covered_paths:
+                return True
+            p_is_tree = bool(p_entry and p_entry[0] == "tree")
+            c_is_tree = bool(c_entry and c_entry[0] == "tree")
+            if (p_is_tree and p_entry[1] != "040000") or (c_is_tree and c_entry[1] != "040000"):
+                return True
+            if p_is_tree or c_is_tree:
+                p_sub = p_entry[2] if p_is_tree else ""
+                c_sub = c_entry[2] if c_is_tree else ""
+                if p_sub and c_sub and p_sub == c_sub:
+                    continue
+                stack.append((f"{full_path}/", p_sub, c_sub))
+    return False
 
 
 _FILES_COMPLETE_TOKEN = object()
