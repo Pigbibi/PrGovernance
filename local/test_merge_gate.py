@@ -1590,6 +1590,101 @@ class AiReviewReceiptTests(unittest.TestCase):
             )
         self.assertEqual(state, "success")
 
+    def test_newer_unterminated_receipt_rejects_prior_clean_receipt(self):
+        claude_clean = self.comment(
+            "claude[bot]",
+            "ai-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+            updated_at="2026-11-14T08:00:00Z",
+        )
+        codex_clean = self.comment(
+            "chatgpt-codex-connector[bot]",
+            "codex-review-state:v1",
+            {
+                "code_review": {
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "has_unresolved_findings": False,
+                }
+            },
+            updated_at="2026-11-14T08:30:00Z",
+        )
+        findings_json = json.dumps(
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 2,
+                    "coverage": "complete",
+                }
+            }
+        )
+        for bad_body in (
+            f"<!-- ai-review-receipt:v1 {findings_json}",
+            "<!-- ai-review-receipt:v1",
+            '<!-- ai-review-receipt:v1 {"review":{"note":"a-->b"}} -->',
+        ):
+            with self.subTest(bad_body=bad_body):
+                newer_bad = {
+                    "user": {"login": "claude[bot]"},
+                    "body": bad_body,
+                    "updated_at": "2026-11-14T09:00:00Z",
+                }
+                with mock.patch.object(gate, "paginate", return_value=[claude_clean, newer_bad]):
+                    state, _ = gate.ai_review_verdict("o/r", 7, self.HEAD, allowed_providers={"claude"})
+                self.assertEqual(state, "error")
+
+                with mock.patch.object(gate, "paginate", return_value=[claude_clean, codex_clean, newer_bad]):
+                    multi_state, _ = gate.ai_review_verdict(
+                        "o/r", 7, self.HEAD, allowed_providers={"codex", "claude"}
+                    )
+                self.assertEqual(multi_state, "error")
+
+    def test_mixed_closed_receipt_and_unterminated_second_marker_fails_closed(self):
+        claude_clean = self.comment(
+            "claude[bot]",
+            "ai-review-receipt:v1",
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            },
+            updated_at="2026-11-14T08:00:00Z",
+        )
+        clean_json = json.dumps(
+            {
+                "review": {
+                    "provider": "claude",
+                    "commit_sha": self.HEAD,
+                    "status": "completed",
+                    "unresolved_findings": 0,
+                    "coverage": "complete",
+                }
+            }
+        )
+        mixed = {
+            "user": {"login": "claude[bot]"},
+            "body": f"<!-- ai-review-receipt:v1 {clean_json} -->\n<!-- ai-review-receipt:v1 {clean_json}",
+            "updated_at": "2026-11-14T09:00:00Z",
+        }
+        with mock.patch.object(gate, "paginate", return_value=[claude_clean, mixed]):
+            state, note = gate.ai_review_verdict("o/r", 7, self.HEAD, allowed_providers={"claude"})
+        self.assertEqual(state, "failure")
+        self.assertIn("Ambiguous or disallowed", note)
+
 
 class ClearingLabelTests(unittest.TestCase):
     HEAD = "a" * 40

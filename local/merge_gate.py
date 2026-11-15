@@ -41,12 +41,14 @@ VERDICT_MARKER = "governance-verdict:v1"
 # provider vouch for a job it never ran.
 ACTIONS_APP_ID = 15368
 ACTIONS_BOT = "github-actions[bot]"
-# A Codex summary body carries several marker comments; keep the capture
-# greedy inside this one but never let it cross the comment terminator.
-RECEIPT_MARKERS = (
-    re.compile(r"<!--\s*ai-review-receipt:v1\s*(\{(?:(?!-->)[\s\S])*\})\s*-->"),
-    re.compile(r"<!--\s*codex-review-receipt:v1\s*(\{(?:(?!-->)[\s\S])*\})\s*-->"),
-    re.compile(r"<!--\s*codex-review-state:v1\s*(\{(?:(?!-->)[\s\S])*\})\s*-->"),
+RECEIPT_MARKER_NAMES = (
+    "ai-review-receipt:v1",
+    "codex-review-receipt:v1",
+    "codex-review-state:v1",
+)
+RECEIPT_MARKER_OPEN = re.compile(
+    r"<!--\s*(ai-review-receipt:v1|codex-review-receipt:v1|codex-review-state:v1)"
+    r"(?=\s|-->|$|[^A-Za-z0-9_.:-])"
 )
 COMPLETE_COVERAGE = {"complete", "completed", "full", "reported_complete", "all"}
 ALL_REVIEW_PROVIDERS = {"codex", "claude", "cursor"}
@@ -531,8 +533,20 @@ def _receipt_unresolved(review: dict[str, Any]) -> bool | None:
     return has_flag if has_flag is not None else count_flag
 
 
+def _extract_receipt_markers(body: str) -> list[tuple[int, str | None]]:
+    """Detect recognized receipt marker prefixes separately from closed HTML payloads."""
+    matches: list[tuple[int, str | None]] = []
+    for match in RECEIPT_MARKER_OPEN.finditer(body):
+        marker_index = RECEIPT_MARKER_NAMES.index(match.group(1))
+        start = match.end()
+        end = body.find("-->", start)
+        payload = None if end < 0 else body[start:end].strip()
+        matches.append((marker_index, payload))
+    return matches
+
+
 def _judge_provider_receipt(
-    login_provider: str, marker_index: int, raw: str, head: str
+    login_provider: str, marker_index: int, raw: str | None, head: str
 ) -> tuple[str, str, bool | None, bool]:
     if marker_index < 0:
         return (
@@ -541,6 +555,8 @@ def _judge_provider_receipt(
             True,
             False,
         )
+    if raw is None:
+        return "error", "AI review receipt is malformed or unterminated", None, False
     review = _parse_review_payload(marker_index, raw)
     if not review:
         return "error", "AI review receipt is not valid JSON", None, False
@@ -597,11 +613,7 @@ def ai_review_verdict(
         if login_provider not in active:
             continue
         body = comment.get("body") or ""
-        matches = [
-            (idx, match.group(1))
-            for idx, pattern in enumerate(RECEIPT_MARKERS)
-            for match in pattern.finditer(body)
-        ]
+        matches = _extract_receipt_markers(body)
         if not matches:
             continue
         updated_at = comment.get("updated_at") or ""
@@ -609,7 +621,7 @@ def ai_review_verdict(
         cid = comment_id if isinstance(comment_id, int) and not isinstance(comment_id, bool) else 0
         parsed_ts = _parse_iso_timestamp(updated_at) or _EPOCH_MIN
         if len(matches) > 1 or matches[0][0] not in allowed_indices:
-            marker_index, payload_raw = -1, ""
+            marker_index, payload_raw = -1, None
         else:
             marker_index, payload_raw = matches[0]
         state, note, on_head, provider_ok = _judge_provider_receipt(
