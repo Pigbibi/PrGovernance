@@ -275,8 +275,10 @@ def _load_policy_file(policy_file: str) -> dict[str, Any]:
     try:
         raw = Path(policy_file).read_bytes()
         policy = json.loads(raw)
-    except (OSError, ValueError) as exc:
-        raise Refusal(f"Cannot read policy file {policy_file}: {exc}") from exc
+    except OSError as exc:
+        raise Refusal(f"Cannot read policy file {policy_file}") from exc
+    except ValueError as exc:
+        raise Refusal(f"Invalid JSON in policy file {policy_file}") from exc
     policy_obj = _expect_dict(policy)
     if policy_obj is None:
         raise Refusal(f"Policy file {policy_file} must contain a JSON object")
