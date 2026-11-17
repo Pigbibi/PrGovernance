@@ -1216,5 +1216,31 @@ class TypedValidatorTests(unittest.TestCase):
         self.assertEqual(gate._dict_at(None, "a"), {})
 
 
+class PolicyFileDiagnosticsTests(unittest.TestCase):
+    def test_load_policy_file_uses_fixed_diagnostics_without_raw_exception_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_path = str(Path(tmp) / "missing.json")
+            with mock.patch.object(gate.Path, "read_bytes", side_effect=OSError("raw-os-secret-detail")):
+                with self.assertRaises(gate.Refusal) as os_ctx:
+                    gate._load_policy_file(missing_path)
+            self.assertEqual(str(os_ctx.exception), f"Cannot read policy file {missing_path}")
+            self.assertNotIn("raw-os-secret-detail", str(os_ctx.exception))
+
+            bad_json_path = Path(tmp) / "bad.json"
+            bad_json_path.write_text("{not valid json", encoding="utf-8")
+            with self.assertRaises(gate.Refusal) as json_ctx:
+                gate._load_policy_file(str(bad_json_path))
+            self.assertEqual(str(json_ctx.exception), f"Invalid JSON in policy file {bad_json_path}")
+            self.assertNotIn("Expecting", str(json_ctx.exception))
+            self.assertNotIn("line 1", str(json_ctx.exception))
+
+            non_utf8_path = Path(tmp) / "binary.json"
+            non_utf8_path.write_bytes(b"\xff\xfe")
+            with self.assertRaises(gate.Refusal) as bin_ctx:
+                gate._load_policy_file(str(non_utf8_path))
+            self.assertEqual(str(bin_ctx.exception), f"Invalid JSON in policy file {non_utf8_path}")
+            self.assertNotIn("codec", str(bin_ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
