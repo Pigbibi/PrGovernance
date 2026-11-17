@@ -120,8 +120,12 @@ collector recovers those patches from the diff media type of an immutable
 `base...head` comparison. It matches each file header and verifies the exact
 addition and deletion counts before evaluating, then repeats collection for
 the normal evidence readback. No pull request code is checked out or executed.
-Binary files, unreadable responses, unrecognised quoted paths, inconsistent
-counts and diffs over 16 MiB remain blocking errors.
+
+Deleting a regular non-executable binary file requires a matching deletion in
+the immutable comparison and a matching binary blob at the base commit. The
+path must be absent at the head commit. Other binary changes, unreadable
+responses, unrecognised quoted paths, inconsistent counts and diffs over 16 MiB
+block evaluation.
 
 Evaluation errors publish a fixed reason code in all three required statuses,
 a warning and the job summary. Arbitrary exception text and API response bodies
