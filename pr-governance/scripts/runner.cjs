@@ -34,10 +34,35 @@ function failureReason(error) {
   return 'EVALUATION_ERROR';
 }
 
-// Unlike the per-file REST patch, the diff media type contains large text
-// hunks. Bind the request to immutable commits, match exact file headers and
-// retain the classifier's count checks. Binary, truncated and ambiguous diffs
-// still block; no PR code is checked out or executed.
+async function verifiedBinaryDeletion(github, repo, pr, file, lines) {
+  if (file.status !== 'removed' || file.previous_filename != null || file.patch != null
+    || file.additions !== 0 || file.deletions !== 0 || !gate.isSha(file.sha) || lines.length !== 4
+    || lines[1] !== 'deleted file mode 100644'
+    || lines[3] !== `Binary files a/${file.filename} and /dev/null differ`) return false;
+  const index = /^index ([0-9a-f]{7,40})\.\.0{7,40}$/.exec(lines[2]);
+  if (!index || !file.sha.startsWith(index[1])) return false;
+
+  const base = pr.base.sha;
+  const head = pr.head.sha;
+  const data = await github.graphql(`query($owner:String!,$repo:String!,$base:GitObjectID!,$head:GitObjectID!,
+      $basePath:String!,$headPath:String!) {
+    repository(owner:$owner,name:$repo) {
+      baseCommit: object(oid:$base) { __typename oid }
+      headCommit: object(oid:$head) { __typename oid }
+      oldFile: object(expression:$basePath) { __typename oid ... on Blob { isBinary } }
+      newFile: object(expression:$headPath) { __typename oid }
+    }
+  }`, { ...repo, base, head, basePath: `${base}:${file.filename}`, headPath: `${head}:${file.filename}` });
+  const evidence = data?.repository;
+  return evidence?.baseCommit?.__typename === 'Commit' && evidence.baseCommit.oid === base
+    && evidence.headCommit?.__typename === 'Commit' && evidence.headCommit.oid === head
+    && evidence.oldFile?.__typename === 'Blob' && evidence.oldFile.oid === file.sha
+    && evidence.oldFile.isBinary === true && evidence.newFile === null;
+}
+
+// Recover large text hunks from the immutable comparison. A binary deletion
+// has no hunk, so require Git object evidence before retaining its diff lines.
+// Unknown or ambiguous differences fail closed without executing PR code.
 async function completePatches(github, repo, pr, files) {
   const missing = files.filter(file => !gate.completePatch(file));
   if (!missing.length) return files;
@@ -55,10 +80,10 @@ async function completePatches(github, repo, pr, files) {
     const header = `diff --git a/${previous} b/${file.filename}`;
     const matches = sections.filter(section => section.slice(0, section.indexOf('\n')) === header);
     if (matches.length !== 1) throw invalid();
-    const lines = matches[0].split('\n');
+    const lines = matches[0].replace(/\n$/, '').split('\n');
     const start = lines.findIndex(line => /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line));
-    if (start < 0) throw invalid();
-    const patch = lines.slice(start).join('\n').replace(/\n$/, '');
+    if (start < 0 && !await verifiedBinaryDeletion(github, repo, pr, file, lines)) throw invalid();
+    const patch = lines.slice(start < 0 ? 1 : start).join('\n');
     if (!gate.completePatch({ ...file, patch })) throw invalid();
     recovered.set(file.filename, patch);
   }
