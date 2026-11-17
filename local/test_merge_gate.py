@@ -1179,5 +1179,42 @@ class DefaultRepoTests(unittest.TestCase):
                     self.assertEqual(gate.default_repo(), expected)
 
 
+class TypedValidatorTests(unittest.TestCase):
+    def test_expect_helpers_preserve_falsy_values_and_reject_bool_as_int(self):
+        self.assertEqual(gate._expect_dict({}), {})
+        self.assertIsNone(gate._expect_dict([]))
+        self.assertEqual(gate._expect_list([]), [])
+        self.assertIsNone(gate._expect_list({}))
+
+        self.assertEqual(gate._expect_str(""), "")
+        self.assertIsNone(gate._expect_str("", non_empty=True))
+        self.assertIsNone(gate._expect_str("   ", non_empty=True, strip=True))
+        self.assertEqual(gate._expect_str("  abc  ", non_empty=True, strip=True), "abc")
+
+        self.assertIs(gate._expect_bool(False), False)
+        self.assertIsNone(gate._expect_bool(0))
+        self.assertIsNone(gate._expect_bool(1))
+
+        self.assertEqual(gate._expect_int(0), 0)
+        self.assertEqual(gate._expect_int(-3), -3)
+        self.assertIsNone(gate._expect_int(True))
+        self.assertIsNone(gate._expect_int(False))
+
+        self.assertEqual(gate._expect_nonneg_int(0), 0)
+        self.assertIsNone(gate._expect_nonneg_int(-1))
+        self.assertIsNone(gate._expect_nonneg_int(True))
+        self.assertIsNone(gate._expect_nonneg_int(False))
+
+        self.assertEqual(gate._expect_sha40("A" * 40), "a" * 40)
+        self.assertIsNone(gate._expect_sha40(" " + "a" * 40))
+        self.assertEqual(gate._expect_sha40(" " + "A" * 40 + "\n", strip=True), "a" * 40)
+        self.assertIsNone(gate._expect_sha40("a" * 39))
+        self.assertIsNone(gate._expect_sha40("g" * 40))
+
+        self.assertEqual(gate._dict_at({"a": {"b": 1}}, "a"), {"b": 1})
+        self.assertEqual(gate._dict_at({"a": "not-a-dict"}, "a", "b"), {})
+        self.assertEqual(gate._dict_at(None, "a"), {})
+
+
 if __name__ == "__main__":
     unittest.main()
