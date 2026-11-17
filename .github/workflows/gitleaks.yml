@@ -1,0 +1,105 @@
+name: Shared Gitleaks scan
+
+on:
+  workflow_call:
+    inputs:
+      full-history:
+        description: Scan all fetched branches and their complete history
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      SECRET_SCAN_BASELINE_B64:
+        description: Base64-encoded redacted baseline JSON for full-history scans
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          path: source
+
+      - name: Resolve governance workflow ref
+        id: ref
+        shell: bash
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          ref="${WORKFLOW_REF##*@}"
+          if [[ -z "$ref" || "$ref" == "$WORKFLOW_REF" ]]; then
+            ref="main"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out trusted governance scanner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Pigbibi/PrGovernance
+          ref: ${{ steps.ref.outputs.ref }}
+          persist-credentials: false
+          path: gov-tools
+
+      - name: Install checksum-verified Gitleaks
+        run: bash gov-tools/pr-governance/scripts/install-gitleaks.sh
+
+      - name: Fetch every branch for full-history scan
+        if: inputs.full-history
+        working-directory: source
+        run: git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Run Gitleaks scan
+        id: scan
+        shell: bash
+        env:
+          FULL_HISTORY: ${{ inputs.full-history }}
+          BASELINE_B64: ${{ secrets.SECRET_SCAN_BASELINE_B64 }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/gitleaks-bin/gitleaks"
+          if [[ "$FULL_HISTORY" == "true" ]]; then
+            if [[ -z "${BASELINE_B64:-}" ]]; then
+              echo "SECRET_SCAN_BASELINE_B64 is not configured; refusing to scan without a baseline" >&2
+              exit 1
+            fi
+            printf '%s' "$BASELINE_B64" | base64 --decode > "$RUNNER_TEMP/secret-baseline.json"
+            python3 gov-tools/pr-governance/scripts/secret_scan.py history \
+              --root "$GITHUB_WORKSPACE/source" \
+              --gitleaks "$binary" \
+              --baseline "$RUNNER_TEMP/secret-baseline.json" \
+              --summary "$RUNNER_TEMP/secret-summary.json"
+            exit 0
+          fi
+          base="${PR_BASE:-$PUSH_BASE}"
+          head="${PR_HEAD:-$PUSH_HEAD}"
+          if [[ -z "$base" || "$base" =~ ^0+$ || -z "$head" ]]; then
+            echo "Missing comparison commits; refusing an incomplete scan" >&2
+            exit 2
+          fi
+          python3 gov-tools/pr-governance/scripts/secret_scan.py range \
+            --root "$GITHUB_WORKSPACE/source" \
+            --base "$base" \
+            --head "$head" \
+            --gitleaks "$binary"
+
+      - name: Upload aggregate-only history summary
+        if: ${{ !cancelled() && inputs.full-history && steps.scan.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: gitleaks-history-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/secret-summary.json
+          if-no-files-found: error
+          retention-days: 3
