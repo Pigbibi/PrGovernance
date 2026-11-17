@@ -423,13 +423,16 @@ function writeSummary(core, entries) {
 async function run({ github, context, core, policy, policySha, policyCommit, defaultBranch, now }) {
   const stamp = Number.isFinite(now) ? now : Math.floor(Date.now() / 1000);
   const mode = gate.MODES.includes(policy?.mode) ? policy.mode : 'enforce';
+  const isSweep = context.eventName === 'schedule' || context.eventName === 'push';
   const targets = await selectTargets(github, context, defaultBranch);
   const outcomes = [];
   const failures = [];
+  const evaluationErrors = [];
   for (const number of targets) {
     if (!policy) {
       // Policy is read from the trusted base; without it nothing can be claimed.
       failures.push({ number, message: 'policy unavailable' });
+      evaluationErrors.push({ number, message: 'policy unavailable' });
       await publishUnavailable({ github, context, core, number, mode });
       continue;
     }
@@ -443,6 +446,7 @@ async function run({ github, context, core, policy, policySha, policyCommit, def
     } catch (error) {
       const reason = failureReason(error);
       failures.push({ number, message: reason });
+      evaluationErrors.push({ number, message: reason });
       outcomes.push({ number, allowed: false, reason,
         summary: { pr: number, allowed: false, reason, evaluation_error: true } });
       core?.warning?.(`PR #${number}: evaluation failed (${reason}); evaluation blocked`);
@@ -458,8 +462,15 @@ async function run({ github, context, core, policy, policySha, policyCommit, def
     core?.info?.(`${failures.length} pull request(s) would fail governance: ${failures.map(item => `#${item.number}`).join(', ')}`);
     return { evaluated: targets.length, failures };
   }
+  if (isSweep && !evaluationErrors.length) {
+    // Sweeps still publish blocking commit statuses on each PR head; keep the
+    // scheduled or base-push workflow green unless evaluation itself errored.
+    core?.info?.(`Sweep recorded blocking statuses for ${failures.length} pull request(s): ${failures.map(item => `#${item.number} (${item.message})`).join(', ')}`);
+    return { evaluated: targets.length, failures };
+  }
+  const reported = isSweep ? evaluationErrors : failures;
   // One failure at the end of the sweep, never one per pull request.
-  core?.setFailed?.(`${failures.length} pull request(s) failed governance: ${failures.map(item => `#${item.number}`).join(', ')}`);
+  core?.setFailed?.(`${reported.length} pull request(s) failed governance: ${reported.map(item => `#${item.number}`).join(', ')}`);
   return { evaluated: targets.length, failures };
 }
 

@@ -136,8 +136,9 @@ action: the consumer must first adopt the reviewed fixed action revision.
 
 `policy.json` `mode` controls the outcome:
 
-- `enforce` (default) — publish statuses and fail the run when any pull request
-  fails.
+- `enforce` (default) — publish statuses for every open pull request, fail
+  pull-request evaluations and evaluation errors, and keep `schedule` /
+  base-`push` sweeps green when all evaluations complete cleanly.
 - `report-only` — publish advisory statuses, warn instead of failing. Use for
   the first week of a migration.
 - `local` — publish nothing. Used by the private-repository track, where branch

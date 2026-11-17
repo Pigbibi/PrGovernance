@@ -327,13 +327,52 @@ test('one stale pull request does not stop the sweep from evaluating the rest', 
   });
   const result = await runMock(m);
   // The stale pull request is a stable verdict, not a failure; the sweep still
-  // evaluated the second one and failed only for it.
-  assert.equal(m.failures.length, 1);
-  assert.match(m.failures[0], /#43/);
-  assert.doesNotMatch(m.failures[0], /#42/);
+  // evaluated the second one, published its blocking status, and left the push sweep green.
+  assert.equal(m.failures.length, 0);
+  assert.equal(m.infos.length, 1);
+  assert.match(m.infos[0], /#43/);
+  assert.doesNotMatch(m.infos[0], /#42/);
   assert.ok(m.statuses.some(status => status.description === 'R1: base-outdated'));
+  assert.ok(m.statuses.some(status => status.sha === other && status.context === 'risk-gate' && status.state === 'failure'));
   assert.deepEqual([...new Set(m.statuses.map(status => status.sha))].sort(), [other, HEAD].sort());
   assert.deepEqual(result.failures.map(item => item.number), [43]);
+});
+
+test('schedule sweep publishes blocking R2 status without failing the sweep job', async () => {
+  const f = receiptMarker(fixture({ path: 'config/settings.json' }));
+  const m = mock(f, { eventName: 'schedule', open: [{ number: 42, head: { sha: HEAD } }] });
+  m.context.payload = {};
+  const result = await runMock(m);
+  assert.equal(m.failures.length, 0);
+  assert.equal(m.infos.length, 1);
+  assert.match(m.infos[0], /#42 \(clearing_label_required\)/);
+  assert.equal(m.statuses.find(status => status.context === 'risk-gate').state, 'failure');
+  assert.deepEqual(result.failures.map(item => item.number), [42]);
+});
+
+test('schedule sweep fails the job when an evaluation error occurs', async () => {
+  const m = mock(fixture(), { eventName: 'schedule', open: [{ number: 42, head: { sha: HEAD } }] });
+  m.context.payload = {};
+  const list = m.github.paginate;
+  m.github.paginate = async (method, params) => {
+    if (method !== m.github.rest.pulls.list) throw new Error('API unavailable');
+    return list(method, params);
+  };
+  const result = await runMock(m);
+  assert.equal(m.failures.length, 1);
+  assert.match(m.failures[0], /#42/);
+  assert.ok(m.statuses.some(status => status.state === 'error'));
+  assert.deepEqual(result.failures.map(item => item.number), [42]);
+});
+
+test('pull_request_target fails when an R2 PR lacks a clearing label', async () => {
+  const f = receiptMarker(fixture({ path: 'config/settings.json' }));
+  const m = mock(f, { eventName: 'pull_request_target' });
+  const result = await runMock(m);
+  assert.equal(m.failures.length, 1);
+  assert.match(m.failures[0], /#42/);
+  assert.equal(m.statuses.find(status => status.context === 'risk-gate').state, 'failure');
+  assert.deepEqual(result.failures.map(item => item.number), [42]);
 });
 
 // ------------------------------------------------------------ shared head ---

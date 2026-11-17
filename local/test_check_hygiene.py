@@ -145,7 +145,19 @@ class CheckHygieneTests(unittest.TestCase):
             self.assertIn("docs/acceptance-policy.md", pub.stdout)
 
             priv = self._run_cli(repo, "--private")
-            self.assertEqual(priv.returncode, 0, msg=priv.stdout + priv.stderr)
+            self.assertEqual(priv.returncode, 1)
+            self.assertIn("docs/acceptance-policy.md: internal artifact must not be tracked in Git", priv.stdout)
+
+            subprocess.run(
+                ["git", "rm", "-f", "--cached", "docs/changes/card.md", "docs/acceptance-policy.md"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            (repo / "docs" / "changes" / "card.md").unlink()
+            (repo / "docs" / "acceptance-policy.md").unlink()
+            priv_clean = self._run_cli(repo, "--private")
+            self.assertEqual(priv_clean.returncode, 0, msg=priv_clean.stdout + priv_clean.stderr)
 
             (repo / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
             missing_gi = self._run_cli(repo, "--private")
@@ -191,6 +203,30 @@ class CheckHygieneTests(unittest.TestCase):
             self.assertEqual(staged_res.returncode, 1)
             self.assertIn("docs/changes/", staged_res.stdout)
 
+
+    def test_english_only_flag_rejects_zh_cn_docs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._init_minimal_repo(root)
+            (root / "README.md").write_text("# Demo\n\n[中文](README.zh-CN.md)\n", encoding="utf-8")
+            (root / "README.zh-CN.md").write_text("# Demo\n\n[EN](README.md)\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md", "README.zh-CN.md"], cwd=root, check=True)
+            ok = self._run_cli(root, "--private", "--strict")
+            self.assertEqual(ok.returncode, 0, msg=ok.stdout + ok.stderr)
+            fail = self._run_cli(root, "--private", "--strict", "--english-only")
+            self.assertEqual(fail.returncode, 1)
+            self.assertIn("README.zh-CN.md: .zh-CN.md files are retired", fail.stdout)
+
+    def test_long_list_item_warns_under_strict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._init_minimal_repo(root)
+            (root / "docs" / "architecture.md").write_text(
+                "# Arch\n\n- " + ("word " * 180) + "\n", encoding="utf-8"
+            )
+            res = self._run_cli(root, "--private", "--strict")
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("list item runs", res.stdout)
 
 if __name__ == "__main__":
     unittest.main()
