@@ -635,6 +635,23 @@ test('an immutable comparison and both Git objects prove a binary deletion', asy
     Array(2).fill([BASE, HEAD, `${BASE}:assets/example.png`, `${HEAD}:assets/example.png`]));
 });
 
+test('a truncated large binary blob with null isBinary still proves a binary deletion', async () => {
+  const { m, repository } = binaryDeletion('fonts/NotoSansMonoCJKsc-Regular.otf');
+  repository.oldFile.isBinary = null;
+  repository.oldFile.isTruncated = true;
+  await runMock(m);
+  assert.deepEqual(states(m), [['pr-template', 'success'], ['ai-review', 'success'], ['risk-gate', 'success']]);
+});
+
+test('a blob with null isBinary and without truncation fails closed', async () => {
+  const { m, repository } = binaryDeletion();
+  repository.oldFile.isBinary = null;
+  repository.oldFile.isTruncated = false;
+  const result = await runMock(m);
+  assert.equal(result.failures[0].message, 'DIFF_EVIDENCE_INVALID');
+  assert.ok(m.statuses.length === 3 && m.statuses.every(status => status.state === 'error'));
+});
+
 test('deleting a binary at a protected path still requires a clearing label', async () => {
   const { m } = binaryDeletion('config/example.png');
   await runMock(m);
