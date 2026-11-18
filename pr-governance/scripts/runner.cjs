@@ -49,7 +49,7 @@ async function verifiedBinaryDeletion(github, repo, pr, file, lines) {
     repository(owner:$owner,name:$repo) {
       baseCommit: object(oid:$base) { __typename oid }
       headCommit: object(oid:$head) { __typename oid }
-      oldFile: object(expression:$basePath) { __typename oid ... on Blob { isBinary } }
+      oldFile: object(expression:$basePath) { __typename oid ... on Blob { isBinary isTruncated } }
       newFile: object(expression:$headPath) { __typename oid }
     }
   }`, { ...repo, base, head, basePath: `${base}:${file.filename}`, headPath: `${head}:${file.filename}` });
@@ -57,7 +57,9 @@ async function verifiedBinaryDeletion(github, repo, pr, file, lines) {
   return evidence?.baseCommit?.__typename === 'Commit' && evidence.baseCommit.oid === base
     && evidence.headCommit?.__typename === 'Commit' && evidence.headCommit.oid === head
     && evidence.oldFile?.__typename === 'Blob' && evidence.oldFile.oid === file.sha
-    && evidence.oldFile.isBinary === true && evidence.newFile === null;
+    && (evidence.oldFile.isBinary === true
+      || (evidence.oldFile.isBinary === null && evidence.oldFile.isTruncated === true))
+    && evidence.newFile === null;
 }
 
 // Recover large text hunks from the immutable comparison. A binary deletion
