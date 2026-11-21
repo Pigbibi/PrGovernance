@@ -18,9 +18,9 @@ on:
   push:
     branches: [main, master]
   # A merge made with GITHUB_TOKEN raises no push, and nothing raises an event
-  # for a resolved review thread, so a sweep closes both gaps.
+  # for a resolved review thread, so a daily sweep closes both gaps.
   schedule:
-    - cron: '17 */6 * * *'
+    - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
       pr_number:

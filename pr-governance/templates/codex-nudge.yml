@@ -7,7 +7,7 @@ name: Review request
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '15 2,14 * * *'
   workflow_dispatch:
 
 permissions:
