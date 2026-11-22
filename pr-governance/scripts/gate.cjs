@@ -10,7 +10,7 @@ const SCHEMA = 'pr-governance/v3';
 const MODES = ['enforce', 'local', 'report-only'];
 const POLICY_FIELDS = ['version', 'mode', 'reviewer', 'r0_paths', 'r2_paths',
   'dependabot_template_exemption', 'max_evidence_age_hours'];
-const POLICY_OPTIONAL_FIELDS = ['owner', 'reviewers', 'review_routing'];
+const POLICY_OPTIONAL_FIELDS = ['owner', 'reviewers', 'review_routing', 'max_r1_diff_lines'];
 const REVIEWER_FIELDS = ['provider', 'app_id', 'user_id', 'login'];
 const OWNER_FIELDS = ['user_id', 'login'];
 const PROVIDERS = ['claude', 'codex', 'cursor'];
@@ -176,6 +176,10 @@ function validatePolicy(policy) {
   assert(typeof policy.dependabot_template_exemption === 'boolean', 'Invalid dependabot_template_exemption');
   assert(typeof policy.max_evidence_age_hours === 'number' && policy.max_evidence_age_hours >= 1
     && policy.max_evidence_age_hours <= 720, 'Invalid max_evidence_age_hours');
+  if (policy.max_r1_diff_lines !== undefined) {
+    assert(Number.isSafeInteger(policy.max_r1_diff_lines) && policy.max_r1_diff_lines >= 50
+      && policy.max_r1_diff_lines <= 5000, 'Invalid max_r1_diff_lines');
+  }
   if (policy.review_routing !== undefined) {
     sameKeys(policy.review_routing, ROUTING_FIELDS, 'review_routing');
     const mentions = policy.review_routing.dispatch_mentions;
@@ -195,7 +199,14 @@ const PROTECTED_TOKEN = new RegExp('(^|[/_.-])(auth(?:entication|orization)?|oau
   + '([/_.-]|$)');
 const MANIFEST = new RegExp('(^|/)(dockerfile(?:\\..*)?|docker-compose[^/]*|compose\\.ya?ml|vercel\\.json'
   + '|wrangler\\.(?:toml|jsonc?)|firebase\\.json|package(?:-lock)?\\.json|requirements[^/]*|pyproject\\.toml'
-  + '|setup\\.(?:py|cfg)|uv\\.lock|poetry\\.lock|yarn\\.lock|pnpm-lock\\.yaml|makefile|.*\\.config\\.[^/]+)$');
+  + '|setup\\.(?:py|cfg)|uv\\.lock|poetry\\.lock|yarn\\.lock|pnpm-lock\\.yaml|makefile|.*\\.config\\.[^/]+'
+  + '|\\.ruff\\.toml|ruff-shared\\.toml|pyrightconfig\\.json|\\.importlinter|importlinter\\.toml'
+  + '|build\\.gradle(?:\\.kts)?|settings\\.gradle(?:\\.kts)?|\\.pre-commit-config\\.yaml'
+  + '|knip\\.jsonc?|\\.jscpd\\.json)$');
+const LOCKFILE_OR_PROSE = /(?:^|\/)(?:package-lock\.json|uv\.lock|poetry\.lock|yarn\.lock|pnpm-lock\.yaml|cargo\.lock|gemfile\.lock)$|\.(?:md|txt|rst)$/i;
+const FIXTURE_PATH = /(?:^|\/)fixtures(?:\/|$)/i;
+const TEST_PATH = /(?:^|\/)(?:tests?|__tests__|spec)(?:\/|$)|(?:\.|_)(?:test|spec)\.[^/]+$/i;
+const DEFAULT_MAX_R1_DIFF_LINES = 500;
 const GOVERNANCE_SCRIPT = /^scripts\/[^/]*(?:check|verify|validate|hygiene|lint)[^/]*\.(?:py|sh|js|cjs|mjs|ts)$/;
 const SECRET_MATERIAL = /\.(?:tf|tfvars|pem|key|p12|pfx)$/;
 
@@ -253,6 +264,10 @@ function classify(files, expected, policy, options = {}) {
   const allowlisted = dependabot.detected && Array.isArray(dependabot.action_files) ? dependabot.action_files : [];
   let tier = 'R0';
   const rules = [];
+  let effectiveDiffLines = 0;
+  let newMonolith = false;
+  const maxR1DiffLines = Number.isSafeInteger(policy.max_r1_diff_lines)
+    ? policy.max_r1_diff_lines : DEFAULT_MAX_R1_DIFF_LINES;
   for (const file of files) {
     assert(['added', 'modified', 'removed', 'renamed', 'copied', 'changed'].includes(file.status), 'Unknown file status');
     assert(isSha(file.sha), 'Missing file object SHA');
@@ -276,10 +291,19 @@ function classify(files, expected, policy, options = {}) {
     // workflow definition still needs one.
     if (fileTier === 'R2' && dependabot.detected && allowlisted.includes(file.filename)
       && isWorkflowPath(file.filename) && !file.previous_filename && pureActionRepin(file)) fileTier = 'R1';
+    if (!LOCKFILE_OR_PROSE.test(file.filename) && !FIXTURE_PATH.test(file.filename)) {
+      effectiveDiffLines += file.additions + file.deletions;
+      if (file.status === 'added' && !TEST_PATH.test(file.filename) && file.additions > maxR1DiffLines) {
+        newMonolith = true;
+      }
+    }
     if (fileTier > tier) tier = fileTier;
     rules.push({ paths, tier: fileTier });
   }
-  return { tier, rules };
+  if ((effectiveDiffLines > maxR1DiffLines || newMonolith) && tier < 'R2' && !dependabot.detected) {
+    tier = 'R2';
+  }
+  return { tier, rules, effectiveDiffLines, newMonolith };
 }
 
 // --------------------------------------------------------------- evidence ---

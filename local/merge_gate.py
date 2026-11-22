@@ -74,8 +74,12 @@ STRUCTURAL_PATHS = (
     re.compile(r"(^|/)(profiles?|skills?)(/|$)"),
     re.compile(r"(^|/)\.agents(/|$)"),
     re.compile(r"(^|/)(dockerfile(?:\..*)?|docker-compose[^/]*|compose\.ya?ml|vercel\.json|wrangler\.(?:toml|jsonc?)|firebase\.json)$"),
+    re.compile(r"(^|/)(pyproject\.toml|package\.json|.*\.config\.[^/]+|\.ruff\.toml|ruff-shared\.toml|pyrightconfig\.json|\.importlinter|importlinter\.toml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|\.pre-commit-config\.yaml|knip\.jsonc?|\.jscpd\.json)$"),
     re.compile(r"\.(?:tf|tfvars)$"),
 )
+DEFAULT_MAX_T1_DIFF_LINES = 500
+PROSE_OR_FIXTURE_DIFF = re.compile(r"(?:\.(?:md|txt|rst)$|(?:^|/)fixtures(?:\/|$))", re.IGNORECASE)
+TEST_SOURCE_PATH = re.compile(r"(?:^|/)(?:tests?|__tests__|spec)(?:/|$)|(?:\.|_)(?:test|spec)\.[^/]+$", re.IGNORECASE)
 KEYWORD_PATHS = (
     re.compile(r"(^|[/_.-])(secrets?|credentials?|iam)([/_.-]|$)"),
     re.compile(r"(^|[/_.-])(config|configuration|settings)([/_.-]|$)"),
@@ -444,6 +448,18 @@ def classify(
     if files and all(is_t0(file) for file in files):
         return "T0", False
     if any(is_keyword(name) for name in names):
+        return "T2", False
+    effective_diff = 0
+    for file in files:
+        fname = file.get("filename") or ""
+        if PROSE_OR_FIXTURE_DIFF.search(fname):
+            continue
+        additions = file.get("additions") or 0
+        deletions = file.get("deletions") or 0
+        effective_diff += additions + deletions
+        if file.get("status") == "added" and not TEST_SOURCE_PATH.search(fname) and additions > DEFAULT_MAX_T1_DIFF_LINES:
+            return "T2", False
+    if effective_diff > DEFAULT_MAX_T1_DIFF_LINES:
         return "T2", False
     return "T1", False
 

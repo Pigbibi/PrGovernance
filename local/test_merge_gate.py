@@ -1242,5 +1242,27 @@ class PolicyFileDiagnosticsTests(unittest.TestCase):
             self.assertNotIn("codec", str(bin_ctx.exception))
 
 
+class DiffVolumeAndConfigProtectionTests(unittest.TestCase):
+    def test_lint_type_arch_and_build_configs_classify_as_t2(self):
+        for cfg in (".ruff.toml", "ruff-shared.toml", "pyrightconfig.json", ".importlinter", "build.gradle", ".pre-commit-config.yaml"):
+            tier, fast = gate.classify([{"filename": cfg, "status": "modified", "additions": 1, "deletions": 0}], False, set(), ())
+            self.assertEqual((tier, fast), ("T2", False), cfg)
+
+    def test_oversized_source_diff_escalates_t1_to_t2_while_exempting_prose(self):
+        prose_only = [
+            {"filename": "src/app.py", "status": "modified", "additions": 20, "deletions": 0},
+            {"filename": "docs/guide.md", "status": "modified", "additions": 600, "deletions": 0},
+            {"filename": "tests/fixtures/data.json", "status": "modified", "additions": 600, "deletions": 0},
+        ]
+        self.assertEqual(gate.classify(prose_only, False, set(), ()), ("T1", False))
+
+        oversized = [{"filename": "src/app.py", "status": "modified", "additions": 501, "deletions": 0}]
+        self.assertEqual(gate.classify(oversized, False, set(), ()), ("T2", False))
+
+    def test_new_monolith_source_file_escalates_t1_to_t2(self):
+        new_file = [{"filename": "src/monolith.py", "status": "added", "additions": 501, "deletions": 0}]
+        self.assertEqual(gate.classify(new_file, False, set(), ()), ("T2", False))
+
+
 if __name__ == "__main__":
     unittest.main()

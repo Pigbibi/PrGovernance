@@ -49,7 +49,7 @@ test('the schema file lists exactly the fields the evaluator enforces', () => {
   const declared = Object.keys(schema.properties).sort();
   const validated = ['version', 'mode', 'reviewer', 'r0_paths', 'r2_paths',
     'dependabot_template_exemption', 'max_evidence_age_hours'].sort();
-  assert.deepEqual(declared, [...validated, 'owner', 'reviewers', 'review_routing'].sort());
+  assert.deepEqual(declared, [...validated, 'owner', 'reviewers', 'review_routing', 'max_r1_diff_lines'].sort());
   assert.deepEqual([...schema.required].sort(), validated);
   assert.deepEqual([...schema.properties.mode.enum].sort(), ['enforce', 'local', 'report-only']);
   assert.deepEqual(schema.properties.reviewer.required.sort(), ['app_id', 'login', 'provider', 'user_id']);
@@ -423,4 +423,43 @@ test('ai-review-receipt is accepted from any configured reviewer', () => {
   const result = evaluate(f);
   assert.equal(result.review.state, 'success');
   assert.equal(result.review.provider, 'cursor');
+});
+
+test('lint, type, architecture, and build config files require R2 clearing label', () => {
+  const f = fixture();
+  for (const cfg of ['.ruff.toml', 'ruff-shared.toml', 'pyrightconfig.json', '.importlinter', 'build.gradle', '.pre-commit-config.yaml']) {
+    assert.equal(gate.pathTier(cfg, f.policy), 'R2', `${cfg} should be R2`);
+  }
+});
+
+test('oversized source diff (>500 effective lines) escalates R1 to R2 while exempting prose and fixtures', () => {
+  const f = fixture();
+  const makePatch = count => Array.from({ length: count }, (_, i) => `+line_${i}`).join('\n');
+  // 600 lines in prose + fixtures stays R1
+  f.files = [
+    { filename: 'src/app.py', status: 'modified', sha: 'a'.repeat(40), additions: 10, deletions: 0, patch: makePatch(10) },
+    { filename: 'docs/guide.md', status: 'modified', sha: 'b'.repeat(40), additions: 600, deletions: 0, patch: makePatch(600) },
+    { filename: 'tests/fixtures/sample.json', status: 'modified', sha: 'c'.repeat(40), additions: 600, deletions: 0, patch: makePatch(600) },
+  ];
+  assert.equal(gate.classify(f.files, 3, f.policy).tier, 'R1');
+
+  // >500 effective source lines escalates to R2
+  f.files = [
+    { filename: 'src/app.py', status: 'modified', sha: 'a'.repeat(40), additions: 501, deletions: 0, patch: makePatch(501) },
+  ];
+  const risk = gate.classify(f.files, 1, f.policy);
+  assert.equal(risk.tier, 'R2');
+  assert.equal(risk.effectiveDiffLines, 501);
+});
+
+test('new non-test source file over max_r1_diff_lines escalates to R2', () => {
+  const f = fixture();
+  f.policy.max_r1_diff_lines = 100;
+  const makePatch = count => Array.from({ length: count }, (_, i) => `+line_${i}`).join('\n');
+  f.files = [
+    { filename: 'src/monolith.py', status: 'added', sha: 'a'.repeat(40), additions: 101, deletions: 0, patch: makePatch(101) },
+  ];
+  const risk = gate.classify(f.files, 1, f.policy);
+  assert.equal(risk.tier, 'R2');
+  assert.equal(risk.newMonolith, true);
 });
