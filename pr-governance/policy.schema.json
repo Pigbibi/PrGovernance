@@ -161,6 +161,12 @@
       "type": "number",
       "minimum": 1,
       "maximum": 720
+    },
+    "max_r1_diff_lines": {
+      "description": "Optional maximum effective source diff lines (additions + deletions, excluding lockfiles, fixtures, and prose) allowed at R1 before escalating to R2. Defaults to 500.",
+      "type": "integer",
+      "minimum": 50,
+      "maximum": 5000
     }
   }
 }

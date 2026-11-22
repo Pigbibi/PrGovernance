@@ -94,3 +94,51 @@ test('reports a clear error when commenting is forbidden', async () => {
   );
   assert.equal(h.posted.length, 0);
 });
+
+test('falls back to @claude review immediately when codex hits quota after stage 1', async () => {
+  const s1Time = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  const quotaTime = new Date(Date.now() - 1 * 60 * 1000).toISOString();
+  const h = harness({
+    comments: [
+      { user: { login: 'github-actions[bot]' }, created_at: s1Time, body: marker(HEAD, 1) },
+      { user: { id: codex.user_id, login: codex.login }, created_at: quotaTime, body: 'Codex usage limit reached. Please try again later.' },
+    ],
+  });
+  await run({ ...h, core });
+  assert.equal(h.posted.length, 1);
+  assert.match(h.posted[0], /@claude review/);
+  assert.doesNotMatch(h.posted[0], /@codex review/);
+  assert.match(h.posted[0], /governance-nudge:a{40}:stage2/);
+});
+
+test('falls back to @claude review on timeout and escalates to cursor human prompt at stage 3', async () => {
+  const oldS1 = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+  const h2 = harness({
+    comments: [{ user: { login: 'github-actions[bot]' }, created_at: oldS1, body: marker(HEAD, 1) }],
+  });
+  await run({ ...h2, core });
+  assert.equal(h2.posted.length, 1);
+  assert.match(h2.posted[0], /@claude review/);
+
+  const prevReviewers = process.env.GOVERNANCE_REVIEWERS_JSON;
+  process.env.GOVERNANCE_REVIEWERS_JSON = JSON.stringify([
+    codex,
+    { provider: 'claude', app_id: 1236702, user_id: 209825114, login: 'claude[bot]' },
+    { provider: 'cursor', app_id: 1210556, user_id: 206951365, login: 'cursor[bot]' },
+  ]);
+  try {
+    const h3 = harness({
+      comments: [
+        { user: { login: 'github-actions[bot]' }, created_at: oldS1, body: marker(HEAD, 1) },
+        { user: { login: 'github-actions[bot]' }, created_at: oldS1, body: marker(HEAD, 2) },
+      ],
+    });
+    await run({ ...h3, core });
+    assert.equal(h3.posted.length, 1);
+    assert.match(h3.posted[0], /cursor review/);
+    assert.match(h3.posted[0], /governance-nudge:a{40}:stage3/);
+  } finally {
+    if (prevReviewers === undefined) delete process.env.GOVERNANCE_REVIEWERS_JSON;
+    else process.env.GOVERNANCE_REVIEWERS_JSON = prevReviewers;
+  }
+});
