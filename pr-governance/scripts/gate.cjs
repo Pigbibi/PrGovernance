@@ -13,7 +13,7 @@ const POLICY_FIELDS = ['version', 'mode', 'reviewer', 'r0_paths', 'r2_paths',
 const POLICY_OPTIONAL_FIELDS = ['owner', 'reviewers', 'review_routing', 'max_r1_diff_lines'];
 const REVIEWER_FIELDS = ['provider', 'app_id', 'user_id', 'login'];
 const OWNER_FIELDS = ['user_id', 'login'];
-const PROVIDERS = ['claude', 'codex', 'cursor'];
+const PROVIDERS = ['claude', 'codex', 'cursor', 'deepseek', 'opencode'];
 const MARKER_NAMES = [
   'ai-review-receipt:v1',
   'codex-review-receipt:v1',
@@ -639,6 +639,6 @@ module.exports = {
   SCHEMA, MODES, CLEARING_LABELS, MARKER_NAMES, REVIEW_TEXT,
   sha256Hex, canonical, digest, isSha,
   validatePolicy, reviewerChain, validateReviewer, pathTier, completePatch, classify, completeTemplate, binding,
-  stableComment, stableThread, matchesReviewer, matchesAnyReviewer, matchesThreadAuthor, normalizeLogin,
+  stableComment, stableThread, matchesReviewer, matchesAnyReviewer, matchesThreadAuthor, normalizeLogin, markerPayloads,
   reviewerEvidence, dependabotEvidence, labelEvidence, templateVerdict, evaluate,
 };
