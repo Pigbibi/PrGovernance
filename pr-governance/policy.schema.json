@@ -41,7 +41,9 @@
           "enum": [
             "claude",
             "codex",
-            "cursor"
+            "cursor",
+            "deepseek",
+            "opencode"
           ]
         },
         "app_id": {
@@ -77,7 +79,9 @@
             "enum": [
               "claude",
               "codex",
-              "cursor"
+              "cursor",
+              "deepseek",
+              "opencode"
             ]
           },
           "app_id": {
