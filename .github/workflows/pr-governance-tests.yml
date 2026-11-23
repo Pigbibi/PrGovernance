@@ -34,3 +34,5 @@ jobs:
         run: python3 pr-governance/scripts/test_secret_scan.py
       - name: Test the local hook runner
         run: python3 -m unittest discover -s local -p 'test_*.py'
+      - name: Test repo scaffolding and org audit scripts
+        run: PYTHONPATH=. python3 -m unittest discover -s scripts -p 'test_*.py'

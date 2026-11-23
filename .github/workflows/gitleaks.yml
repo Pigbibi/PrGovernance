@@ -1,6 +1,9 @@
 name: Shared Gitleaks scan
 
 on:
+  pull_request:
+  push:
+    branches: ["main"]
   workflow_call:
     inputs:
       full-history:
