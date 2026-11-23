@@ -98,6 +98,33 @@ class InitRepoAndAuditTests(unittest.TestCase):
         self.assertIn("missing .githooks", priv.issues)
         self.assertIn("missing .pre-commit-config.yaml", priv.issues)
 
+    def test_private_scaffold_copies_merge_gate_and_local_tool_audit(self):
+        import shutil
+        import subprocess
+        from unittest import mock
+        from scripts.org_audit import run_local_tool_audit
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (target / "package.json").write_text("{}\n", encoding="utf-8")
+            created = scaffold_repo(
+                target,
+                repo_slug="Pigbibi/PrivateApp",
+                visibility="private",
+                stack="python",
+                governance_root=Path(__file__).resolve().parents[1],
+            )
+            self.assertIn("governance/merge_gate.py", created)
+            self.assertTrue((target / "governance/merge_gate.py").is_file())
+
+            fake_ok = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(shutil, "which", side_effect=lambda cmd: f"/usr/bin/{cmd}" if cmd in {"jscpd", "vulture"} else None):
+                res = run_local_tool_audit(target, runner=lambda *a, **kw: fake_ok)
+            self.assertEqual(res["jscpd"], "clean")
+            self.assertEqual(res["vulture"], "clean")
+            self.assertEqual(res["knip"], "skipped (not installed)")
+
 
 if __name__ == "__main__":
     unittest.main()
