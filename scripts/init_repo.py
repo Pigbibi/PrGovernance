@@ -174,6 +174,14 @@ def scaffold_repo(
         pol_src = gov_root / "pr-governance/policy.default.json"
         if pol_src.exists() and _write_if_missing(target_dir / "governance/policy.json", pol_src.read_text(encoding="utf-8")):
             created.append("governance/policy.json")
+        gate_src = local_dir / "merge_gate.py"
+        if gate_src.exists():
+            gate_dst = target_dir / "governance/merge_gate.py"
+            if not gate_dst.exists():
+                gate_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(gate_src, gate_dst)
+                gate_dst.chmod(gate_dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                created.append("governance/merge_gate.py")
 
     if stack == "python":
         if _write_if_missing(target_dir / ".ruff.toml", RUFF_TOML):

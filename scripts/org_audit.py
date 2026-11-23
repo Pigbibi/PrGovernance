@@ -165,11 +165,47 @@ def audit_private_dir(root: Path) -> list[RepoFinding]:
     return findings
 
 
+def run_local_tool_audit(
+    repo_dir: Path,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> dict[str, str]:
+    """Run optional local duplication/dead-code checks (jscpd, vulture, knip) when tools exist."""
+    import shutil
+
+    results: dict[str, str] = {}
+    if shutil.which("jscpd"):
+        res = runner(
+            ["jscpd", "--silent", "--min-lines", "10", "--ignore", "**/.git/**,**/node_modules/**,**/.venv/**,**/external/**", str(repo_dir)],
+            capture_output=True, text=True, check=False,
+        )
+        results["jscpd"] = "clean" if res.returncode == 0 else f"findings (rc={res.returncode})"
+    else:
+        results["jscpd"] = "skipped (not installed)"
+
+    if (repo_dir / "pyproject.toml").is_file() or any(repo_dir.glob("src/**/*.py")):
+        if shutil.which("vulture"):
+            target = str(repo_dir / "src") if (repo_dir / "src").is_dir() else str(repo_dir)
+            res = runner(["vulture", target, "--min-confidence", "80"], capture_output=True, text=True, check=False)
+            lines = [ln for ln in (res.stdout or "").splitlines() if ln.strip()]
+            results["vulture"] = "clean" if res.returncode == 0 else f"{len(lines)} candidate(s)"
+        else:
+            results["vulture"] = "skipped (not installed)"
+
+    if (repo_dir / "package.json").is_file():
+        if shutil.which("knip"):
+            res = runner(["knip", "--no-progress"], cwd=str(repo_dir), capture_output=True, text=True, check=False)
+            results["knip"] = "clean" if res.returncode == 0 else f"findings (rc={res.returncode})"
+        else:
+            results["knip"] = "skipped (not installed)"
+    return results
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Weekly centralized governance drift audit.")
     parser.add_argument("--owners", nargs="+", default=["Pigbibi", "GdeiAssistant", "QuantStrategyLab"])
     parser.add_argument("--canonical-sha", required=True)
     parser.add_argument("--private-dir", type=Path, default=None, help="Optional directory of local private repo checkouts")
+    parser.add_argument("--run-tools", action="store_true", help="Run installed local static tools (jscpd/vulture/knip) on --private-dir repos")
     args = parser.parse_args(argv)
 
     all_findings: list[RepoFinding] = []
@@ -177,6 +213,11 @@ def main(argv: list[str] | None = None) -> int:
         all_findings.extend(audit_namespace(owner, args.canonical_sha))
     if args.private_dir is not None:
         all_findings.extend(audit_private_dir(args.private_dir))
+        if args.run_tools and args.private_dir.is_dir():
+            for child in sorted(args.private_dir.iterdir()):
+                if child.is_dir() and (child / ".git").exists():
+                    summary = run_local_tool_audit(child)
+                    print(f"[tools] {child.name}: {json.dumps(summary, ensure_ascii=False)}")
 
     for f in all_findings:
         print(f"- {f.repo}: {'; '.join(f.issues)}")
