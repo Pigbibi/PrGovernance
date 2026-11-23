@@ -450,6 +450,11 @@ test('oversized source diff (>500 effective lines) escalates R1 to R2 while exem
   const risk = gate.classify(f.files, 1, f.policy);
   assert.equal(risk.tier, 'R2');
   assert.equal(risk.effectiveDiffLines, 501);
+  assert.equal(risk.volumeEscalated, true);
+  f.snapshot.files = f.files;
+  f.snapshot.pr.changed_files = 1;
+  const verdict = evaluate(f);
+  assert.match(verdict.statuses.find(s => s.context === 'risk-gate').description, /diff volume exceeded/);
 });
 
 test('new non-test source file over max_r1_diff_lines escalates to R2', () => {

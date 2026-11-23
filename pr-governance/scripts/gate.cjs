@@ -300,10 +300,12 @@ function classify(files, expected, policy, options = {}) {
     if (fileTier > tier) tier = fileTier;
     rules.push({ paths, tier: fileTier });
   }
+  let volumeEscalated = false;
   if ((effectiveDiffLines > maxR1DiffLines || newMonolith) && tier < 'R2' && !dependabot.detected) {
     tier = 'R2';
+    volumeEscalated = true;
   }
-  return { tier, rules, effectiveDiffLines, newMonolith };
+  return { tier, rules, effectiveDiffLines, newMonolith, volumeEscalated };
 }
 
 // --------------------------------------------------------------- evidence ---
@@ -576,10 +578,13 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
   // so an agent-cleared merge is visible instead of passing as a human review.
   const cleared = labels.applied === 'owner' ? 'cleared by owner-approved'
     : labels.applied === 'agent' ? 'cleared by agent-approved, NOT confirmed by the owner' : null;
+  const gateReasonText = reason === 'clearing_label_required' && risk.volumeEscalated
+    ? 'diff volume exceeded; needs owner-approved or agent-approved'
+    : (GATE_TEXT[reason] || REVIEW_TEXT[reason] || reason);
   const gateDescription = gateState === 'success'
     ? `${risk.tier}: ${cleared || 'review verified'}`
     : gateState === 'pending' ? `${risk.tier}: waiting for reviewer`
-      : `${risk.tier}: ${GATE_TEXT[reason] || REVIEW_TEXT[reason] || reason}`;
+      : `${risk.tier}: ${gateReasonText}`;
   const evidenceSha = digest({
     binding: expected,
     tier: risk.tier,
