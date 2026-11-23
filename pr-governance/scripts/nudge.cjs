@@ -8,9 +8,13 @@ const gate = require('./gate.cjs');
 const defaults = require('../policy.default.json');
 
 const MIN_HEAD_AGE_MS = 10 * 60 * 1000;
+const FALLBACK_WAIT_MS = 15 * 60 * 1000;
 const MAX_PULL_REQUESTS = 100;
+const QUOTA_PATTERN = /\b(?:usage\s+limit|rate\s*limit|quota\s+(?:exceeded|reached|exhausted)|out\s+of\s+credits?|limit\s+reached|try\s+again\s+later)\b|额度已用完|达到上限/i;
 
-const marker = head => `<!-- governance-nudge:${head} -->`;
+const marker = (head, stage = 1) => (stage === 1
+  ? `<!-- governance-nudge:${head} -->`
+  : `<!-- governance-nudge:${head}:stage${stage} -->`);
 
 function dispatchMentions(policy) {
   const raw = process.env.GOVERNANCE_DISPATCH_MENTIONS_JSON;
@@ -56,9 +60,29 @@ function receiptFor(comments, head, chain) {
     && comment.body.includes(head));
 }
 
+function findNudgeComment(comments, head, stage) {
+  if (stage === 1) {
+    const legacy = `<!-- governance-nudge:${head} -->`;
+    const explicit = `<!-- governance-nudge:${head}:stage1 -->`;
+    return comments.find(c => typeof c.body === 'string' && (c.body.includes(legacy) || c.body.includes(explicit))) || null;
+  }
+  const needle = marker(head, stage);
+  return comments.find(c => typeof c.body === 'string' && c.body.includes(needle)) || null;
+}
+
 function alreadyNudged(comments, head) {
-  const needle = marker(head);
-  return comments.some(comment => typeof comment.body === 'string' && comment.body.includes(needle));
+  return Boolean(findNudgeComment(comments, head, 1));
+}
+
+function reviewerQuotaHit(comments, reviewer, sinceMs) {
+  if (!reviewer) return false;
+  return comments.some(c => {
+    if (!gate.matchesReviewer(c.user, reviewer) || typeof c.body !== 'string') return false;
+    if (gate.MARKER_NAMES.some(name => c.body.includes(name))) return false;
+    const ts = Date.parse(c.created_at || '');
+    if (Number.isFinite(sinceMs) && Number.isFinite(ts) && ts < sinceMs) return false;
+    return QUOTA_PATTERN.test(c.body);
+  });
 }
 
 async function headAge(github, repo, head) {
@@ -71,16 +95,24 @@ async function headAge(github, repo, head) {
   }
 }
 
-function nudgeBody(head, mentions) {
+function nudgeBody(head, mentions, stage = 1) {
+  const mentionList = stage === 1
+    ? [mentions[0] || '@codex review']
+    : stage === 2
+      ? [mentions[1] || '@claude review']
+      : [];
+  const stageNote = stage === 1
+    ? 'This head has no AI review receipt after 10 minutes (primary: Codex).'
+    : stage === 2
+      ? 'Primary reviewer did not produce a receipt (quota/timeout). Falling back to secondary reviewer.'
+      : 'Primary and secondary reviewers did not produce a receipt. A human must comment `cursor review` or `bugbot run` (Bugbot ignores bot-posted triggers).';
   const lines = [
-    ...mentions,
+    ...mentionList,
+    ...(mentionList.length ? [''] : []),
+    marker(head, stage),
     '',
-    marker(head),
-    '',
-    'This head has no AI review receipt after 10 minutes.',
+    stageNote,
     'Dispatch order: Codex → Claude → Cursor.',
-    'If both above are unavailable, a human should comment `cursor review` or `bugbot run`',
-    '(Bugbot ignores those commands when posted by a bot or GitHub App).',
     'Acceptable markers: `ai-review-receipt:v1`, `codex-review-state:v1`, `codex-review-receipt:v1`.',
   ];
   return lines.join('\n');
@@ -93,14 +125,36 @@ async function reviewRequested(github, repo, pr, core, config) {
     ...repo, issue_number: pr.number, per_page: 100,
   });
   if (receiptFor(comments, head, config.chain)) return 'reviewed';
-  if (alreadyNudged(comments, head)) return 'nudged';
-  const age = await headAge(github, repo, head);
-  if (age === null || age < MIN_HEAD_AGE_MS) return 'too-new';
+  const s1 = findNudgeComment(comments, head, 1);
+  const s2 = findNudgeComment(comments, head, 2);
+  const s3 = findNudgeComment(comments, head, 3);
+  const now = Date.now();
+  let nextStage = null;
+  if (!s1) {
+    const age = await headAge(github, repo, head);
+    if (age === null || age < MIN_HEAD_AGE_MS) return 'too-new';
+    nextStage = 1;
+  } else if (!s2 && config.mentions.length > 1) {
+    const s1Ms = Date.parse(s1.created_at || '');
+    const primaryQuota = reviewerQuotaHit(comments, config.chain[0], s1Ms);
+    const timedOut = Number.isFinite(s1Ms) && (now - s1Ms) >= FALLBACK_WAIT_MS;
+    if (!primaryQuota && !timedOut) return 'nudged';
+    nextStage = 2;
+  } else if (!s3 && config.chain.some(r => r.provider === 'cursor')) {
+    const prev = s2 || s1;
+    const prevMs = Date.parse(prev.created_at || '');
+    const secondaryQuota = s2 ? reviewerQuotaHit(comments, config.chain[1], prevMs) : false;
+    const timedOut = Number.isFinite(prevMs) && (now - prevMs) >= FALLBACK_WAIT_MS;
+    if (!secondaryQuota && !timedOut) return 'nudged';
+    nextStage = 3;
+  } else {
+    return 'nudged';
+  }
   try {
     await github.rest.issues.createComment({
       ...repo,
       issue_number: pr.number,
-      body: nudgeBody(head, config.mentions),
+      body: nudgeBody(head, config.mentions, nextStage),
     });
   } catch (err) {
     if (err && err.status === 403) {
@@ -112,8 +166,8 @@ async function reviewRequested(github, repo, pr, core, config) {
     }
     throw err;
   }
-  core.info(`Requested a review for #${pr.number} at ${head.slice(0, 7)}`);
-  return 'requested';
+  core.info(`Requested stage-${nextStage} review for #${pr.number} at ${head.slice(0, 7)}`);
+  return nextStage === 1 ? 'requested' : `fallback-stage${nextStage}`;
 }
 
 async function run({ github, context, core }) {

@@ -34,10 +34,37 @@ function failureReason(error) {
   return 'EVALUATION_ERROR';
 }
 
-// Unlike the per-file REST patch, the diff media type contains large text
-// hunks. Bind the request to immutable commits, match exact file headers and
-// retain the classifier's count checks. Binary, truncated and ambiguous diffs
-// still block; no PR code is checked out or executed.
+async function verifiedBinaryDeletion(github, repo, pr, file, lines) {
+  if (file.status !== 'removed' || file.previous_filename != null || file.patch != null
+    || file.additions !== 0 || file.deletions !== 0 || !gate.isSha(file.sha) || lines.length !== 4
+    || lines[1] !== 'deleted file mode 100644'
+    || lines[3] !== `Binary files a/${file.filename} and /dev/null differ`) return false;
+  const index = /^index ([0-9a-f]{7,40})\.\.0{7,40}$/.exec(lines[2]);
+  if (!index || !file.sha.startsWith(index[1])) return false;
+
+  const base = pr.base.sha;
+  const head = pr.head.sha;
+  const data = await github.graphql(`query($owner:String!,$repo:String!,$base:GitObjectID!,$head:GitObjectID!,
+      $basePath:String!,$headPath:String!) {
+    repository(owner:$owner,name:$repo) {
+      baseCommit: object(oid:$base) { __typename oid }
+      headCommit: object(oid:$head) { __typename oid }
+      oldFile: object(expression:$basePath) { __typename oid ... on Blob { isBinary isTruncated } }
+      newFile: object(expression:$headPath) { __typename oid }
+    }
+  }`, { ...repo, base, head, basePath: `${base}:${file.filename}`, headPath: `${head}:${file.filename}` });
+  const evidence = data?.repository;
+  return evidence?.baseCommit?.__typename === 'Commit' && evidence.baseCommit.oid === base
+    && evidence.headCommit?.__typename === 'Commit' && evidence.headCommit.oid === head
+    && evidence.oldFile?.__typename === 'Blob' && evidence.oldFile.oid === file.sha
+    && (evidence.oldFile.isBinary === true
+      || (evidence.oldFile.isBinary === null && evidence.oldFile.isTruncated === true))
+    && evidence.newFile === null;
+}
+
+// Recover large text hunks from the immutable comparison. A binary deletion
+// has no hunk, so require Git object evidence before retaining its diff lines.
+// Unknown or ambiguous differences fail closed without executing PR code.
 async function completePatches(github, repo, pr, files) {
   const missing = files.filter(file => !gate.completePatch(file));
   if (!missing.length) return files;
@@ -55,10 +82,10 @@ async function completePatches(github, repo, pr, files) {
     const header = `diff --git a/${previous} b/${file.filename}`;
     const matches = sections.filter(section => section.slice(0, section.indexOf('\n')) === header);
     if (matches.length !== 1) throw invalid();
-    const lines = matches[0].split('\n');
+    const lines = matches[0].replace(/\n$/, '').split('\n');
     const start = lines.findIndex(line => /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line));
-    if (start < 0) throw invalid();
-    const patch = lines.slice(start).join('\n').replace(/\n$/, '');
+    if (start < 0 && !await verifiedBinaryDeletion(github, repo, pr, file, lines)) throw invalid();
+    const patch = lines.slice(start < 0 ? 1 : start).join('\n');
     if (!gate.completePatch({ ...file, patch })) throw invalid();
     recovered.set(file.filename, patch);
   }
@@ -398,13 +425,16 @@ function writeSummary(core, entries) {
 async function run({ github, context, core, policy, policySha, policyCommit, defaultBranch, now }) {
   const stamp = Number.isFinite(now) ? now : Math.floor(Date.now() / 1000);
   const mode = gate.MODES.includes(policy?.mode) ? policy.mode : 'enforce';
+  const isSweep = context.eventName === 'schedule' || context.eventName === 'push';
   const targets = await selectTargets(github, context, defaultBranch);
   const outcomes = [];
   const failures = [];
+  const evaluationErrors = [];
   for (const number of targets) {
     if (!policy) {
       // Policy is read from the trusted base; without it nothing can be claimed.
       failures.push({ number, message: 'policy unavailable' });
+      evaluationErrors.push({ number, message: 'policy unavailable' });
       await publishUnavailable({ github, context, core, number, mode });
       continue;
     }
@@ -418,6 +448,7 @@ async function run({ github, context, core, policy, policySha, policyCommit, def
     } catch (error) {
       const reason = failureReason(error);
       failures.push({ number, message: reason });
+      evaluationErrors.push({ number, message: reason });
       outcomes.push({ number, allowed: false, reason,
         summary: { pr: number, allowed: false, reason, evaluation_error: true } });
       core?.warning?.(`PR #${number}: evaluation failed (${reason}); evaluation blocked`);
@@ -433,8 +464,15 @@ async function run({ github, context, core, policy, policySha, policyCommit, def
     core?.info?.(`${failures.length} pull request(s) would fail governance: ${failures.map(item => `#${item.number}`).join(', ')}`);
     return { evaluated: targets.length, failures };
   }
+  if (isSweep && !evaluationErrors.length) {
+    // Sweeps still publish blocking commit statuses on each PR head; keep the
+    // scheduled or base-push workflow green unless evaluation itself errored.
+    core?.info?.(`Sweep recorded blocking statuses for ${failures.length} pull request(s): ${failures.map(item => `#${item.number} (${item.message})`).join(', ')}`);
+    return { evaluated: targets.length, failures };
+  }
+  const reported = isSweep ? evaluationErrors : failures;
   // One failure at the end of the sweep, never one per pull request.
-  core?.setFailed?.(`${failures.length} pull request(s) failed governance: ${failures.map(item => `#${item.number}`).join(', ')}`);
+  core?.setFailed?.(`${reported.length} pull request(s) failed governance: ${reported.map(item => `#${item.number}`).join(', ')}`);
   return { evaluated: targets.length, failures };
 }
 

@@ -1,0 +1,26 @@
+name: Weekly Org Drift Audit
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Weekly governance and monolith audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run centralized drift audit
+        env:
+          GH_TOKEN: ${{ secrets.ORG_AUDIT_TOKEN || github.token }}
+        run: |
+          python3 scripts/org_audit.py \
+            --owners Pigbibi GdeiAssistant QuantStrategyLab \
+            --canonical-sha "${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY" || true

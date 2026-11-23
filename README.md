@@ -9,9 +9,10 @@ branch protection, not this repository, enforces merges.
 | Path | Purpose |
 | --- | --- |
 | `pr-governance/` | Canonical GitHub Action, policy schema, and caller templates. |
+| `pr-governance/actions/` | Reusable composite actions such as `scan-before-publish`. |
 | `pr-governance/templates/` | Caller workflows consumed via `Pigbibi/PrGovernance/pr-governance@<sha>`. |
 | `local/` | Git hooks, private-repo merge gate, and `check_hygiene.py`. |
-| `.github/workflows/` | Action and local-governance regression checks. |
+| `.github/workflows/` | Action checks, reusable `gitleaks.yml`, and repository hygiene checks. |
 
 ## Two tracks
 

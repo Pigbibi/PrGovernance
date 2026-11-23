@@ -1,0 +1,23 @@
+name: Scan before publish
+description: Scan a local staging file or directory with the canonical Gitleaks rules before publication
+inputs:
+  path:
+    description: Existing file or directory path or glob relative to the workspace
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install checksum-verified Gitleaks
+      shell: bash
+      env:
+        ACTION_ROOT: ${{ github.action_path }}
+      run: bash "$ACTION_ROOT/../../scripts/install-gitleaks.sh"
+
+    - name: Scan publication path
+      shell: bash
+      env:
+        ACTION_ROOT: ${{ github.action_path }}
+        ARTIFACT_PATHS: ${{ inputs.path }}
+      run: |
+        python3 "$ACTION_ROOT/../../scripts/secret_scan.py" artifacts \
+          --gitleaks "$RUNNER_TEMP/gitleaks-bin/gitleaks"

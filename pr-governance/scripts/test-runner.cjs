@@ -327,13 +327,52 @@ test('one stale pull request does not stop the sweep from evaluating the rest', 
   });
   const result = await runMock(m);
   // The stale pull request is a stable verdict, not a failure; the sweep still
-  // evaluated the second one and failed only for it.
-  assert.equal(m.failures.length, 1);
-  assert.match(m.failures[0], /#43/);
-  assert.doesNotMatch(m.failures[0], /#42/);
+  // evaluated the second one, published its blocking status, and left the push sweep green.
+  assert.equal(m.failures.length, 0);
+  assert.equal(m.infos.length, 1);
+  assert.match(m.infos[0], /#43/);
+  assert.doesNotMatch(m.infos[0], /#42/);
   assert.ok(m.statuses.some(status => status.description === 'R1: base-outdated'));
+  assert.ok(m.statuses.some(status => status.sha === other && status.context === 'risk-gate' && status.state === 'failure'));
   assert.deepEqual([...new Set(m.statuses.map(status => status.sha))].sort(), [other, HEAD].sort());
   assert.deepEqual(result.failures.map(item => item.number), [43]);
+});
+
+test('schedule sweep publishes blocking R2 status without failing the sweep job', async () => {
+  const f = receiptMarker(fixture({ path: 'config/settings.json' }));
+  const m = mock(f, { eventName: 'schedule', open: [{ number: 42, head: { sha: HEAD } }] });
+  m.context.payload = {};
+  const result = await runMock(m);
+  assert.equal(m.failures.length, 0);
+  assert.equal(m.infos.length, 1);
+  assert.match(m.infos[0], /#42 \(clearing_label_required\)/);
+  assert.equal(m.statuses.find(status => status.context === 'risk-gate').state, 'failure');
+  assert.deepEqual(result.failures.map(item => item.number), [42]);
+});
+
+test('schedule sweep fails the job when an evaluation error occurs', async () => {
+  const m = mock(fixture(), { eventName: 'schedule', open: [{ number: 42, head: { sha: HEAD } }] });
+  m.context.payload = {};
+  const list = m.github.paginate;
+  m.github.paginate = async (method, params) => {
+    if (method !== m.github.rest.pulls.list) throw new Error('API unavailable');
+    return list(method, params);
+  };
+  const result = await runMock(m);
+  assert.equal(m.failures.length, 1);
+  assert.match(m.failures[0], /#42/);
+  assert.ok(m.statuses.some(status => status.state === 'error'));
+  assert.deepEqual(result.failures.map(item => item.number), [42]);
+});
+
+test('pull_request_target fails when an R2 PR lacks a clearing label', async () => {
+  const f = receiptMarker(fixture({ path: 'config/settings.json' }));
+  const m = mock(f, { eventName: 'pull_request_target' });
+  const result = await runMock(m);
+  assert.equal(m.failures.length, 1);
+  assert.match(m.failures[0], /#42/);
+  assert.equal(m.statuses.find(status => status.context === 'risk-gate').state, 'failure');
+  assert.deepEqual(result.failures.map(item => item.number), [42]);
 });
 
 // ------------------------------------------------------------ shared head ---
@@ -564,6 +603,79 @@ test('a truncated REST patch is recovered without weakening patch accounting', a
   await runMock(m);
   assert.equal(m.failures.length, 0);
   assert.equal(m.statuses.find(status => status.context === 'risk-gate').state, 'success');
+});
+
+function binaryDeletion(filename = 'assets/example.png') {
+  const file = { filename, status: 'removed', sha: 'd'.repeat(40), additions: 0, deletions: 0 };
+  const m = mock(receiptMarker(fixture({ files: [file] })));
+  const diff = `diff --git a/${filename} b/${filename}\ndeleted file mode 100644\n`
+    + `index ${file.sha.slice(0, 9)}..000000000\nBinary files a/${filename} and /dev/null differ\n`;
+  const repository = {
+    baseCommit: { __typename: 'Commit', oid: BASE },
+    headCommit: { __typename: 'Commit', oid: HEAD },
+    oldFile: { __typename: 'Blob', oid: file.sha, isBinary: true },
+    newFile: null,
+  };
+  const requests = [];
+  const readThreads = m.github.graphql;
+  m.github.graphql = async (query, params) => {
+    if (!query.includes('oldFile:')) return readThreads(query, params);
+    requests.push(params);
+    return { repository };
+  };
+  m.github.rest.repos.compareCommitsWithBasehead = async () => ({ data: diff });
+  return { m, repository, requests, diff };
+}
+
+test('an immutable comparison and both Git objects prove a binary deletion', async () => {
+  const { m, requests } = binaryDeletion();
+  await runMock(m);
+  assert.deepEqual(states(m), [['pr-template', 'success'], ['ai-review', 'success'], ['risk-gate', 'success']]);
+  assert.deepEqual(requests.map(({ base, head, basePath, headPath }) => [base, head, basePath, headPath]),
+    Array(2).fill([BASE, HEAD, `${BASE}:assets/example.png`, `${HEAD}:assets/example.png`]));
+});
+
+test('a truncated large binary blob with null isBinary still proves a binary deletion', async () => {
+  const { m, repository } = binaryDeletion('fonts/NotoSansMonoCJKsc-Regular.otf');
+  repository.oldFile.isBinary = null;
+  repository.oldFile.isTruncated = true;
+  await runMock(m);
+  assert.deepEqual(states(m), [['pr-template', 'success'], ['ai-review', 'success'], ['risk-gate', 'success']]);
+});
+
+test('a blob with null isBinary and without truncation fails closed', async () => {
+  const { m, repository } = binaryDeletion();
+  repository.oldFile.isBinary = null;
+  repository.oldFile.isTruncated = false;
+  const result = await runMock(m);
+  assert.equal(result.failures[0].message, 'DIFF_EVIDENCE_INVALID');
+  assert.ok(m.statuses.length === 3 && m.statuses.every(status => status.state === 'error'));
+});
+
+test('deleting a binary at a protected path still requires a clearing label', async () => {
+  const { m } = binaryDeletion('config/example.png');
+  await runMock(m);
+  assert.equal(m.failures.length, 1);
+  assert.equal(m.statuses.find(status => status.context === 'risk-gate').description,
+    'R2: needs owner-approved or agent-approved');
+});
+
+for (const [name, mutate] of [
+  ['non-deletion status', ({ m }) => { m.state.files[0].status = 'modified'; }],
+  ['wrong compare object', ({ m, diff }) => {
+    m.github.rest.repos.compareCommitsWithBasehead = async () => ({ data: diff.replace('ddddddddd', 'eeeeeeeee') });
+  }],
+  ['wrong base blob', ({ repository }) => { repository.oldFile.oid = 'e'.repeat(40); }],
+  ['text blob', ({ repository }) => { repository.oldFile.isBinary = false; }],
+  ['unconfirmed head commit', ({ repository }) => { repository.headCommit = null; }],
+  ['file still exists at head', ({ repository }) => { repository.newFile = repository.oldFile; }],
+  ['incomplete response', ({ repository }) => { delete repository.newFile; }],
+]) test(`a claimed binary deletion with ${name} fails closed`, async () => {
+  const setup = binaryDeletion();
+  mutate(setup);
+  const result = await runMock(setup.m);
+  assert.equal(result.failures[0].message, 'DIFF_EVIDENCE_INVALID');
+  assert.ok(setup.m.statuses.length === 3 && setup.m.statuses.every(status => status.state === 'error'));
 });
 
 test('a stale base with an omitted patch gets its explicit blocking verdict', async () => {

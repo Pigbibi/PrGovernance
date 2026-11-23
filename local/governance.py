@@ -341,13 +341,33 @@ def protected_push(lines, settings, is_ancestor):
 
 
 def hook_pre_commit(root):
-    return audit(root, True, config(root), changed_only=True)
+    problems = audit(root, True, config(root), changed_only=True)
+    ruff_bin = shutil.which("ruff")
+    if ruff_bin:
+        staged_py = [
+            path
+            for path in git_output(root, "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z").split("\0")
+            if path.endswith(".py")
+        ]
+        if staged_py:
+            res = subprocess.run(
+                [ruff_bin, "check", "--quiet", *staged_py],
+                cwd=root,
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                detail = (res.stdout or res.stderr).strip()
+                problems.append(f"ruff check failed on staged Python files:\n{detail}" if detail else "ruff check failed")
+    return problems
 
 
 HOOK_FILES = ("governance.py", "pre-commit", "commit-msg", "pre-push")
 MERGE_GATE_FILES = (
     ("merge_gate.py", "governance/merge_gate.py"),
     ("test_merge_gate.py", "governance/tests/test_merge_gate.py"),
+    ("test_merge_gate_receipts.py", "governance/tests/test_merge_gate_receipts.py"),
+    ("test_merge_gate_audit.py", "governance/tests/test_merge_gate_audit.py"),
     ("check_hygiene.py", "scripts/check_hygiene.py"),
 )
 DRIFT_FILES = (
@@ -691,8 +711,9 @@ def main(argv):
     parser.add_argument("--root", default=".")
     parser.add_argument("--source", help="directory to install the hooks from or compare against")
     parser.add_argument("--include-merge-gate", action="store_true",
-                        help="with install or verify, include merge_gate.py, test_merge_gate.py, "
-                             "and check_hygiene.py inside the installed .git/governance directory")
+                        help="with install or verify, include merge_gate.py, "
+                             "test_merge_gate*.py, and check_hygiene.py inside the installed "
+                             ".git/governance directory")
     options = parser.parse_args(argv)
     root = repository_root(str(Path(options.root).resolve()))
     if options.command == "install":

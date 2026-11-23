@@ -970,9 +970,9 @@ class RepositoryTests(unittest.TestCase):
         # Never modify or create tracked worktree files during install.
         self.assertFalse((Path(self.root) / "governance").exists())
         self.assertFalse((Path(self.root) / "scripts").exists())
-        # Verify the installed test_merge_gate.py discovers sibling merge_gate.py cleanly.
+        # Verify the installed test_merge_gate*.py suites discover sibling merge_gate.py cleanly.
         test_run = run(sys.executable, "-m", "unittest", "discover",
-                       "-s", str(configured), "-p", "test_merge_gate.py")
+                       "-s", str(configured), "-p", "test_merge_gate*.py")
         self.assertEqual(test_run.returncode, 0, test_run.stderr)
         verified = self.cli("verify", "--source", str(local_dir), "--include-merge-gate")
         self.assertEqual(verified.returncode, 0, verified.stderr)
@@ -1095,9 +1095,8 @@ class RepositoryTests(unittest.TestCase):
         external_dir = Path(self.root).parent / "external-governance"
         (external_dir / "tests").mkdir(parents=True, exist_ok=True)
         (external_dir / "merge_gate.py").write_text((gov_dir / "merge_gate.py").read_text())
-        (external_dir / "tests" / "test_merge_gate.py").write_text(
-            (gov_dir / "tests" / "test_merge_gate.py").read_text()
-        )
+        for path in (gov_dir / "tests").glob("test_merge_gate*.py"):
+            (external_dir / "tests" / path.name).write_text(path.read_text())
         shutil.rmtree(gov_dir)
         gov_dir.symlink_to(external_dir)
 

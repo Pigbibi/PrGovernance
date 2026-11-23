@@ -31,7 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 API_ROOT = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 USER_AGENT = "repository-merge-gate/1"
@@ -51,12 +51,17 @@ RECEIPT_MARKER_OPEN = re.compile(
     r"(?=\s|-->|$|[^A-Za-z0-9_.:-])"
 )
 COMPLETE_COVERAGE = {"complete", "completed", "full", "reported_complete", "all"}
-ALL_REVIEW_PROVIDERS = {"codex", "claude", "cursor"}
+ALL_REVIEW_PROVIDERS = {"codex", "claude", "cursor", "opencode", "deepseek"}
 REVIEWER_PROVIDERS: dict[str, tuple[str, tuple[int, ...]]] = {
     "chatgpt-codex-connector": ("codex", (0, 1, 2)),
     "chatgpt-codex-connector[bot]": ("codex", (0, 1, 2)),
     "claude[bot]": ("claude", (0,)),
     "cursor[bot]": ("cursor", (0,)),
+    "pigbibi-local-ai-reviewer": ("opencode", (0,)),
+    "pigbibi-local-ai-reviewer[bot]": ("opencode", (0,)),
+    "pigbibi-ai-reviewer[bot]": ("opencode", (0,)),
+    "qsl-ai-reviewer[bot]": ("opencode", (0,)),
+    "gdei-ai-reviewer[bot]": ("opencode", (0,)),
 }
 ACTION_PIN = re.compile(r"^\s*-?\s*uses\s*:")
 ACTION_TARGET = re.compile(
@@ -74,8 +79,12 @@ STRUCTURAL_PATHS = (
     re.compile(r"(^|/)(profiles?|skills?)(/|$)"),
     re.compile(r"(^|/)\.agents(/|$)"),
     re.compile(r"(^|/)(dockerfile(?:\..*)?|docker-compose[^/]*|compose\.ya?ml|vercel\.json|wrangler\.(?:toml|jsonc?)|firebase\.json)$"),
+    re.compile(r"(^|/)(pyproject\.toml|package\.json|.*\.config\.[^/]+|\.ruff\.toml|ruff-shared\.toml|pyrightconfig\.json|\.importlinter|importlinter\.toml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|\.pre-commit-config\.yaml|knip\.jsonc?|\.jscpd\.json)$"),
     re.compile(r"\.(?:tf|tfvars)$"),
 )
+DEFAULT_MAX_T1_DIFF_LINES = 500
+PROSE_OR_FIXTURE_DIFF = re.compile(r"(?:\.(?:md|txt|rst)$|(?:^|/)fixtures(?:\/|$))", re.IGNORECASE)
+TEST_SOURCE_PATH = re.compile(r"(?:^|/)(?:tests?|__tests__|spec)(?:/|$)|(?:\.|_)(?:test|spec)\.[^/]+$", re.IGNORECASE)
 KEYWORD_PATHS = (
     re.compile(r"(^|[/_.-])(secrets?|credentials?|iam)([/_.-]|$)"),
     re.compile(r"(^|[/_.-])(config|configuration|settings)([/_.-]|$)"),
@@ -121,6 +130,66 @@ class Refusal(RuntimeError):
 
 def diagnostic(exc: ApiError) -> str:
     return f"GitHub API {exc.status}"
+
+
+SHA40_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _expect_dict(value: Any) -> dict[str, Any] | None:
+    """Return value if it is a dict, otherwise None."""
+    return value if isinstance(value, dict) else None
+
+
+def _expect_list(value: Any) -> list[Any] | None:
+    """Return value if it is a list, otherwise None."""
+    return value if isinstance(value, list) else None
+
+
+def _expect_str(value: Any, *, non_empty: bool = False, strip: bool = False) -> str | None:
+    """Return value if it is a str (optionally stripped and non-empty), otherwise None."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip() if strip else value
+    if non_empty and not text:
+        return None
+    return text
+
+
+def _expect_bool(value: Any) -> bool | None:
+    """Return value if it is strictly a bool, otherwise None."""
+    return value if isinstance(value, bool) else None
+
+
+def _expect_int(value: Any) -> int | None:
+    """Return value if it is an int and strictly not a bool, otherwise None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _expect_nonneg_int(value: Any) -> int | None:
+    """Return value if it is a non-negative non-bool int, otherwise None."""
+    number = _expect_int(value)
+    return number if number is not None and number >= 0 else None
+
+
+def _expect_sha40(value: Any, *, strip: bool = False) -> str | None:
+    """Return lowercase 40-char hex SHA if valid, otherwise None."""
+    text = _expect_str(value, strip=strip)
+    if text is None:
+        return None
+    lowered = text.lower()
+    return lowered if SHA40_RE.fullmatch(lowered) else None
+
+
+def _dict_at(mapping: Any, *keys: str) -> dict[str, Any]:
+    """Safely traverse nested dicts and return {} if any segment is missing or non-dict."""
+    current = _expect_dict(mapping)
+    for key in keys:
+        if current is None:
+            return {}
+        current = _expect_dict(current.get(key))
+    return current or {}
 
 
 def auth_token() -> str:
@@ -215,13 +284,16 @@ def _load_policy_file(policy_file: str) -> dict[str, Any]:
     try:
         raw = Path(policy_file).read_bytes()
         policy = json.loads(raw)
-    except (OSError, ValueError) as exc:
-        raise Refusal(f"Cannot read policy file {policy_file}: {exc}") from exc
-    if not isinstance(policy, dict):
+    except OSError as exc:
+        raise Refusal(f"Cannot read policy file {policy_file}") from exc
+    except ValueError as exc:
+        raise Refusal(f"Invalid JSON in policy file {policy_file}") from exc
+    policy_obj = _expect_dict(policy)
+    if policy_obj is None:
         raise Refusal(f"Policy file {policy_file} must contain a JSON object")
-    policy["_sha256"] = hashlib.sha256(raw).hexdigest()
-    policy["_source"] = f"file:{policy_file}"
-    return policy
+    policy_obj["_sha256"] = hashlib.sha256(raw).hexdigest()
+    policy_obj["_source"] = f"file:{policy_file}"
+    return policy_obj
 
 
 def _probe_policy(repo: str, ref: str) -> Any:
@@ -251,11 +323,12 @@ def load_policy(repo: str, ref: str) -> dict[str, Any]:
         )
     raw = base64.b64decode(data["content"])
     policy = json.loads(raw)
-    if not isinstance(policy, dict):
+    policy_obj = _expect_dict(policy)
+    if policy_obj is None:
         raise Refusal(f"governance/policy.json on {ref} must contain a JSON object")
-    policy["_sha256"] = hashlib.sha256(raw).hexdigest()
-    policy["_source"] = ref
-    return policy
+    policy_obj["_sha256"] = hashlib.sha256(raw).hexdigest()
+    policy_obj["_source"] = ref
+    return policy_obj
 
 
 def verify_script(repo: str, ref: str) -> None:
@@ -287,8 +360,9 @@ def base_action_files(repo: str, ref: str) -> set[str]:
         policy = json.loads(base64.b64decode(data["content"]))
     except (ValueError, TypeError):
         return set()
-    values = policy.get("action_files")
-    return set(values) if isinstance(values, list) else set()
+    policy_obj = _expect_dict(policy)
+    values = _expect_list(policy_obj.get("action_files")) if policy_obj is not None else None
+    return set(values) if values is not None else set()
 
 
 def normalized(path: str) -> str:
@@ -307,12 +381,11 @@ def is_keyword(path: str) -> bool:
 
 def _matches_extra_protected(path: str, extra: tuple[str, ...]) -> bool:
     candidate = normalized(path)
-    return any(
-        isinstance(prefix, str)
-        and bool(prefix)
-        and (path.startswith(prefix) or candidate.startswith(normalized(prefix)))
-        for prefix in extra
-    )
+    for prefix in extra:
+        text = _expect_str(prefix, non_empty=True)
+        if text is not None and (path.startswith(text) or candidate.startswith(normalized(text))):
+            return True
+    return False
 
 
 def is_protected(path: str, extra: tuple[str, ...]) -> bool:
@@ -340,8 +413,8 @@ def same_action(lines: list[tuple[str, str]]) -> bool:
 def action_repin(file: dict[str, Any], allowed: set[str]) -> bool:
     if file.get("filename") not in allowed:
         return False
-    patch = file.get("patch")
-    if not isinstance(patch, str):
+    patch = _expect_str(file.get("patch"))
+    if patch is None:
         return False
     changed: list[tuple[str, str]] = []
     for line in patch.splitlines():
@@ -381,14 +454,26 @@ def classify(
         return "T0", False
     if any(is_keyword(name) for name in names):
         return "T2", False
+    effective_diff = 0
+    for file in files:
+        fname = file.get("filename") or ""
+        if PROSE_OR_FIXTURE_DIFF.search(fname):
+            continue
+        additions = file.get("additions") or 0
+        deletions = file.get("deletions") or 0
+        effective_diff += additions + deletions
+        if file.get("status") == "added" and not TEST_SOURCE_PATH.search(fname) and additions > DEFAULT_MAX_T1_DIFF_LINES:
+            return "T2", False
+    if effective_diff > DEFAULT_MAX_T1_DIFF_LINES:
+        return "T2", False
     return "T1", False
 
 
 def scan_secrets(files: list[dict[str, Any]]) -> list[str]:
     hits: list[str] = []
     for file in files:
-        patch = file.get("patch")
-        if not isinstance(patch, str):
+        patch = _expect_str(file.get("patch"))
+        if patch is None:
             continue
         for line in patch.split("\n"):
             # GitHub's files endpoint omits ---/+++ diff headers, so a line
@@ -408,18 +493,10 @@ def scan_secrets(files: list[dict[str, Any]]) -> list[str]:
 
 
 def complete_patch(file: dict[str, Any]) -> bool:
-    patch = file.get("patch")
-    additions = file.get("additions")
-    deletions = file.get("deletions")
-    if (
-        not isinstance(patch, str)
-        or isinstance(additions, bool)
-        or not isinstance(additions, int)
-        or additions < 0
-        or isinstance(deletions, bool)
-        or not isinstance(deletions, int)
-        or deletions < 0
-    ):
+    patch = _expect_str(file.get("patch"))
+    additions = _expect_nonneg_int(file.get("additions"))
+    deletions = _expect_nonneg_int(file.get("deletions"))
+    if patch is None or additions is None or deletions is None:
         return False
     lines = patch.split("\n")
     added = sum(1 for line in lines if line.startswith("+"))
@@ -470,34 +547,39 @@ def complete_template(body: str) -> bool:
     )
 
 
+def _is_verified_dependabot_commit(commit: Any) -> bool:
+    commit_obj = _expect_dict(commit)
+    if commit_obj is None:
+        return False
+    return (
+        _dict_at(commit_obj, "author").get("login") == "dependabot[bot]"
+        and _dict_at(commit_obj, "committer").get("login") == "web-flow"
+        and _dict_at(commit_obj, "commit", "verification").get("verified") is True
+    )
+
+
 def dependabot_head(
     repo: str,
     number: int,
     head: str | None = None,
     comparison: dict[str, Any] | None = None,
 ) -> bool:
-    if isinstance(comparison, dict) and "commits" in comparison:
-        commits = comparison.get("commits")
-        total = comparison.get("total_commits")
-        if not isinstance(commits, list) or not commits or len(commits) >= 250:
+    comparison_obj = _expect_dict(comparison)
+    if comparison_obj is not None and "commits" in comparison_obj:
+        commits = _expect_list(comparison_obj.get("commits"))
+        total = comparison_obj.get("total_commits")
+        if commits is None or not commits or len(commits) >= 250:
             return False
-        if total is not None and (
-            isinstance(total, bool) or not isinstance(total, int) or total != len(commits)
-        ):
+        if total is not None and _expect_nonneg_int(total) != len(commits):
             return False
     else:
         commits = paginate(f"/repos/{repo}/pulls/{number}/commits")
         if not commits or len(commits) >= 250:
             return False
-    if head is not None and (not isinstance(commits[-1], dict) or commits[-1].get("sha") != head):
+    last_commit = _expect_dict(commits[-1])
+    if head is not None and (last_commit is None or last_commit.get("sha") != head):
         return False
-    return all(
-        isinstance(commit, dict)
-        and (commit.get("author") or {}).get("login") == "dependabot[bot]"
-        and (commit.get("committer") or {}).get("login") == "web-flow"
-        and (commit.get("commit") or {}).get("verification", {}).get("verified") is True
-        for commit in commits
-    )
+    return all(_is_verified_dependabot_commit(commit) for commit in commits)
 
 
 def _parse_review_payload(marker_index: int, raw: str) -> dict[str, Any] | None:
@@ -505,12 +587,11 @@ def _parse_review_payload(marker_index: int, raw: str) -> dict[str, Any] | None:
         payload = json.loads(raw)
     except (ValueError, AttributeError):
         return None
-    if marker_index == 2:
-        return payload.get("code_review") if isinstance(payload, dict) else None
-    if isinstance(payload, dict):
-        review = payload.get("review")
-        return review if isinstance(review, dict) else None
-    return None
+    payload_obj = _expect_dict(payload)
+    if payload_obj is None:
+        return None
+    key = "code_review" if marker_index == 2 else "review"
+    return _expect_dict(payload_obj.get(key))
 
 
 _EPOCH_MIN = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
@@ -522,9 +603,10 @@ def _base_change_cutoff(timeline: list[dict[str, Any]] | None) -> dt.datetime | 
         return None
     latest: dt.datetime | None = None
     for event in timeline:
-        if not isinstance(event, dict) or event.get("event") != "base_ref_changed":
+        event_obj = _expect_dict(event)
+        if event_obj is None or event_obj.get("event") != "base_ref_changed":
             continue
-        ts = _parse_iso_timestamp(event.get("created_at"))
+        ts = _parse_iso_timestamp(event_obj.get("created_at"))
         if ts is None:
             return _EPOCH_MAX
         if latest is None or ts > latest:
@@ -533,10 +615,11 @@ def _base_change_cutoff(timeline: list[dict[str, Any]] | None) -> dt.datetime | 
 
 
 def _parse_iso_timestamp(value: Any) -> dt.datetime | None:
-    if not isinstance(value, str) or not value.strip():
+    text = _expect_str(value, non_empty=True, strip=True)
+    if text is None:
         return None
     try:
-        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
     if parsed.tzinfo is None:
@@ -548,22 +631,21 @@ def _receipt_unresolved(review: dict[str, Any]) -> bool | None:
     has_flag: bool | None = None
     count_flag: bool | None = None
     if "has_unresolved_findings" in review:
-        val = review.get("has_unresolved_findings")
-        if not isinstance(val, bool):
+        has_flag = _expect_bool(review.get("has_unresolved_findings"))
+        if has_flag is None:
             return None
-        has_flag = val
     if "unresolved_findings" in review:
-        u = review.get("unresolved_findings")
-        if isinstance(u, bool):
-            count_flag = u
-        elif isinstance(u, int) and not isinstance(u, bool) and u >= 0:
-            count_flag = u > 0
+        raw_count = review.get("unresolved_findings")
+        bool_count = _expect_bool(raw_count)
+        if bool_count is not None:
+            count_flag = bool_count
         else:
-            return None
+            int_count = _expect_nonneg_int(raw_count)
+            if int_count is None:
+                return None
+            count_flag = int_count > 0
     if has_flag is not None and count_flag is not None:
-        if has_flag != count_flag:
-            return None
-        return has_flag
+        return has_flag if has_flag == count_flag else None
     return has_flag if has_flag is not None else count_flag
 
 
@@ -575,6 +657,8 @@ def _extract_receipt_markers(body: str) -> list[tuple[int, str | None]]:
         start = match.end()
         end = body.find("-->", start)
         payload = None if end < 0 else body[start:end].strip()
+        if marker_index == 1 and payload == "":
+            continue
         matches.append((marker_index, payload))
     return matches
 
@@ -594,19 +678,24 @@ def _judge_provider_receipt(
     review = _parse_review_payload(marker_index, raw)
     if not review:
         return "error", "AI review receipt is not valid JSON", None, False
-    on_head = review.get("commit_sha") == head
+    commit_sha = _expect_sha40(review.get("commit_sha"))
+    on_head = (commit_sha == head.lower()) if commit_sha is not None else None
     if "provider" in review:
-        declared = review.get("provider")
-        if not isinstance(declared, str) or declared.strip().lower() != login_provider:
+        declared = _expect_str(review.get("provider"), strip=True)
+        if declared is None or declared.lower() != login_provider:
             return (
                 "failure",
                 f"AI review receipt provider does not match comment author {login_provider}",
                 on_head,
                 False,
             )
-    status = review.get("status") or ("completed" if marker_index != 2 else None)
+    status = review.get("status")
     if status != "completed":
-        return "pending", f"AI review {status or 'not finished'}", on_head, True
+        status_str = _expect_str(status)
+        label = status_str if status_str is not None and status_str.strip() else "not finished"
+        return "pending", f"AI review {label}", on_head, True
+    if on_head is None:
+        return "error", "AI review receipt is missing a valid commit_sha", None, False
     if not on_head:
         return "failure", "AI review covers another commit, not this head", False, True
     unresolved = _receipt_unresolved(review)
@@ -615,48 +704,61 @@ def _judge_provider_receipt(
     if unresolved is None:
         return "failure", "AI review findings state is not reported", True, True
     raw_coverage = review.get("coverage")
-    if marker_index in (0, 1):
-        if not isinstance(raw_coverage, str) or raw_coverage.strip().lower() not in COMPLETE_COVERAGE:
-            return "failure", "AI review coverage is incomplete", True, True
-    elif raw_coverage is not None:
-        if not isinstance(raw_coverage, str) or raw_coverage.strip().lower() not in COMPLETE_COVERAGE:
+    if marker_index in (0, 1) or raw_coverage is not None:
+        coverage = _expect_str(raw_coverage, strip=True)
+        if coverage is None or coverage.lower() not in COMPLETE_COVERAGE:
             return "failure", "AI review coverage is incomplete", True, True
     return "success", f"{login_provider} reviewed this head with no unresolved findings", True, True
 
 
-def ai_review_verdict(
-    repo: str,
-    number: int,
+class _ProviderReceipt(NamedTuple):
+    head_rank: int
+    parsed_ts: dt.datetime
+    updated_at: str
+    cid: int
+    seq_idx: int
+    state: str
+    note: str
+    on_head: bool | None
+    provider_ok: bool
+
+    @property
+    def priority_key(self) -> tuple[int, dt.datetime, str, int, int]:
+        return (self.head_rank, self.parsed_ts, self.updated_at, self.cid, self.seq_idx)
+
+    @property
+    def order_key(self) -> tuple[dt.datetime, str, int, int]:
+        return (self.parsed_ts, self.updated_at, self.cid, self.seq_idx)
+
+    @property
+    def time_key(self) -> tuple[dt.datetime, str]:
+        return (self.parsed_ts, self.updated_at)
+
+
+def _collect_latest_provider_receipts(
+    comments: list[dict[str, Any]],
     head: str,
-    allowed_providers: set[str] | None = None,
-    base_changed_at: dt.datetime | None = None,
-) -> tuple[str, str]:
-    active = ALL_REVIEW_PROVIDERS if allowed_providers is None else (set(allowed_providers) & ALL_REVIEW_PROVIDERS)
-    if not active:
-        return "pending", "No AI review providers configured"
-    comments = paginate(f"/repos/{repo}/issues/{number}/comments")
+    active: set[str],
+    base_changed_at: dt.datetime | None,
+) -> dict[str, _ProviderReceipt]:
     # Track the latest receipt per allowed provider, preferring current-head or
     # unparseable receipts (`on_head is not False`) over delayed stale-commit
     # receipts so a later off-head comment cannot mask current-head findings.
-    latest_by_provider: dict[
-        str,
-        tuple[int, dt.datetime, str, int, int, str, str, bool | None, bool],
-    ] = {}
+    latest_by_provider: dict[str, _ProviderReceipt] = {}
     for seq_idx, comment in enumerate(comments):
-        login = (comment.get("user") or {}).get("login", "")
+        login = _dict_at(comment, "user").get("login", "")
         binding = REVIEWER_PROVIDERS.get(login)
         if not binding:
             continue
         login_provider, allowed_indices = binding
         if login_provider not in active:
             continue
-        body = comment.get("body") or ""
-        matches = _extract_receipt_markers(body)
+        matches = _extract_receipt_markers(comment.get("body") or "")
         if not matches:
             continue
         updated_at = comment.get("updated_at") or comment.get("created_at") or ""
-        comment_id = comment.get("id")
-        cid = comment_id if isinstance(comment_id, int) and not isinstance(comment_id, bool) else 0
+        parsed_cid = _expect_int(comment.get("id"))
+        cid = parsed_cid if parsed_cid is not None else 0
         parsed_ts_opt = _parse_iso_timestamp(updated_at)
         parsed_ts = parsed_ts_opt or _EPOCH_MIN
         if base_changed_at is not None and (parsed_ts_opt is None or parsed_ts_opt < base_changed_at):
@@ -674,9 +776,8 @@ def ai_review_verdict(
             state, note, on_head, provider_ok = _judge_provider_receipt(
                 login_provider, marker_index, payload_raw, head
             )
-        head_rank = 1 if on_head is not False else 0
-        candidate = (
-            head_rank,
+        candidate = _ProviderReceipt(
+            1 if on_head is not False else 0,
             parsed_ts,
             updated_at,
             cid,
@@ -687,58 +788,53 @@ def ai_review_verdict(
             provider_ok,
         )
         prev = latest_by_provider.get(login_provider)
-        if prev is None or candidate[:5] > prev[:5]:
+        if prev is None or candidate.priority_key > prev.priority_key:
             latest_by_provider[login_provider] = candidate
-    if not latest_by_provider:
-        return "pending", "No AI review receipt on this pull request"
+    return latest_by_provider
 
-    judged = [
-        (
-            (parsed_ts, updated_at, cid, seq_idx),
-            (parsed_ts, updated_at),
-            login_provider,
-            state,
-            note,
-            on_head,
-            provider_ok,
-        )
-        for login_provider, (
-            _head_rank,
-            parsed_ts,
-            updated_at,
-            cid,
-            seq_idx,
-            state,
-            note,
-            on_head,
-            provider_ok,
-        ) in latest_by_provider.items()
-    ]
 
-    judged.sort(key=lambda entry: entry[0], reverse=True)
-    passing_head = [e for e in judged if e[5] is True and e[3] == "success"]
-    failing_head = [e for e in judged if e[5] is True and e[3] in ("error", "failure")]
-    pending_head = [e for e in judged if e[5] is True and e[3] == "pending"]
+def _select_provider_verdict(latest_by_provider: dict[str, _ProviderReceipt]) -> tuple[str, str]:
+    judged = sorted(latest_by_provider.values(), key=lambda entry: entry.order_key, reverse=True)
+    passing_head = [e for e in judged if e.on_head is True and e.state == "success"]
+    failing_head = [e for e in judged if e.on_head is True and e.state in ("error", "failure")]
+    pending_head = [e for e in judged if e.on_head is True and e.state == "pending"]
 
     if passing_head:
-        max_pass_ts = max(e[1] for e in passing_head)
+        max_pass_ts = max(e.time_key for e in passing_head)
         for entry in judged:
-            if entry[5] is None and entry[1] >= max_pass_ts:
-                return entry[3], entry[4]
+            if entry.on_head is None and entry.time_key >= max_pass_ts:
+                return entry.state, entry.note
         for entry in judged:
-            if not entry[6] and entry[5] is not None and entry[1] >= max_pass_ts:
-                return entry[3], entry[4]
+            if not entry.provider_ok and entry.on_head is not None and entry.time_key >= max_pass_ts:
+                return entry.state, entry.note
         if failing_head:
-            return failing_head[0][3], failing_head[0][4]
+            return failing_head[0].state, failing_head[0].note
         if pending_head:
-            return pending_head[0][3], pending_head[0][4]
-        return passing_head[0][3], passing_head[0][4]
+            return pending_head[0].state, pending_head[0].note
+        return passing_head[0].state, passing_head[0].note
 
     if failing_head:
-        return failing_head[0][3], failing_head[0][4]
+        return failing_head[0].state, failing_head[0].note
     if pending_head:
-        return pending_head[0][3], pending_head[0][4]
-    return judged[0][3], judged[0][4]
+        return pending_head[0].state, pending_head[0].note
+    return judged[0].state, judged[0].note
+
+
+def ai_review_verdict(
+    repo: str,
+    number: int,
+    head: str,
+    allowed_providers: set[str] | None = None,
+    base_changed_at: dt.datetime | None = None,
+) -> tuple[str, str]:
+    active = ALL_REVIEW_PROVIDERS if allowed_providers is None else (set(allowed_providers) & ALL_REVIEW_PROVIDERS)
+    if not active:
+        return "pending", "No AI review providers configured"
+    comments = paginate(f"/repos/{repo}/issues/{number}/comments")
+    latest_by_provider = _collect_latest_provider_receipts(comments, head, active, base_changed_at)
+    if not latest_by_provider:
+        return "pending", "No AI review receipt on this pull request"
+    return _select_provider_verdict(latest_by_provider)
 
 
 def codex_verdict(
@@ -755,42 +851,51 @@ def codex_verdict(
 def policy_review_providers(policy: dict[str, Any]) -> set[str]:
     if policy.get("codex_required", True) is True:
         return {"codex"}
-    configured = policy.get("ai_review_providers")
-    if isinstance(configured, list):
-        return {
-            p.strip().lower()
-            for p in configured
-            if isinstance(p, str) and p.strip().lower() in ALL_REVIEW_PROVIDERS
-        }
-    return set()
+    configured = _expect_list(policy.get("ai_review_providers"))
+    if configured is None:
+        return set()
+    providers: set[str] = set()
+    for entry in configured:
+        name = _expect_str(entry, non_empty=True, strip=True)
+        if name is not None and name.lower() in ALL_REVIEW_PROVIDERS:
+            providers.add(name.lower())
+    return providers
 
 
 _UNSET = object()
 
 
 def _clean_logins(configured: Any) -> set[str]:
-    if not isinstance(configured, list):
+    entries = _expect_list(configured)
+    if entries is None:
         return set()
-    return {login.strip() for login in configured if isinstance(login, str) and login.strip()}
+    cleaned: set[str] = set()
+    for login in entries:
+        text = _expect_str(login, non_empty=True, strip=True)
+        if text is not None:
+            cleaned.add(text)
+    return cleaned
 
 
 def policy_agent_logins(policy: dict[str, Any] | None) -> set[str]:
-    if not isinstance(policy, dict):
+    policy_obj = _expect_dict(policy)
+    if policy_obj is None:
         return set()
-    configured = policy.get("agent_logins")
-    if not isinstance(configured, list):
-        configured = policy.get("approved_agent_logins")
+    configured = _expect_list(policy_obj.get("agent_logins"))
+    if configured is None:
+        configured = _expect_list(policy_obj.get("approved_agent_logins"))
     return _clean_logins(configured)
 
 
 def _valid_verdict_signers(policy: dict[str, Any] | None) -> set[str]:
     """Return GitHub logins accepted by audit() as merge verdict signers."""
-    if not isinstance(policy, dict):
+    policy_obj = _expect_dict(policy)
+    if policy_obj is None:
         return set()
-    signers = _clean_logins(policy.get("verdict_signers"))
-    owner = policy.get("owner_login")
-    if isinstance(owner, str) and owner.strip():
-        signers.add(owner.strip())
+    signers = _clean_logins(policy_obj.get("verdict_signers"))
+    owner = _expect_str(policy_obj.get("owner_login"), non_empty=True, strip=True)
+    if owner is not None:
+        signers.add(owner)
     return signers
 
 
@@ -804,10 +909,10 @@ def _require_verdict_signer(policy: dict[str, Any] | None) -> str:
         raise Refusal(
             f"Cannot verify authenticated GitHub caller ({diagnostic(exc)}); refusing merge"
         ) from exc
-    caller_login = caller.get("login") if isinstance(caller, dict) else None
-    if not isinstance(caller_login, str) or not caller_login.strip():
+    caller_obj = _expect_dict(caller)
+    caller_login = _expect_str(caller_obj.get("login") if caller_obj is not None else None, non_empty=True, strip=True)
+    if caller_login is None:
         raise Refusal("Cannot identify authenticated GitHub caller; refusing merge")
-    caller_login = caller_login.strip()
     if caller_login not in signers:
         raise Refusal(
             f"Authenticated caller {caller_login} is not an audit-accepted verdict signer; "
@@ -821,7 +926,7 @@ def _valid_clearing_actor(
 ) -> bool:
     if event.get("event") != "labeled":
         return False
-    actor_login = (event.get("actor") or {}).get("login") or ""
+    actor_login = _dict_at(event, "actor").get("login") or ""
     if name == "owner-approved":
         return bool(owner) and actor_login == owner
     if name == "agent-approved":
@@ -849,9 +954,10 @@ def branch_activities(activity_repo: str, head_ref: str) -> list[dict[str, Any]]
             params=params,
             allow=(403, 404),
         )
-        if chunk is None or not isinstance(chunk, list):
+        chunk_list = _expect_list(chunk)
+        if chunk_list is None:
             return None
-        entries.extend(chunk)
+        entries.extend(chunk_list)
         link_header = headers.get("link", "")
         next_match = re.search(r'<([^>]+)>\s*;\s*(?:[^,]*;\s*)?rel="next"', link_header)
         if not next_match:
@@ -865,6 +971,89 @@ def branch_activities(activity_repo: str, head_ref: str) -> list[dict[str, Any]]
         cursor = next_cursor
 
 
+def _live_label_from_events(
+    repo: str, number: int, owner: str, agent_logins: set[str] | None
+) -> str | None:
+    events = paginate(f"/repos/{repo}/issues/{number}/events")
+    latest: dict[str, dict[str, Any]] = {}
+    for event in events:
+        event_obj = _expect_dict(event)
+        if event_obj is None:
+            continue
+        name = _dict_at(event_obj, "label").get("name")
+        if event_obj.get("event") in ("labeled", "unlabeled") and name in ("owner-approved", "agent-approved"):
+            latest[name] = event_obj
+    for name in ("owner-approved", "agent-approved"):
+        event = latest.get(name)
+        if event and _valid_clearing_actor(name, event, owner, agent_logins):
+            return name
+    return None
+
+
+def _latest_timeline_labels(timeline: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    reset_events = ("committed", "head_ref_force_pushed", "head_ref_restored", "reopened", "base_ref_changed")
+    for event in timeline:
+        event_obj = _expect_dict(event)
+        if event_obj is None:
+            continue
+        kind = event_obj.get("event")
+        if kind in reset_events:
+            latest.clear()
+            continue
+        name = _dict_at(event_obj, "label").get("name")
+        if kind in ("labeled", "unlabeled") and name in ("owner-approved", "agent-approved"):
+            latest[name] = event_obj
+    return latest
+
+
+def _status_matches_clearing_event(
+    statuses: list[dict[str, Any]],
+    name: str,
+    number: int,
+    event_id: Any,
+    base_changed_at: dt.datetime | None,
+) -> bool:
+    if event_id is None or _expect_bool(event_id) is not None:
+        return False
+    expected = f"{name} for PR {number} at event {event_id} on this head"
+    for status in statuses:
+        if (
+            status.get("context") == "clearing-label"
+            and status.get("state") == "success"
+            and _dict_at(status, "creator").get("login") == ACTIONS_BOT
+            and status.get("description") == expected
+        ):
+            if base_changed_at is not None:
+                status_ts = _parse_iso_timestamp(status.get("updated_at") or status.get("created_at"))
+                if status_ts is None or status_ts < base_changed_at:
+                    continue
+            return True
+    return False
+
+
+def _activity_matches_head(activities: Any, head: str, event_ts: dt.datetime) -> bool:
+    if not activities:
+        return False
+    timed_entries: list[tuple[dt.datetime, dict[str, Any]]] = []
+    for entry in activities:
+        entry_obj = _expect_dict(entry)
+        if entry_obj is None or _expect_str(entry_obj.get("activity_type"), non_empty=True) is None:
+            return False
+        ts = _parse_iso_timestamp(entry_obj.get("timestamp"))
+        if ts is None:
+            return False
+        timed_entries.append((ts, entry_obj))
+    if not timed_entries:
+        return False
+    newest_ts, newest = max(timed_entries, key=lambda pair: pair[0])
+    return (
+        newest.get("activity_type") != "branch_deletion"
+        and newest.get("after") == head
+        and event_ts >= newest_ts
+    )
+
+
 def live_label(
     repo: str,
     number: int,
@@ -874,44 +1063,23 @@ def live_label(
     timeline: list[dict[str, Any]] | None = None,
 ) -> str | None:
     if pull is None:
-        events = paginate(f"/repos/{repo}/issues/{number}/events")
-        latest: dict[str, dict[str, Any]] = {}
-        for event in events:
-            name = (event.get("label") or {}).get("name")
-            if event.get("event") in ("labeled", "unlabeled") and name in ("owner-approved", "agent-approved"):
-                latest[name] = event
-        for name in ("owner-approved", "agent-approved"):
-            event = latest.get(name)
-            if event and _valid_clearing_actor(name, event, owner, agent_logins):
-                return name
-        return None
+        return _live_label_from_events(repo, number, owner, agent_logins)
 
     present = {(lbl.get("name") or "") for lbl in (pull.get("labels") or [])}
     if not (present & {"owner-approved", "agent-approved"}):
         return None
-    head_info = pull.get("head") or {}
+    head_info = _dict_at(pull, "head")
     head = head_info.get("sha") or ""
     if not head:
         return None
     if timeline is None:
         timeline = paginate(f"/repos/{repo}/issues/{number}/timeline")
-    latest = {}
-    reset_events = ("committed", "head_ref_force_pushed", "head_ref_restored", "reopened", "base_ref_changed")
     base_changed_at = _base_change_cutoff(timeline)
-    for event in timeline:
-        if not isinstance(event, dict):
-            continue
-        kind = event.get("event")
-        if kind in reset_events:
-            latest.clear()
-            continue
-        name = (event.get("label") or {}).get("name")
-        if kind in ("labeled", "unlabeled") and name in ("owner-approved", "agent-approved"):
-            latest[name] = event
+    latest = _latest_timeline_labels(timeline)
 
     statuses: list[dict[str, Any]] | None = None
     activities: Any = _UNSET
-    head_repo = ((head_info.get("repo") or {}).get("full_name") or "")
+    head_repo = _dict_at(head_info, "repo").get("full_name") or ""
     head_ref = head_info.get("ref") or ""
     for name in ("owner-approved", "agent-approved"):
         if name not in present:
@@ -924,43 +1092,13 @@ def live_label(
             continue
         if statuses is None:
             statuses = paginate(f"/repos/{repo}/commits/{head}/statuses")
-        event_id = event.get("id")
-        if event_id is not None and not isinstance(event_id, bool):
-            expected = f"{name} for PR {number} at event {event_id} on this head"
-            for s in statuses:
-                if (
-                    s.get("context") == "clearing-label"
-                    and s.get("state") == "success"
-                    and (s.get("creator") or {}).get("login") == ACTIONS_BOT
-                    and s.get("description") == expected
-                ):
-                    if base_changed_at is not None:
-                        status_ts = _parse_iso_timestamp(s.get("updated_at") or s.get("created_at"))
-                        if status_ts is None or status_ts < base_changed_at:
-                            continue
-                    return name
-        activity_repo = head_repo or ""
-        if not activity_repo or not head_ref or event_ts is None:
+        if _status_matches_clearing_event(statuses, name, number, event.get("id"), base_changed_at):
+            return name
+        if not head_repo or not head_ref or event_ts is None:
             continue
         if activities is _UNSET:
-            activities = branch_activities(activity_repo, head_ref)
-        if not activities:
-            continue
-        timed_entries: list[tuple[dt.datetime, dict[str, Any]]] = []
-        valid_entries = True
-        for entry in activities:
-            if not isinstance(entry, dict) or not isinstance(entry.get("activity_type"), str) or not entry.get("activity_type"):
-                valid_entries = False
-                break
-            ts = _parse_iso_timestamp(entry.get("timestamp"))
-            if ts is None:
-                valid_entries = False
-                break
-            timed_entries.append((ts, entry))
-        if not valid_entries or not timed_entries:
-            continue
-        newest_ts, newest = max(timed_entries, key=lambda pair: pair[0])
-        if newest.get("activity_type") != "branch_deletion" and newest.get("after") == head and event_ts >= newest_ts:
+            activities = branch_activities(head_repo, head_ref)
+        if _activity_matches_head(activities, head, event_ts):
             return name
     return None
 
@@ -1046,15 +1184,20 @@ def required_contexts(policy: dict[str, Any], verified_dependabot: bool) -> list
     )
     if not names:
         names = policy.get("required_checks")
-    return [name for name in names or [] if isinstance(name, str) and name]
+    result: list[str] = []
+    for name in names or []:
+        text = _expect_str(name, non_empty=True)
+        if text is not None:
+            result.append(text)
+    return result
 
 
 def applicable_contexts(
     policy: dict[str, Any], verified_dependabot: bool, files: list[dict[str, Any]]
 ) -> list[str]:
     required = required_contexts(policy, verified_dependabot)
-    skipped = policy.get("ci_skipped_checks")
-    if not isinstance(skipped, dict):
+    skipped = _expect_dict(policy.get("ci_skipped_checks"))
+    if skipped is None:
         return required
     names = {
         name
@@ -1065,9 +1208,10 @@ def applicable_contexts(
     if not names:
         return required
     for context, patterns in skipped.items():
-        if context not in required or not isinstance(patterns, list):
+        pattern_list = _expect_list(patterns)
+        if context not in required or pattern_list is None:
             continue
-        globs = [pattern for pattern in patterns if isinstance(pattern, str)]
+        globs = [text for text in (_expect_str(p) for p in pattern_list) if text is not None]
         # A workflow's paths-ignore filter only skips a context when every
         # changed file matches; one source file still runs it.
         if globs and all(any(fnmatch.fnmatch(name, glob) for glob in globs) for name in names):
@@ -1104,6 +1248,21 @@ def check_results(
     return missing, unsettled, pending, failing
 
 
+def _index_tree_entries(raw_tree: Any) -> dict[str, dict[str, Any]] | None:
+    tree_list = _expect_list(raw_tree)
+    if tree_list is None:
+        return None
+    indexed: dict[str, dict[str, Any]] = {}
+    for entry in tree_list:
+        entry_obj = _expect_dict(entry)
+        if entry_obj is None:
+            continue
+        path = _expect_str(entry_obj.get("path"))
+        if path is not None:
+            indexed[path] = entry_obj
+    return indexed
+
+
 def _resolve_tree_mode(
     repo: str, head: str, path: str, tree_cache: dict[str, dict[str, dict[str, Any]] | None]
 ) -> tuple[bool, bool]:
@@ -1114,15 +1273,13 @@ def _resolve_tree_mode(
     current_sha = head
     for idx, segment in enumerate(parts):
         if current_sha not in tree_cache:
-            data = request("GET", f"/repos/{repo}/git/trees/{current_sha}", allow=(404,))
-            if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
-                tree_cache[current_sha] = None
+            data_obj = _expect_dict(
+                request("GET", f"/repos/{repo}/git/trees/{current_sha}", allow=(404,))
+            )
+            indexed = _index_tree_entries(data_obj.get("tree")) if data_obj is not None else None
+            tree_cache[current_sha] = indexed
+            if indexed is None:
                 return False, False
-            tree_cache[current_sha] = {
-                e.get("path"): e
-                for e in data["tree"]
-                if isinstance(e, dict) and isinstance(e.get("path"), str)
-            }
         entries = tree_cache[current_sha]
         if entries is None:
             return False, False
@@ -1141,29 +1298,30 @@ def _resolve_tree_mode(
 def symlink_entries(
     repo: str, head: str, files: list[dict[str, Any]]
 ) -> tuple[list[str], bool]:
-    checked = [
-        f.get("filename")
-        for f in files
-        if f.get("status") != "removed" and isinstance(f.get("filename"), str) and f.get("filename")
-    ]
+    checked: list[str] = []
+    for file in files:
+        if file.get("status") == "removed":
+            continue
+        name = _expect_str(file.get("filename"), non_empty=True)
+        if name is not None:
+            checked.append(name)
     if not checked:
         return [], True
-    tree = request(
-        "GET",
-        f"/repos/{repo}/git/trees/{head}",
-        params={"recursive": "1"},
-        allow=(404,),
+    tree_obj = _expect_dict(
+        request(
+            "GET",
+            f"/repos/{repo}/git/trees/{head}",
+            params={"recursive": "1"},
+            allow=(404,),
+        )
     )
-    if not isinstance(tree, dict) or not isinstance(tree.get("tree"), list):
+    entries = _index_tree_entries(tree_obj.get("tree")) if tree_obj is not None else None
+    if tree_obj is None or entries is None:
         return [], False
-    modes = {
-        e.get("path"): e.get("mode")
-        for e in tree["tree"]
-        if isinstance(e, dict) and isinstance(e.get("path"), str)
-    }
+    modes = {path: entry.get("mode") for path, entry in entries.items()}
     flagged: list[str] = []
     tree_cache: dict[str, dict[str, dict[str, Any]] | None] = {}
-    truncated = bool(tree.get("truncated"))
+    truncated = bool(tree_obj.get("truncated"))
     for path in checked:
         parts = [part for part in path.split("/") if part]
         if not parts:
@@ -1202,45 +1360,18 @@ def _review_verdict_for_policy(
     )
 
 
-def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[dict[str, Any], list[str]]:
-    pull = request("GET", f"/repos/{repo}/pulls/{number}")
-    if pull.get("state") != "open":
-        raise Refusal(f"Pull request #{number} is {pull.get('state')}, not open")
-    if pull.get("draft"):
-        raise Refusal(f"Pull request #{number} is a draft; mark it ready before merging")
-    head = pull["head"]["sha"]
-    base_ref = pull["base"]["ref"]
-    policy_ref = request("GET", f"/repos/{repo}")["default_branch"]
+def _load_eval_policy(repo: str, policy_ref: str, policy_file: str | None) -> tuple[dict[str, Any], bool]:
     if policy_file:
         policy = _load_bootstrap_policy_file(repo, policy_ref, policy_file)
-        bootstrap = True
         print(
             f"warning: using trusted --policy-file ({policy_file}) instead of {policy_ref} (bootstrap)",
             file=sys.stderr,
         )
-    else:
-        policy = load_policy(repo, policy_ref)
-        bootstrap = False
-    verify_script(repo, policy_ref)
-    contains_base, base_head, comparison = head_comparison(repo, base_ref, head)
-    raw_files = comparison.get("files") if isinstance(comparison, dict) else None
-    valid_files = isinstance(raw_files, list) and all(isinstance(item, dict) for item in raw_files)
-    files = raw_files if valid_files else []
-    reasons: list[str] = []
-    if not valid_files or len(files) >= 300 or len(files) != pull.get("changed_files"):
-        reasons.append("Changed-file list is incomplete; refuse to judge a partial diff")
-    if not contains_base:
-        reasons.append("Base branch advanced since this head was built; update the branch first")
-    if shared_head(repo, number, head):
-        reasons.append("Another open pull request shares this head; verdicts would collide")
-    symlinks, tree_ok = symlink_entries(repo, head, files)
-    symlink_set = set(symlinks)
-    if symlinks:
-        reasons.append(
-            "Symlink entries are not allowed in pull requests: " + ", ".join(sorted(symlinks)[:5])
-        )
-    if not tree_ok:
-        reasons.append("Cannot verify Git tree modes for changed files")
+        return policy, True
+    return load_policy(repo, policy_ref), False
+
+
+def _hydrate_zero_change_sizes(repo: str, files: list[dict[str, Any]], symlink_set: set[str]) -> None:
     for file in files:
         if file.get("filename") in symlink_set:
             continue
@@ -1250,17 +1381,86 @@ def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[di
             continue
         if not file.get("sha"):
             continue
-        blob = request("GET", f"/repos/{repo}/git/blobs/{file['sha']}", allow=(404,))
-        file["_size"] = (blob or {}).get("size")
-    verified_dependabot = (
-        (pull.get("user") or {}).get("login") == "dependabot[bot]"
-        and dependabot_head(repo, number, head=head, comparison=comparison)
+        blob = _expect_dict(request("GET", f"/repos/{repo}/git/blobs/{file['sha']}", allow=(404,)))
+        file["_size"] = blob.get("size") if blob is not None else None
+
+
+def _evaluate_checks(
+    repo: str,
+    head: str,
+    policy: dict[str, Any],
+    verified_dependabot: bool,
+    files: list[dict[str, Any]],
+    bootstrap: bool,
+) -> tuple[str, list[str], str, list[str]]:
+    if not policy.get("require_checks", True):
+        checks_note = policy.get("checks_disabled_reason") or "not required by policy"
+        if bootstrap:
+            checks_note += " (policy read from --policy-file; the entry is not installed yet)"
+        return "skipped", [], checks_note, []
+    required = applicable_contexts(policy, verified_dependabot, files)
+    if not required:
+        return "missing", [], "", ["CI is required but no applicable context remains"]
+    missing, unsettled, pending, failing = check_results(repo, head, required)
+    reasons: list[str] = []
+    if missing:
+        reasons.append("CI did not report required contexts: " + ", ".join(missing[:5]))
+    if unsettled:
+        reasons.append("CI has not succeeded: " + ", ".join(unsettled[:5]))
+    if pending:
+        reasons.append("CI is still running: " + ", ".join(pending[:5]))
+    if failing:
+        reasons.append("CI is not successful: " + ", ".join(failing[:5]))
+    checks = (
+        "pending" if pending and not (missing or unsettled or failing)
+        else "failure" if (missing or unsettled or failing)
+        else "success"
     )
-    extra = tuple(policy.get("extra_protected_paths") or ())
-    tier, fast_path = classify(files, verified_dependabot, base_action_files(repo, policy_ref), extra)
-    if symlinks or not tree_ok:
-        tier = "T2"
-        fast_path = False
+    checks_note = (
+        "The merge entry is not on the default branch yet; the contexts come from "
+        "the trusted --policy-file"
+        if bootstrap else ""
+    )
+    return checks, required, checks_note, reasons
+
+
+def _evaluate_diff_and_tree(
+    repo: str, number: int, pull: dict[str, Any], head: str, base_ref: str
+) -> tuple[str, dict[str, Any], list[dict[str, Any]], list[str], bool, list[str]]:
+    contains_base, base_head, comparison = head_comparison(repo, base_ref, head)
+    comparison_obj = _expect_dict(comparison)
+    raw_files = _expect_list(comparison_obj.get("files")) if comparison_obj is not None else None
+    valid_files = raw_files is not None and all(_expect_dict(item) is not None for item in raw_files)
+    files = raw_files if valid_files else []
+    reasons: list[str] = []
+    if not valid_files or len(files) >= 300 or len(files) != pull.get("changed_files"):
+        reasons.append("Changed-file list is incomplete; refuse to judge a partial diff")
+    if not contains_base:
+        reasons.append("Base branch advanced since this head was built; update the branch first")
+    if shared_head(repo, number, head):
+        reasons.append("Another open pull request shares this head; verdicts would collide")
+    symlinks, tree_ok = symlink_entries(repo, head, files)
+    if symlinks:
+        reasons.append(
+            "Symlink entries are not allowed in pull requests: " + ", ".join(sorted(symlinks)[:5])
+        )
+    if not tree_ok:
+        reasons.append("Cannot verify Git tree modes for changed files")
+    _hydrate_zero_change_sizes(repo, files, set(symlinks))
+    return base_head, comparison, files, symlinks, tree_ok, reasons
+
+
+def _evaluate_review_and_label(
+    repo: str,
+    number: int,
+    pull: dict[str, Any],
+    head: str,
+    policy: dict[str, Any],
+    tier: str,
+    fast_path: bool,
+    verified_dependabot: bool,
+) -> tuple[str, set[str], str | None, list[str]]:
+    reasons: list[str] = []
     providers = policy_review_providers(policy)
     needs_review = bool(providers and tier != "T0" and not fast_path)
     timeline = (
@@ -1296,6 +1496,39 @@ def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[di
         reasons.append("This repository requires owner-approved for protected paths")
     if tier == "T2" and not verified_dependabot and not complete_template(pull.get("body") or ""):
         reasons.append("Fill in the AI, What changed and How verified sections")
+    return codex_state, providers, label, reasons
+
+
+def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[dict[str, Any], list[str]]:
+    pull = request("GET", f"/repos/{repo}/pulls/{number}")
+    if pull.get("state") != "open":
+        raise Refusal(f"Pull request #{number} is {pull.get('state')}, not open")
+    if pull.get("draft"):
+        raise Refusal(f"Pull request #{number} is a draft; mark it ready before merging")
+    head = pull["head"]["sha"]
+    base_ref = pull["base"]["ref"]
+    policy_ref = request("GET", f"/repos/{repo}")["default_branch"]
+    policy, bootstrap = _load_eval_policy(repo, policy_ref, policy_file)
+    verify_script(repo, policy_ref)
+
+    base_head, comparison, files, symlinks, tree_ok, reasons = _evaluate_diff_and_tree(
+        repo, number, pull, head, base_ref
+    )
+    verified_dependabot = (
+        _dict_at(pull, "user").get("login") == "dependabot[bot]"
+        and dependabot_head(repo, number, head=head, comparison=comparison)
+    )
+    extra = tuple(policy.get("extra_protected_paths") or ())
+    tier, fast_path = classify(files, verified_dependabot, base_action_files(repo, policy_ref), extra)
+    if symlinks or not tree_ok:
+        tier = "T2"
+        fast_path = False
+
+    codex_state, providers, label, review_reasons = _evaluate_review_and_label(
+        repo, number, pull, head, policy, tier, fast_path, verified_dependabot
+    )
+    reasons.extend(review_reasons)
+
     hits = scan_secrets(files)
     if hits:
         reasons.append("Possible secret in the diff: " + "; ".join(sorted(set(hits))[:5]))
@@ -1303,36 +1536,12 @@ def evaluate(repo: str, number: int, policy_file: str | None = None) -> tuple[di
     unscannable = unscanned_text(files)
     if unscannable:
         reasons.append("Cannot scan text changes without a diff: " + ", ".join(unscannable[:5]))
-    required: list[str] = []
-    if policy.get("require_checks", True):
-        required = applicable_contexts(policy, verified_dependabot, files)
-        if not required:
-            reasons.append("CI is required but no applicable context remains")
-            checks = "missing"
-            checks_note = ""
-        else:
-            missing, unsettled, pending, failing = check_results(repo, head, required)
-            if missing:
-                reasons.append("CI did not report required contexts: " + ", ".join(missing[:5]))
-            if unsettled:
-                reasons.append("CI has not succeeded: " + ", ".join(unsettled[:5]))
-            if pending:
-                reasons.append("CI is still running: " + ", ".join(pending[:5]))
-            if failing:
-                reasons.append("CI is not successful: " + ", ".join(failing[:5]))
-            checks = "pending" if pending and not (missing or unsettled or failing) else (
-                "failure" if missing or unsettled or failing else "success"
-            )
-            checks_note = (
-                "The merge entry is not on the default branch yet; the contexts come from "
-                "the trusted --policy-file"
-                if bootstrap else ""
-            )
-    else:
-        checks = "skipped"
-        checks_note = policy.get("checks_disabled_reason") or "not required by policy"
-        if bootstrap:
-            checks_note += " (policy read from --policy-file; the entry is not installed yet)"
+
+    checks, required, checks_note, check_reasons = _evaluate_checks(
+        repo, head, policy, verified_dependabot, files, bootstrap
+    )
+    reasons.extend(check_reasons)
+
     verdict = {
         "repo": repo,
         "pr": number,
@@ -1499,22 +1708,24 @@ def _resolve_commit(repo: str, sha: str, indexed: dict[str, dict[str, Any]]) -> 
 
 
 def _first_parent_shas(listing: list[dict[str, Any]]) -> set[str]:
-    indexed = {
-        commit["sha"]: commit
-        for commit in listing
-        if isinstance(commit, dict) and isinstance(commit.get("sha"), str)
-    }
+    indexed: dict[str, dict[str, Any]] = {}
+    for commit in listing:
+        commit_obj = _expect_dict(commit)
+        sha = _expect_str(commit_obj.get("sha")) if commit_obj is not None else None
+        if commit_obj is not None and sha is not None:
+            indexed[sha] = commit_obj
     reachable: set[str] = set()
-    current = listing[0].get("sha") if listing and isinstance(listing[0], dict) else ""
-    while isinstance(current, str) and current and current.lower() not in reachable:
-        reachable.add(current.lower())
-        commit = indexed.get(current)
+    first_obj = _expect_dict(listing[0]) if listing else None
+    current: Any = first_obj.get("sha") if first_obj is not None else ""
+    while (current_sha := _expect_str(current, non_empty=True)) is not None and current_sha.lower() not in reachable:
+        reachable.add(current_sha.lower())
+        commit = indexed.get(current_sha)
         if not commit:
             break
         parents = [
-            parent.get("sha")
+            parent_obj.get("sha")
             for parent in (commit.get("parents") or [])
-            if isinstance(parent, dict)
+            if (parent_obj := _expect_dict(parent)) is not None
         ]
         current = parents[0] if parents else ""
     return reachable
@@ -1528,15 +1739,17 @@ def _commit_is_ancestor(
     lowered = ancestor.lower()
     if lowered == tip.lower() or (known_ancestors is not None and lowered in known_ancestors):
         return True
-    comparison = request(
-        "GET",
-        f"/repos/{repo}/compare/{ancestor}...{tip}",
-        allow=(404, 422),
+    comparison = _expect_dict(
+        request(
+            "GET",
+            f"/repos/{repo}/compare/{ancestor}...{tip}",
+            allow=(404, 422),
+        )
     )
-    if not isinstance(comparison, dict):
+    if comparison is None:
         return False
-    merge_base = (comparison.get("merge_base_commit") or {}).get("sha")
-    if not isinstance(merge_base, str) or merge_base.lower() != lowered:
+    merge_base = _expect_str(_dict_at(comparison, "merge_base_commit").get("sha"))
+    if merge_base is None or merge_base.lower() != lowered:
         return False
     status = comparison.get("status")
     return status is None or status in ("identical", "ahead")
@@ -1564,41 +1777,758 @@ def _audit_force_pushes(
     since_dt = _parse_iso_timestamp(since) if since else None
     findings: list[str] = []
     for entry in activities:
-        if not isinstance(entry, dict) or entry.get("activity_type") != "force_push":
+        entry_obj = _expect_dict(entry)
+        if entry_obj is None or entry_obj.get("activity_type") != "force_push":
             continue
-        entry_ref = entry.get("ref")
+        entry_ref = entry_obj.get("ref")
         if entry_ref is not None and entry_ref != expected_ref:
             continue
-        entry_ts = _parse_iso_timestamp(entry.get("timestamp"))
+        entry_ts = _parse_iso_timestamp(entry_obj.get("timestamp"))
         if since_dt is not None and entry_ts is not None and entry_ts < since_dt:
             continue
-        entry_id = entry.get("id")
-        id_key = (
-            str(entry_id)
-            if entry_id is not None and not isinstance(entry_id, bool)
-            else ""
-        )
+        entry_id = entry_obj.get("id")
+        id_key = str(entry_id) if entry_id is not None and _expect_bool(entry_id) is None else ""
         note = ""
         if id_key:
             note = str(acknowledged.get(f"activity:{id_key}") or acknowledged.get(id_key) or "")
         if note:
             print(f"note: acknowledged force push on {default} ({id_key}): {note}")
             continue
-        after = str(entry.get("after") or "")
+        before = str(entry_obj.get("before") or "")
+        after = str(entry_obj.get("after") or "")
         if (
             baseline_sha
             and baseline_verified
+            and before
             and after
+            and not re.fullmatch(r"0+", before)
+            and not re.fullmatch(r"0+", after)
+            and before.lower() != baseline_sha
             and after.lower() != baseline_sha
+            and _commit_is_ancestor(repo, before, baseline_sha)
             and _commit_is_ancestor(repo, after, baseline_sha)
         ):
             continue
-        before = str(entry.get("before") or "")
         origin = before[:7] if before else "unknown"
         target = after[:7] if after else "unknown"
         event_label = f"activity {id_key}" if id_key else "activity"
         findings.append(f"force push on {default} ({event_label}: {origin}..{target})")
     return findings
+
+
+def _rebased_commit_matches(step_commit: dict[str, Any], pr_commit: dict[str, Any]) -> bool:
+    step_sha = _expect_str(step_commit.get("sha"), non_empty=True)
+    pr_sha = _expect_str(pr_commit.get("sha"), non_empty=True)
+    if step_sha is not None and step_sha == pr_sha:
+        return True
+    step_meta = _expect_dict(step_commit.get("commit"))
+    pr_meta = _expect_dict(pr_commit.get("commit"))
+    if step_meta is None or pr_meta is None:
+        return False
+    step_message = _expect_str(step_meta.get("message"))
+    pr_message = _expect_str(pr_meta.get("message"), non_empty=True)
+    if step_message is None or pr_message is None or step_message != pr_message:
+        return False
+    step_author = _expect_dict(step_meta.get("author"))
+    pr_author = _expect_dict(pr_meta.get("author"))
+    if step_author is None or pr_author is None:
+        return False
+    pr_email = _expect_str(pr_author.get("email"), non_empty=True)
+    if pr_email is None or step_author.get("email") != pr_email:
+        return False
+    pr_date = _expect_str(pr_author.get("date"), non_empty=True)
+    if pr_date is None or step_author.get("date") != pr_date:
+        return False
+    pr_name = _expect_str(pr_author.get("name"), non_empty=True)
+    if pr_name is not None and step_author.get("name") != pr_name:
+        return False
+    return True
+
+
+def _commit_tree_sha(commit: dict[str, Any]) -> str:
+    return _expect_sha40(_dict_at(commit, "commit", "tree").get("sha"), strip=True) or ""
+
+
+VALID_GIT_FILE_MODES = frozenset({"100644", "100755", "120000", "160000"})
+ALLOWED_DIFF_STATUSES = frozenset({"added", "modified", "removed", "renamed", "copied", "changed"})
+
+
+def _fetch_tree_map(
+    repo: str,
+    tree_sha: str,
+    *,
+    recursive: bool,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> dict[str, tuple[str, str, str]] | str | None:
+    key = (tree_sha, recursive)
+    if key in tree_cache:
+        return tree_cache[key]
+    params = {"recursive": "1"} if recursive else None
+    res_obj = _expect_dict(request("GET", f"/repos/{repo}/git/trees/{tree_sha}", params=params, allow=(404,)))
+    tree_list = _expect_list(res_obj.get("tree")) if res_obj is not None else None
+    if res_obj is None or tree_list is None:
+        tree_cache[key] = None
+        return None
+    if res_obj.get("truncated") is True:
+        result: dict[str, tuple[str, str, str]] | str | None = "TRUNCATED" if recursive else None
+        tree_cache[key] = result
+        return result
+    entries: dict[str, tuple[str, str, str]] = {}
+    for item in tree_list:
+        item_obj = _expect_dict(item)
+        if item_obj is None:
+            continue
+        p = _expect_str(item_obj.get("path"), non_empty=True)
+        t = _expect_str(item_obj.get("type"))
+        m = _expect_str(item_obj.get("mode"))
+        s = _expect_sha40(item_obj.get("sha"))
+        if (
+            p is not None
+            and (recursive or ("/" not in p and p not in (".", "..")))
+            and t is not None
+            and m is not None
+            and s is not None
+        ):
+            entries[p] = (t, m, s)
+    tree_cache[key] = entries
+    return entries
+
+
+def _lookup_tree_file_mode(
+    repo: str,
+    tree_sha: str,
+    filepath: str,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> str:
+    if not tree_sha or not filepath:
+        return ""
+    parts = filepath.split("/")
+    if any(not seg or seg in (".", "..") for seg in parts):
+        return ""
+    flat = _fetch_tree_map(repo, tree_sha, recursive=True, tree_cache=tree_cache)
+    flat_map = _expect_dict(flat)
+    if flat_map is not None:
+        entry = flat_map.get(filepath)
+        if entry and entry[0] in ("blob", "commit") and entry[1] in VALID_GIT_FILE_MODES:
+            return entry[1]
+        return ""
+    if flat != "TRUNCATED":
+        return ""
+    current_tree = tree_sha
+    for segment in parts[:-1]:
+        node_map = _expect_dict(_fetch_tree_map(repo, current_tree, recursive=False, tree_cache=tree_cache))
+        if node_map is None:
+            return ""
+        sub = node_map.get(segment)
+        if not sub or sub[0] != "tree" or sub[1] != "040000":
+            return ""
+        current_tree = sub[2]
+    leaf_map = _expect_dict(_fetch_tree_map(repo, current_tree, recursive=False, tree_cache=tree_cache))
+    if leaf_map is None:
+        return ""
+    leaf = leaf_map.get(parts[-1])
+    if leaf and leaf[0] in ("blob", "commit") and leaf[1] in VALID_GIT_FILE_MODES:
+        return leaf[1]
+    return ""
+
+
+def _canonical_file_proof(
+    entry: dict[str, Any],
+    additions: int,
+    deletions: int,
+    changes: int,
+    status: str,
+) -> tuple[str, Any] | None:
+    patch = entry.get("patch")
+    sha_hex = _expect_sha40(entry.get("sha")) or ""
+    if (
+        patch in (None, "")
+        and additions == 0
+        and deletions == 0
+        and changes == 0
+        and sha_hex
+        and status == "renamed"
+    ):
+        return ("rename_sha", sha_hex)
+    if (
+        patch in (None, "")
+        and additions == 0
+        and deletions == 0
+        and changes == 0
+        and sha_hex == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+    ):
+        return ("empty_blob", sha_hex)
+    if complete_patch(entry):
+        return ("patch", patch)
+    return None
+
+
+def _canonical_commit_file_entry(
+    repo: str,
+    entry: Any,
+    parent_tree: str,
+    commit_tree: str,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> tuple[Any, ...] | None:
+    entry_obj = _expect_dict(entry)
+    if entry_obj is None:
+        return None
+    filename = _expect_str(entry_obj.get("filename"), non_empty=True)
+    status = _expect_str(entry_obj.get("status"))
+    raw_previous = entry_obj.get("previous_filename")
+    previous = "" if raw_previous is None else _expect_str(raw_previous)
+    additions = _expect_nonneg_int(entry_obj.get("additions"))
+    deletions = _expect_nonneg_int(entry_obj.get("deletions"))
+    changes = _expect_nonneg_int(entry_obj.get("changes"))
+    if (
+        filename is None
+        or status is None
+        or previous is None
+        or additions is None
+        or deletions is None
+        or changes is None
+        or status not in ALLOWED_DIFF_STATUSES
+        or changes != additions + deletions
+    ):
+        return None
+    if status == "added":
+        old_mode = ""
+    else:
+        if not parent_tree:
+            return None
+        old_path = previous if (status in ("renamed", "copied") and previous) else filename
+        old_mode = _lookup_tree_file_mode(repo, parent_tree, old_path, tree_cache)
+        if not old_mode:
+            return None
+    if status == "removed":
+        new_mode = ""
+    else:
+        new_mode = _lookup_tree_file_mode(repo, commit_tree, filename, tree_cache)
+        if not new_mode:
+            return None
+    proof = _canonical_file_proof(entry_obj, additions, deletions, changes, status)
+    if proof is None:
+        return None
+    return (filename, previous, status, additions, deletions, changes, old_mode, new_mode, proof)
+
+
+def _canonical_commit_files(
+    repo: str,
+    commit_detail: dict[str, Any],
+    parent_commit: dict[str, Any] | None,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> list[tuple[Any, ...]] | None:
+    files = _expect_list(commit_detail.get("files"))
+    commit_tree = _commit_tree_sha(commit_detail)
+    parent_obj = _expect_dict(parent_commit)
+    parent_tree = _commit_tree_sha(parent_obj) if parent_obj is not None else ""
+    if (
+        commit_detail.get("_files_complete") is not _FILES_COMPLETE_TOKEN
+        or files is None
+        or not (0 < len(files) <= 3000)
+        or not commit_tree
+    ):
+        return None
+    normalized: list[tuple[Any, ...]] = []
+    covered_paths: set[str] = set()
+    for entry in files:
+        record = _canonical_commit_file_entry(repo, entry, parent_tree, commit_tree, tree_cache)
+        if record is None:
+            return None
+        covered_paths.add(record[0])
+        if record[1]:
+            covered_paths.add(record[1])
+        normalized.append(record)
+    parent_map = (
+        {}
+        if parent_commit is None
+        else (_fetch_tree_map(repo, parent_tree, recursive=True, tree_cache=tree_cache) if parent_tree else None)
+    )
+    commit_map = _fetch_tree_map(repo, commit_tree, recursive=True, tree_cache=tree_cache)
+    if _has_uncovered_tree_diff(
+        repo,
+        parent_tree,
+        commit_tree,
+        parent_map,
+        commit_map,
+        covered_paths,
+        tree_cache,
+    ):
+        return None
+    normalized.sort()
+    return normalized
+
+
+def _flat_tree_children(
+    flat_map: dict[str, tuple[str, str, str]],
+    prefix: str,
+) -> dict[str, tuple[str, str, str]]:
+    children: dict[str, tuple[str, str, str]] = {}
+    for full_path, entry in flat_map.items():
+        if not full_path.startswith(prefix):
+            continue
+        rel = full_path[len(prefix):]
+        if not rel:
+            continue
+        if "/" not in rel:
+            if rel not in (".", ".."):
+                children[rel] = entry
+            continue
+        subdir = rel.split("/", 1)[0]
+        if subdir and subdir not in (".", "..") and subdir not in children:
+            children[subdir] = ("tree", "040000", "")
+    return children
+
+
+def _load_tree_children(
+    repo: str,
+    tree_map: dict[str, tuple[str, str, str]] | str | None,
+    prefix: str,
+    tree_sha: str,
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> dict[str, tuple[str, str, str]] | None:
+    flat = _expect_dict(tree_map)
+    if flat is not None:
+        return _flat_tree_children(flat, prefix)
+    if not tree_sha:
+        return {}
+    return _expect_dict(_fetch_tree_map(repo, tree_sha, recursive=False, tree_cache=tree_cache))
+
+
+def _has_uncovered_tree_diff(
+    repo: str,
+    parent_tree: str,
+    commit_tree: str,
+    parent_map: dict[str, tuple[str, str, str]] | str | None,
+    commit_map: dict[str, tuple[str, str, str]] | str | None,
+    covered_paths: set[str],
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None],
+) -> bool:
+    if parent_map is None or commit_map is None:
+        return True
+    parent_dict = _expect_dict(parent_map)
+    commit_dict = _expect_dict(commit_map)
+    if parent_dict is not None and commit_dict is not None:
+        for path in set(parent_dict) | set(commit_dict):
+            p_entry = parent_dict.get(path)
+            c_entry = commit_dict.get(path)
+            p_file = p_entry if (p_entry and p_entry[0] in ("blob", "commit")) else None
+            c_file = c_entry if (c_entry and c_entry[0] in ("blob", "commit")) else None
+            if p_file != c_file and path not in covered_paths:
+                return True
+        return False
+
+    stack: list[tuple[str, str, str]] = [("", parent_tree, commit_tree)]
+    seen: set[tuple[str, str, str]] = set()
+    visited = 0
+    while stack:
+        prefix, p_sha, c_sha = stack.pop()
+        if (prefix, p_sha, c_sha) in seen:
+            continue
+        seen.add((prefix, p_sha, c_sha))
+        visited += 1
+        if visited > 2000:
+            return True
+        if p_sha and c_sha and p_sha == c_sha:
+            continue
+        p_children = _load_tree_children(repo, parent_map, prefix, p_sha, tree_cache)
+        c_children = _load_tree_children(repo, commit_map, prefix, c_sha, tree_cache)
+        if p_children is None or c_children is None:
+            return True
+
+        for name in set(p_children) | set(c_children):
+            full_path = f"{prefix}{name}"
+            p_entry = p_children.get(name)
+            c_entry = c_children.get(name)
+            p_file = p_entry if (p_entry and p_entry[0] in ("blob", "commit")) else None
+            c_file = c_entry if (c_entry and c_entry[0] in ("blob", "commit")) else None
+            if p_file != c_file and full_path not in covered_paths:
+                return True
+            p_is_tree = bool(p_entry and p_entry[0] == "tree")
+            c_is_tree = bool(c_entry and c_entry[0] == "tree")
+            if (p_is_tree and p_entry[1] != "040000") or (c_is_tree and c_entry[1] != "040000"):
+                return True
+            if p_is_tree or c_is_tree:
+                p_sub = p_entry[2] if p_is_tree else ""
+                c_sub = c_entry[2] if c_is_tree else ""
+                if p_sub and c_sub and p_sub == c_sub:
+                    continue
+                stack.append((f"{full_path}/", p_sub, c_sub))
+    return False
+
+
+_FILES_COMPLETE_TOKEN = object()
+
+
+def _resolve_commit_detail(repo: str, commit: dict[str, Any]) -> dict[str, Any] | None:
+    if commit.get("_files_complete") is _FILES_COMPLETE_TOKEN and _expect_list(commit.get("files")) is not None:
+        return commit
+    sha = _expect_str(commit.get("sha"), non_empty=True)
+    if sha is None:
+        return None
+    base_detail: dict[str, Any] | None = None
+    all_files: list[dict[str, Any]] = []
+    seen_page_keys: tuple[tuple[str, str, str], ...] | None = None
+    for page in range(1, 31):
+        detail = _expect_dict(
+            request(
+                "GET",
+                f"/repos/{repo}/commits/{sha}",
+                params={"per_page": 100, "page": page},
+                allow=(404,),
+            )
+        )
+        chunk = _expect_list(detail.get("files")) if detail is not None else None
+        if detail is None or chunk is None:
+            return None
+        if base_detail is None:
+            base_detail = detail
+        if not chunk:
+            break
+        page_keys: list[tuple[str, str, str]] = []
+        for item in chunk:
+            item_obj = _expect_dict(item)
+            if item_obj is None:
+                return None
+            fn = _expect_str(item_obj.get("filename"), non_empty=True)
+            st = _expect_str(item_obj.get("status"), non_empty=True)
+            if fn is None or st is None:
+                return None
+            page_keys.append((fn, st, str(item_obj.get("sha") or "")))
+        keys_tuple = tuple(page_keys)
+        if page > 1 and keys_tuple == seen_page_keys:
+            return None
+        seen_page_keys = keys_tuple
+        all_files.extend(chunk)
+        if len(all_files) > 3000:
+            return None
+        if len(chunk) < 30:
+            break
+        if page == 30:
+            return None
+    if base_detail is None:
+        return None
+    stats = _expect_dict(base_detail.get("stats"))
+    if stats is not None and "total" in stats and stats["total"] is not None:
+        total = _expect_int(stats["total"])
+        if total is None:
+            return None
+        total_changes = 0
+        for item in all_files:
+            ch = _expect_nonneg_int(item.get("changes"))
+            if ch is None:
+                return None
+            total_changes += ch
+        if total != total_changes:
+            return None
+    return {**base_detail, "files": all_files, "_files_complete": _FILES_COMPLETE_TOKEN}
+
+
+def _rebased_chain_content_matches(
+    repo: str,
+    step_commits: list[dict[str, Any]],
+    pr_commits: list[dict[str, Any]],
+    base_parent: str,
+    pr_base_parent: str,
+    indexed: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    if len(step_commits) != len(pr_commits) or not pr_commits:
+        return False
+    if all(
+        (s_sha := _expect_str(s.get("sha"), non_empty=True)) is not None and s_sha == p.get("sha")
+        for s, p in zip(step_commits, pr_commits)
+    ):
+        return True
+    if base_parent and pr_base_parent == base_parent:
+        tree_pairs = [(_commit_tree_sha(s), _commit_tree_sha(p)) for s, p in zip(step_commits, pr_commits)]
+        if all(st and st == pt for st, pt in tree_pairs):
+            return True
+    step_parent_head = _resolve_commit(repo, base_parent, indexed if indexed is not None else {}) if base_parent else None
+    pr_parent_head = _resolve_commit(repo, pr_base_parent, {}) if pr_base_parent else None
+    tree_cache: dict[tuple[str, bool], dict[str, tuple[str, str, str]] | str | None] = {}
+    for index, (step_commit, pr_commit) in enumerate(zip(step_commits, pr_commits)):
+        step_detail = _resolve_commit_detail(repo, step_commit)
+        pr_detail = _resolve_commit_detail(repo, pr_commit)
+        if step_detail is None or pr_detail is None:
+            return False
+        step_parent = step_parent_head if index == 0 else step_commits[index - 1]
+        pr_parent = pr_parent_head if index == 0 else pr_commits[index - 1]
+        step_files = _canonical_commit_files(repo, step_detail, step_parent, tree_cache)
+        pr_files = _canonical_commit_files(repo, pr_detail, pr_parent, tree_cache)
+        if step_files is None or pr_files is None or step_files != pr_files:
+            return False
+    return True
+
+
+def _matching_verdicts(
+    comments: list[dict[str, Any]],
+    repo: str,
+    number: Any,
+    head: str,
+    merge_sha: Any,
+    signers: set[str] | None,
+) -> list[dict[str, Any]]:
+    if not signers:
+        return []
+    matched: list[dict[str, Any]] = []
+    for comment in comments:
+        comment_obj = _expect_dict(comment)
+        if comment_obj is None:
+            continue
+        author = _expect_str(_dict_at(comment_obj, "user").get("login"))
+        if author is None or author not in signers:
+            continue
+        body = comment_obj.get("body") or ""
+        for match in re.finditer(rf"<!--\s*{VERDICT_MARKER}\s*(\{{[\s\S]*?\}})\s*-->", body):
+            try:
+                verdict = json.loads(match.group(1))
+            except ValueError:
+                continue
+            verdict_obj = _expect_dict(verdict)
+            if verdict_obj is None:
+                continue
+            if (
+                verdict_obj.get("repo") == repo
+                and verdict_obj.get("pr") == number
+                and verdict_obj.get("head_sha") == head
+                and verdict_obj.get("merge_sha") == merge_sha
+                and verdict_obj.get("verdict") == "pass"
+                and verdict_obj.get("merged") is True
+            ):
+                matched.append(verdict_obj)
+    return matched
+
+
+def _authenticated_pull_merge_method(
+    repo: str,
+    pull: dict[str, Any],
+    merge_sha: str,
+    signers: set[str] | None,
+) -> str | None:
+    if not signers:
+        return None
+    number = _expect_int(pull.get("number"))
+    head = _expect_str(_dict_at(pull, "head").get("sha"), non_empty=True)
+    if number is None or head is None or not merge_sha:
+        return None
+    comments = paginate(f"/repos/{repo}/issues/{number}/comments")
+    for verdict in _matching_verdicts(comments, repo, number, head, merge_sha, signers):
+        method = _expect_str(verdict.get("merge_method"), non_empty=True)
+        if method is not None:
+            return method
+    return None
+
+
+def _is_ancestor_of_base_parent(
+    repo: str,
+    base_sha: str,
+    base_parent: str,
+    indexed: dict[str, dict[str, Any]],
+) -> bool:
+    if not base_sha or not base_parent:
+        return False
+    target = base_sha.lower()
+    current: Any = base_parent
+    seen: set[str] = set()
+    had_multi_parent = False
+    reached_root = False
+    while (current_sha := _expect_str(current, non_empty=True)) is not None and current_sha.lower() not in seen:
+        lowered = current_sha.lower()
+        if lowered == target:
+            return True
+        seen.add(lowered)
+        commit = _expect_dict(indexed.get(current_sha))
+        if commit is None:
+            break
+        parents = []
+        for parent in (commit.get("parents") or []):
+            parent_obj = _expect_dict(parent)
+            parent_sha = _expect_str(parent_obj.get("sha"), non_empty=True) if parent_obj is not None else None
+            if parent_sha is not None:
+                parents.append(parent_sha)
+        if len(parents) > 1:
+            had_multi_parent = True
+        if not parents:
+            reached_root = True
+            break
+        current = parents[0]
+    if reached_root and not had_multi_parent:
+        return False
+    return _commit_is_ancestor(repo, base_sha, base_parent)
+
+
+def _single_parent_sha(commit: Any) -> str | None:
+    commit_obj = _expect_dict(commit)
+    if commit_obj is None:
+        return None
+    parents = commit_obj.get("parents") or []
+    if len(parents) != 1:
+        return None
+    parent_obj = _expect_dict(parents[0])
+    if parent_obj is None:
+        return None
+    return _expect_str(parent_obj.get("sha"), non_empty=True)
+
+
+def _fetch_pr_commit_chain(repo: str, number: int, head_sha: str) -> tuple[list[dict[str, Any]], str] | None:
+    pr_commits: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        chunk = _expect_list(
+            request(
+                "GET",
+                f"/repos/{repo}/pulls/{number}/commits",
+                params={"per_page": 100, "page": page},
+                allow=(404,),
+            )
+        )
+        if chunk is None:
+            return None
+        pr_commits.extend(chunk)
+        if len(pr_commits) >= 250:
+            return None
+        if len(chunk) < 100:
+            break
+        page += 1
+    if len(pr_commits) <= 1 or pr_commits[-1].get("sha") != head_sha:
+        return None
+    pr_base_parent = ""
+    for index, pr_commit in enumerate(pr_commits):
+        pr_parent_sha = _single_parent_sha(pr_commit)
+        if pr_parent_sha is None:
+            return None
+        if index == 0:
+            pr_base_parent = pr_parent_sha
+        elif pr_parent_sha != pr_commits[index - 1].get("sha"):
+            return None
+    return pr_commits, pr_base_parent
+
+
+def _collect_rebased_commits(
+    repo: str,
+    pull: dict[str, Any],
+    merge_sha: str,
+    indexed: dict[str, dict[str, Any]],
+    merge_method: str | None = None,
+) -> set[str]:
+    if merge_method is not None and merge_method != "rebase":
+        return set()
+    if pull.get("commits") == 1:
+        return set()
+    number = _expect_int(pull.get("number"))
+    head_sha = _expect_str(_dict_at(pull, "head").get("sha"), non_empty=True)
+    base_sha = _expect_str(_dict_at(pull, "base").get("sha"), non_empty=True)
+    if number is None or head_sha is None or base_sha is None:
+        return set()
+    chain = _fetch_pr_commit_chain(repo, number, head_sha)
+    if chain is None:
+        return set()
+    pr_commits, pr_base_parent = chain
+    earlier_shas: list[str] = []
+    step_commits_rev: list[dict[str, Any]] = []
+    step_sha = merge_sha
+    base_parent = ""
+    for index in range(len(pr_commits) - 1, -1, -1):
+        pr_commit = pr_commits[index]
+        step_commit = _expect_dict(_resolve_commit(repo, step_sha, indexed) if step_sha else None)
+        parent_sha = _single_parent_sha(step_commit)
+        if step_commit is None or parent_sha is None:
+            return set()
+        if not _rebased_commit_matches(step_commit, pr_commit):
+            return set()
+        step_commits_rev.append(step_commit)
+        if index < len(pr_commits) - 1:
+            earlier_shas.append(step_sha)
+        base_parent = parent_sha
+        step_sha = parent_sha
+    if not _is_ancestor_of_base_parent(repo, base_sha, base_parent, indexed):
+        return set()
+    if merge_method != "rebase":
+        step_commits_rev.reverse()
+        if not _rebased_chain_content_matches(
+            repo, step_commits_rev, pr_commits, base_parent, pr_base_parent, indexed
+        ):
+            return set()
+    return set(earlier_shas)
+
+
+def _expand_rebased_pull(
+    repo: str,
+    pull: dict[str, Any],
+    commit_sha: str,
+    indexed: dict[str, dict[str, Any]],
+    resolved_methods: dict[int, str],
+    rebased_commits: set[str],
+    signers: set[str] | None,
+    *,
+    allow_comment_lookup: bool = False,
+) -> None:
+    number = _expect_int(pull.get("number"))
+    method = resolved_methods.get(number) if number is not None else None
+    if allow_comment_lookup and method is None and number is not None:
+        found_method = _authenticated_pull_merge_method(repo, pull, commit_sha, signers)
+        if found_method is not None:
+            resolved_methods[number] = found_method
+            method = found_method
+    rebased_commits.update(
+        _collect_rebased_commits(repo, pull, commit_sha, indexed, merge_method=method)
+    )
+
+
+def _inspect_commit_association(
+    repo: str,
+    default: str,
+    current: str,
+    commit: dict[str, Any],
+    parents: list[Any],
+    merge_shas: set,
+    pulls_by_merge_sha: dict[str, dict[str, Any]] | None,
+    indexed: dict[str, dict[str, Any]],
+    resolved_methods: dict[int, str],
+    rebased_commits: set[str],
+    acknowledged: dict,
+    strict: bool,
+    signers: set[str] | None,
+) -> str | None:
+    if current in merge_shas:
+        pull = pulls_by_merge_sha.get(current) if pulls_by_merge_sha else None
+        if len(parents) == 1 and pull is not None:
+            _expand_rebased_pull(
+                repo, pull, current, indexed, resolved_methods, rebased_commits, signers
+            )
+        return None
+    related = request("GET", f"/repos/{repo}/commits/{current}/pulls", allow=(404,)) or []
+    matched = [
+        p
+        for p in related
+        if p.get("merged_at")
+        and _dict_at(p, "base").get("ref") == default
+        and p.get("merge_commit_sha") == current
+    ]
+    if matched:
+        if len(parents) == 1:
+            for p in matched:
+                _expand_rebased_pull(
+                    repo,
+                    p,
+                    current,
+                    indexed,
+                    resolved_methods,
+                    rebased_commits,
+                    signers,
+                    allow_comment_lookup=True,
+                )
+        return None
+    subject = (_dict_at(commit, "commit").get("message") or "").splitlines()[0]
+    note = str(acknowledged.get(current) or acknowledged.get(current[:7]) or "")
+    message = f"{current[:7]} on {default} is not associated with a merged pull request: {subject}"
+    if note:
+        print(f"note: acknowledged direct push {current[:7]}: {note}")
+        return None
+    if strict:
+        return message
+    print(f"warning: {message}")
+    return None
 
 
 def scan_direct_pushes(
@@ -1610,6 +2540,10 @@ def scan_direct_pushes(
     limit: int,
     baseline_sha: str = "",
     listing: list[dict[str, Any]] | None = None,
+    pulls_by_merge_sha: dict[str, dict[str, Any]] | None = None,
+    pull_methods: dict[int, str] | None = None,
+    first_parent: set[str] | None = None,
+    signers: set[str] | None = None,
 ) -> list[str]:
     # Only main's first-parent chain is evidence of a push that bypassed the entry;
     # scanning the raw commit listing both misses chain commits behind a long branch
@@ -1625,10 +2559,28 @@ def scan_direct_pushes(
                           params={"sha": default, "per_page": 100}) or []
     for commit in listing:
         indexed.setdefault(commit["sha"], commit)
+    resolved_methods: dict[int, str] = dict(pull_methods or {})
     findings: list[str] = []
-    current, visited = (listing[0]["sha"] if listing else ""), 0
+    rebased_commits: set[str] = set()
+    seen_shas: set[str] = set()
+    current, visited, steps = (listing[0]["sha"] if listing else ""), 0, 0
+    max_steps = max(limit * 20, 2000)
     while current and visited < limit:
+        if current in seen_shas:
+            findings.append(
+                f"{current[:7]} on {default} forms a commit parent cycle; "
+                "the direct-push audit is incomplete"
+            )
+            break
+        seen_shas.add(current)
         if baseline_sha and current.lower() == baseline_sha:
+            break
+        steps += 1
+        if steps > max_steps:
+            findings.append(
+                f"{current[:7]} on {default} exceeded direct-push traversal limit ({max_steps}); "
+                "the direct-push audit is incomplete"
+            )
             break
         commit = _resolve_commit(repo, current, indexed)
         if commit is None:
@@ -1637,54 +2589,49 @@ def scan_direct_pushes(
             break
         parents = [parent.get("sha") for parent in (commit.get("parents") or [])]
         next_sha = parents[0] if parents else ""
-        visited += 1
-        if current in merge_shas:
-            current = next_sha
-            continue
-        related = request("GET", f"/repos/{repo}/commits/{current}/pulls", allow=(404,)) or []
-        if not any(
-            pull.get("merged_at")
-            and (pull.get("base") or {}).get("ref") == default
-            and pull.get("merge_commit_sha") == current
-            for pull in related
-        ):
-            subject = ((commit.get("commit") or {}).get("message") or "").splitlines()[0]
-            note = str(acknowledged.get(current) or acknowledged.get(current[:7]) or "")
-            message = f"{current[:7]} on {default} is not associated with a merged pull request: {subject}"
-            if note:
-                print(f"note: acknowledged direct push {current[:7]}: {note}")
-            elif strict:
-                findings.append(message)
-            else:
-                print(f"warning: {message}")
+        if current not in rebased_commits:
+            visited += 1
+            finding = _inspect_commit_association(
+                repo,
+                default,
+                current,
+                commit,
+                parents,
+                merge_shas,
+                pulls_by_merge_sha,
+                indexed,
+                resolved_methods,
+                rebased_commits,
+                acknowledged,
+                strict,
+                signers,
+            )
+            if finding is not None:
+                findings.append(finding)
         current = next_sha
     return findings
 
 
-def audit(
-    repo: str,
-    limit: int,
-    strict_direct: bool,
-    policy_ref: str | None = None,
-    policy_file: str | None = None,
-) -> int:
-    info = request("GET", f"/repos/{repo}")
-    default = info["default_branch"]
+def _load_audit_policy(
+    repo: str, default: str, policy_ref: str | None, policy_file: str | None
+) -> tuple[dict[str, Any], bool]:
     if policy_file:
         policy = _load_policy_file(policy_file)
         verify_script(repo, default)
-        trusted_policy = True
-    elif policy_ref:
+        return policy, True
+    if policy_ref:
         policy = load_policy(repo, policy_ref)
         verify_script(repo, policy_ref)
-        trusted_policy = True
-    else:
-        policy = load_policy(repo, default)
-        verify_script(repo, default)
-        trusted_policy = False
+        return policy, True
+    policy = load_policy(repo, default)
+    verify_script(repo, default)
+    return policy, False
 
+
+def _resolve_audit_scope(
+    policy: dict[str, Any], strict_direct: bool, trusted_policy: bool
+) -> tuple[bool, str, str, set[str], dict[str, Any], int, list[str]]:
     strict = bool(strict_direct or policy.get("audit_strict_direct", True))
-    signers = _valid_verdict_signers(policy)
     violations: list[str] = []
     raw_since = policy.get("audit_since") or ""
     since = ""
@@ -1697,10 +2644,11 @@ def audit(
     raw_baseline = policy.get("audit_baseline_sha")
     baseline_sha = ""
     if raw_baseline is not None and raw_baseline != "":
-        if isinstance(raw_baseline, str) and re.fullmatch(r"[0-9a-f]{40}", raw_baseline.strip().lower()):
-            baseline_sha = raw_baseline.strip().lower()
-        else:
+        parsed_baseline = _expect_sha40(raw_baseline, strip=True)
+        if parsed_baseline is None:
             violations.append("audit_baseline_sha in policy is invalid")
+        else:
+            baseline_sha = parsed_baseline
     ignored = {str(number) for number in policy.get("audit_ignore_prs") or []}
     acknowledged = policy.get("audit_acknowledged_direct") or {}
     direct_limit = int(policy.get("audit_direct_commits") or 40)
@@ -1710,6 +2658,10 @@ def audit(
         ignored = set()
         acknowledged = {}
         direct_limit = max(direct_limit, 40)
+    return strict, since, baseline_sha, ignored, acknowledged, direct_limit, violations
+
+
+def _fetch_audited_pulls(repo: str, limit: int, since: str, ignored: set[str]) -> list[dict[str, Any]]:
     eligible: list[dict[str, Any]] = []
     page = 1
     while True:
@@ -1753,64 +2705,96 @@ def audit(
     # The API sorts by update time, not merge time; select the latest merges
     # before applying the limit so a stale update cannot consume the window.
     eligible.sort(key=lambda pull: pull["merged_at"], reverse=True)
-    audited_pulls = eligible[:limit]
+    return eligible[:limit]
+
+
+def _audit_pull_verdicts(
+    repo: str, audited_pulls: list[dict[str, Any]], signers: set[str]
+) -> tuple[int, dict[int, str], list[str]]:
     checked = 0
+    pull_methods: dict[int, str] = {}
+    violations: list[str] = []
     for pull in audited_pulls:
         number = pull["number"]
         checked += 1
         head = pull["head"]["sha"]
         merge_sha = pull.get("merge_commit_sha")
         comments = paginate(f"/repos/{repo}/issues/{number}/comments")
-        passed = False
-        for comment in comments:
-            author = (comment.get("user") or {}).get("login")
-            if not signers or not isinstance(author, str) or author not in signers:
-                continue
-            for match in re.finditer(rf"<!--\s*{VERDICT_MARKER}\s*(\{{[\s\S]*?\}})\s*-->", comment.get("body") or ""):
-                try:
-                    verdict = json.loads(match.group(1))
-                except ValueError:
-                    continue
-                if (
-                    verdict.get("repo") == repo
-                    and verdict.get("pr") == number
-                    and verdict.get("head_sha") == head
-                    and verdict.get("merge_sha") == merge_sha
-                    and verdict.get("verdict") == "pass"
-                    and verdict.get("merged") is True
-                ):
-                    passed = True
-        if not passed:
+        matched = _matching_verdicts(comments, repo, number, head, merge_sha, signers)
+        if not matched:
             violations.append(f"#{number} merged at {head[:7]} without an authenticated passing verdict")
+            continue
+        number_int = _expect_int(number)
+        if number_int is not None:
+            for verdict in matched:
+                method = _expect_str(verdict.get("merge_method"))
+                if method is not None:
+                    pull_methods[number_int] = method
+    return checked, pull_methods, violations
+
+
+def _audit_ancestry_rollbacks(
+    repo: str,
+    default: str,
+    listing: list[dict[str, Any]],
+    default_pulls: list[dict[str, Any]],
+    baseline_sha: str,
+) -> tuple[set[str], bool, list[str]]:
+    default_tip = listing[0]["sha"] if listing else ""
+    first_parent = _first_parent_shas(listing)
+    baseline_verified = False
+    violations: list[str] = []
+    if not default_tip:
+        if baseline_sha or default_pulls:
+            violations.append(f"could not resolve {default} tip; rollback audit is incomplete")
+        return first_parent, baseline_verified, violations
+    if baseline_sha:
+        baseline_verified = _commit_is_ancestor(repo, baseline_sha, default_tip, first_parent)
+        if not baseline_verified:
+            violations.append(
+                f"baseline {baseline_sha[:7]} is no longer an ancestor of {default} "
+                f"(possible force-push rollback)"
+            )
+    for pull in default_pulls:
+        merge_sha = pull.get("merge_commit_sha")
+        if merge_sha and not _commit_is_ancestor(repo, merge_sha, default_tip, first_parent):
+            violations.append(
+                f"#{pull['number']} merge commit {merge_sha[:7]} is no longer an ancestor of "
+                f"{default} (possible force-push rollback)"
+            )
+    return first_parent, baseline_verified, violations
+
+
+def audit(
+    repo: str,
+    limit: int,
+    strict_direct: bool,
+    policy_ref: str | None = None,
+    policy_file: str | None = None,
+) -> int:
+    info = request("GET", f"/repos/{repo}")
+    default = info["default_branch"]
+    policy, trusted_policy = _load_audit_policy(repo, default, policy_ref, policy_file)
+    signers = _valid_verdict_signers(policy)
+    strict, since, baseline_sha, ignored, acknowledged, direct_limit, violations = _resolve_audit_scope(
+        policy, strict_direct, trusted_policy
+    )
+    audited_pulls = _fetch_audited_pulls(repo, limit, since, ignored)
+    checked, pull_methods, verdict_violations = _audit_pull_verdicts(repo, audited_pulls, signers)
+    violations.extend(verdict_violations)
+
     listing = request(
         "GET",
         f"/repos/{repo}/commits",
         params={"sha": default, "per_page": 100},
     ) or []
-    default_tip = listing[0]["sha"] if listing else ""
-    first_parent = _first_parent_shas(listing)
-    baseline_verified = False
     default_pulls = [
-        pull for pull in audited_pulls if (pull.get("base") or {}).get("ref") == default
+        pull for pull in audited_pulls if _dict_at(pull, "base").get("ref") == default
     ]
-    if not default_tip:
-        if baseline_sha or default_pulls:
-            violations.append(f"could not resolve {default} tip; rollback audit is incomplete")
-    else:
-        if baseline_sha:
-            baseline_verified = _commit_is_ancestor(repo, baseline_sha, default_tip, first_parent)
-            if not baseline_verified:
-                violations.append(
-                    f"baseline {baseline_sha[:7]} is no longer an ancestor of {default} "
-                    f"(possible force-push rollback)"
-                )
-        for pull in default_pulls:
-            merge_sha = pull.get("merge_commit_sha")
-            if merge_sha and not _commit_is_ancestor(repo, merge_sha, default_tip, first_parent):
-                violations.append(
-                    f"#{pull['number']} merge commit {merge_sha[:7]} is no longer an ancestor of "
-                    f"{default} (possible force-push rollback)"
-                )
+    first_parent, baseline_verified, rollback_violations = _audit_ancestry_rollbacks(
+        repo, default, listing, default_pulls, baseline_sha
+    )
+    violations.extend(rollback_violations)
     violations.extend(
         _audit_force_pushes(
             repo,
@@ -1822,11 +2806,12 @@ def audit(
             strict=strict,
         )
     )
-    merge_shas = {
-        pull.get("merge_commit_sha")
+    pulls_by_merge_sha = {
+        pull["merge_commit_sha"]: pull
         for pull in default_pulls
         if pull.get("merge_commit_sha")
     }
+    merge_shas = set(pulls_by_merge_sha)
     violations.extend(
         scan_direct_pushes(
             repo,
@@ -1837,6 +2822,10 @@ def audit(
             direct_limit,
             baseline_sha=baseline_sha,
             listing=listing,
+            pulls_by_merge_sha=pulls_by_merge_sha,
+            pull_methods=pull_methods,
+            first_parent=first_parent,
+            signers=signers,
         )
     )
     print(f"audited {checked} merged pull requests since {since or 'the beginning'}")
