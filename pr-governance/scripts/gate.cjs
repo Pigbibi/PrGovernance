@@ -326,7 +326,7 @@ function classify(files, expected, policy, options = {}) {
     // R0 is deliberately narrow: even inline code, links and HTML need a reviewer.
     if (fileTier === 'R0' && (file.status !== 'modified'
       || changed.some(line => /[`~<>\[\]{}\\$]|^\s{4}|(?:https?:|javascript:|\b(?:curl|wget|npm|python|sudo|bash)\b)/i.test(line)))) fileTier = 'R1';
-    if (paths.some(path => /\.(?:md|txt)$/.test(path))
+    if (fileTier !== 'R3' && paths.some(path => /\.(?:md|txt)$/.test(path))
       && changed.some(line => /\b(?:auth|iam|secret|credential|permission|trading|orders?|strategy|deploy|workflow|owner-approved)\b|认证|授权|凭据|交易|下单|部署/i.test(line))) fileTier = 'R2';
     // A verified Dependabot update inside an allowlisted workflow is nothing but
     // a repin, so it may merge without a clearing label. Everything else in a
