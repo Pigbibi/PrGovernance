@@ -516,6 +516,16 @@ test('v4 requires monotonic review requirements and enough providers', () => {
   assert.throws(() => gate.validatePolicy(f.policy), /monotonic/);
 });
 
+test('v4 schema login patterns accept every shipped reviewer', () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'policy.v4.schema.json'), 'utf8'));
+  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'policy.v4.default.json'), 'utf8'));
+  const primaryPattern = new RegExp(schema.properties.reviewer.properties.login.pattern);
+  const reviewerPattern = new RegExp(schema.properties.reviewers.items.properties.login.pattern);
+  assert.equal(primaryPattern.test(shipped.reviewer.login), true);
+  assert.equal(reviewerPattern.test(shipped.reviewers[0].login), true);
+  assert.equal(reviewerPattern.test(shipped.reviewers[1].login), true);
+});
+
 test('v4 R2 waits for two independent reviewer providers', () => {
   const { f, second } = upgradeV4(fixture({ path: 'config/app.json' }));
   receiptMarker(f);
@@ -550,5 +560,15 @@ test('v4 R3 requires owner approval even after two clean reviews', () => {
   result = evaluate(f);
   assert.equal(result.allowed, true);
   assert.equal(result.labels.applied, 'owner');
+});
+
+test('v4 prose content escalation cannot downgrade an R3 path', () => {
+  const { f } = upgradeV4(fixture({ path: 'infra/production/README.md' }));
+  f.snapshot.files[0].patch = '+deploy with owner-approved evidence';
+  f.snapshot.files[0].additions = 1;
+  f.snapshot.files[0].deletions = 0;
+  const risk = gate.classify(f.snapshot.files, 1, f.policy);
+  assert.equal(risk.tier, 'R3');
+  assert.equal(risk.rules[0].tier, 'R3');
 });
 
