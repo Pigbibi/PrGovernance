@@ -6,11 +6,15 @@
 // embedded verbatim into the generated reusable workflow, so it has to run in
 // any JavaScript host with nothing but the language itself.
 
-const SCHEMA = 'pr-governance/v3';
+const SCHEMA = 'pr-governance/v4';
+const LEGACY_SCHEMA = 'pr-governance/v3';
+const SCHEMAS = [LEGACY_SCHEMA, SCHEMA];
 const MODES = ['enforce', 'local', 'report-only'];
 const POLICY_FIELDS = ['version', 'mode', 'reviewer', 'r0_paths', 'r2_paths',
   'dependabot_template_exemption', 'max_evidence_age_hours'];
-const POLICY_OPTIONAL_FIELDS = ['owner', 'reviewers', 'review_routing', 'max_r1_diff_lines'];
+const POLICY_OPTIONAL_FIELDS = ['owner', 'reviewers', 'review_routing', 'max_r1_diff_lines',
+  'r3_paths', 'review_requirements'];
+const REVIEW_REQUIREMENT_FIELDS = ['r0', 'r1', 'r2', 'r3', 'distinct_providers'];
 const REVIEWER_FIELDS = ['provider', 'app_id', 'user_id', 'login'];
 const OWNER_FIELDS = ['user_id', 'login'];
 const PROVIDERS = ['claude', 'codex', 'cursor', 'deepseek', 'opencode'];
@@ -150,12 +154,43 @@ function reviewerChain(policy) {
   return chain;
 }
 
+function validateReviewRequirements(policy) {
+  const requirements = policy.review_requirements;
+  sameKeys(requirements, REVIEW_REQUIREMENT_FIELDS, 'review_requirements');
+  const chain = reviewerChain(policy);
+  for (const tier of ['r0', 'r1', 'r2', 'r3']) {
+    const count = requirements[tier];
+    assert(Number.isSafeInteger(count) && count >= 1 && count <= chain.length,
+      `Invalid review requirement for ${tier}`);
+  }
+  assert(requirements.r0 <= requirements.r1
+    && requirements.r1 <= requirements.r2
+    && requirements.r2 <= requirements.r3,
+  'Review requirements must be monotonic');
+  assert(typeof requirements.distinct_providers === 'boolean',
+    'Invalid distinct_providers');
+  if (requirements.distinct_providers) {
+    const providers = new Set(chain.map(reviewer => reviewer.provider));
+    assert(providers.size >= requirements.r3,
+      'Not enough distinct reviewer providers');
+  }
+  return requirements;
+}
+
 function validatePolicy(policy) {
   sameKeys(policy, POLICY_FIELDS, 'policy', POLICY_OPTIONAL_FIELDS);
-  assert(policy.version === SCHEMA, `Unsupported policy version: ${String(policy.version)}`);
+  assert(SCHEMAS.includes(policy.version), `Unsupported policy version: ${String(policy.version)}`);
   assert(MODES.includes(policy.mode), `Unsupported policy mode: ${String(policy.mode)}`);
   validateReviewer(policy.reviewer, 'reviewer');
   if (policy.reviewers !== undefined) reviewerChain(policy);
+  if (policy.version === SCHEMA) {
+    assert(Array.isArray(policy.r3_paths), 'Invalid r3_paths');
+    assert(policy.review_requirements !== undefined, 'Missing review_requirements');
+    validateReviewRequirements(policy);
+  } else {
+    assert(policy.r3_paths === undefined && policy.review_requirements === undefined,
+      'v4 fields require pr-governance/v4');
+  }
   // The owner comes from protected repository variables, so the committed
   // policy may leave it out. When it is present, it must be well formed.
   if (policy.owner !== undefined) {
@@ -163,7 +198,7 @@ function validatePolicy(policy) {
     assert(isPositiveId(policy.owner.user_id), 'Invalid owner user id');
     assert(typeof policy.owner.login === 'string' && policy.owner.login.length > 0, 'Invalid owner login');
   }
-  for (const field of ['r0_paths', 'r2_paths']) {
+  for (const field of policy.version === SCHEMA ? ['r0_paths', 'r2_paths', 'r3_paths'] : ['r0_paths', 'r2_paths']) {
     const rules = policy[field];
     assert(Array.isArray(rules), `Invalid ${field}`);
     assert(new Set(rules).size === rules.length, `Duplicate rule in ${field}`);
@@ -209,11 +244,18 @@ const TEST_PATH = /(?:^|\/)(?:tests?|__tests__|spec)(?:\/|$)|(?:\.|_)(?:test|spe
 const DEFAULT_MAX_R1_DIFF_LINES = 500;
 const GOVERNANCE_SCRIPT = /^scripts\/[^/]*(?:check|verify|validate|hygiene|lint)[^/]*\.(?:py|sh|js|cjs|mjs|ts)$/;
 const SECRET_MATERIAL = /\.(?:tf|tfvars|pem|key|p12|pfx)$/;
+const R3_TOKEN = new RegExp('(^|[/_.-])(iam|secrets?|credentials?|production|prod'
+  + '|live[-_]?trading|terraform|destroy|migrations?)([/_.-]|$)');
 
 function pathTier(path, policy) {
   assert(typeof path === 'string' && path.length > 0 && !path.startsWith('/') && !path.includes('\\')
     && !path.split('/').some(part => part === '..' || part === '.' || part === ''), 'Unknown path');
   const lowered = path.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+  // v4 isolates changes that can alter production authority, credentials or
+  // destructive state. Repositories can add explicit paths without weakening
+  // the canonical protected-token floor.
+  if (policy.version === SCHEMA
+    && (R3_TOKEN.test(lowered) || policy.r3_paths.some(rule => matchesPath(path, rule)))) return 'R3';
   // Protected paths outrank prose, examples and fixtures: a document that names
   // a credential is not low risk.
   if (lowered.startsWith('.github/')
@@ -471,6 +513,43 @@ function reviewerEvidence(snapshot, policy, now) {
   return { ...bound, state: 'success', reason: 'review_complete' };
 }
 
+function multiReviewerEvidence(snapshot, policy, now, tier) {
+  const chain = reviewerChain(policy);
+  const required = policy.review_requirements[tier.toLowerCase()];
+  const results = chain.map(reviewer => reviewerEvidence(snapshot, {
+    ...policy,
+    reviewer,
+    reviewers: [reviewer],
+  }, now));
+  const summaries = results.map(result => ({
+    provider: result.provider,
+    state: result.state,
+    reason: result.reason,
+    comment_id: result.comment_id,
+    commit_sha: result.commit_sha,
+    coverage: result.coverage,
+    unresolved: result.unresolved,
+  }));
+  const blocking = results.find(result => result.state === 'failure'
+    && result.reason !== 'review_stale');
+  const successful = results.filter(result => result.state === 'success');
+  const providers = [...new Set(successful.map(result => result.provider))].sort();
+  const enough = successful.length >= required
+    && (!policy.review_requirements.distinct_providers || providers.length >= required);
+  const common = {
+    required,
+    count: successful.length,
+    providers,
+    receipts: summaries,
+  };
+  if (blocking) return { ...blocking, ...common };
+  if (enough) return { ...successful[0], ...common };
+  const running = results.find(result => result.reason === 'review_running');
+  const primary = running || results[0];
+  return { ...primary, ...common, state: 'pending',
+    reason: running ? 'review_running' : 'review_pending' };
+}
+
 function unresolvedReviewerThreads(snapshot, policy) {
   const chain = reviewerChain(policy);
   return (snapshot.threads || [])
@@ -533,6 +612,7 @@ function templateVerdict(snapshot, policy, dependabot) {
 
 const GATE_TEXT = {
   clearing_label_required: 'needs owner-approved or agent-approved',
+  owner_approval_required: 'needs owner-approved',
   pr_template_incomplete: 'PR template incomplete',
   ai_review_pending: 'waiting for reviewer',
 };
@@ -557,17 +637,20 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
   const threads = unresolvedReviewerThreads(snapshot, policy);
   // Reviewer evidence is required at every tier: a prose-only change can still
   // introduce a misleading claim, so R0 only lowers the label requirement.
-  let review = reviewerEvidence(snapshot, policy, now);
+  let review = policy.version === SCHEMA
+    ? multiReviewerEvidence(snapshot, policy, now, risk.tier)
+    : reviewerEvidence(snapshot, policy, now);
   // Thread state comes from GitHub, the marker from the provider. The stricter
   // reading wins, and a resolved-or-missing thread never proves a clean review.
   if (threads.length && review.state !== 'failure') review = { ...review, state: 'failure', reason: 'review_threads' };
   const blocking = threads.map(id => `thread:${id}`);
   if (review.reason === 'review_findings') blocking.push('marker:unresolved_findings');
-  const tierOK = risk.tier !== 'R2' || labels.applied !== null;
+  const tierOK = risk.tier === 'R3' ? labels.applied === 'owner'
+    : risk.tier !== 'R2' || labels.applied !== null;
   const allowed = review.state === 'success' && tierOK && template.ok;
   let reason;
   if (review.state === 'failure') reason = review.reason;
-  else if (!tierOK) reason = 'clearing_label_required';
+  else if (!tierOK) reason = risk.tier === 'R3' ? 'owner_approval_required' : 'clearing_label_required';
   else if (!template.ok) reason = 'pr_template_incomplete';
   else if (review.state === 'pending') reason = 'ai_review_pending';
   else reason = review.reason;
@@ -590,7 +673,9 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
     tier: risk.tier,
     mode: policy.mode,
     review: { format: review.format, comment_id: review.comment_id, commit_sha: review.commit_sha,
-      coverage: review.coverage, unresolved: review.unresolved, state: review.state, reason: review.reason },
+      coverage: review.coverage, unresolved: review.unresolved, state: review.state, reason: review.reason,
+      required: review.required ?? 1, count: review.count ?? (review.state === 'success' ? 1 : 0),
+      providers: review.providers ?? [review.provider], receipts: review.receipts ?? null },
     threads: (snapshot.threads || []).map(stableThread),
     labels: { applied: labels.applied, records: labels.records },
     template: { ok: template.ok, exempt: template.exempt },
@@ -599,7 +684,7 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
       committer: commit.committer?.login ?? null, verified: commit.commit?.verification?.verified === true })),
   });
   return {
-    policy_version: SCHEMA,
+    policy_version: policy.version,
     mode: policy.mode,
     tier: risk.tier,
     rules: risk.rules,
@@ -614,7 +699,10 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
     evidence_sha256: evidenceSha,
     statuses: [
       { context: 'pr-template', state: template.state, description: template.description },
-      { context: 'ai-review', state: review.state, description: REVIEW_TEXT[review.reason] },
+      { context: 'ai-review', state: review.state,
+        description: review.required > 1
+          ? `${review.count}/${review.required} independent reviews verified`
+          : REVIEW_TEXT[review.reason] },
       { context: 'risk-gate', state: gateState, description: gateDescription },
     ],
   };
@@ -641,9 +729,10 @@ function completeTemplate(body) {
 }
 
 module.exports = {
-  SCHEMA, MODES, CLEARING_LABELS, MARKER_NAMES, REVIEW_TEXT,
+  SCHEMA, LEGACY_SCHEMA, SCHEMAS, MODES, CLEARING_LABELS, MARKER_NAMES, REVIEW_TEXT,
   sha256Hex, canonical, digest, isSha,
-  validatePolicy, reviewerChain, validateReviewer, pathTier, completePatch, classify, completeTemplate, binding,
+  validatePolicy, validateReviewRequirements, reviewerChain, validateReviewer, pathTier, completePatch, classify, completeTemplate, binding,
   stableComment, stableThread, matchesReviewer, matchesAnyReviewer, matchesThreadAuthor, normalizeLogin, markerPayloads,
-  reviewerEvidence, dependabotEvidence, labelEvidence, templateVerdict, evaluate,
+  reviewerEvidence, multiReviewerEvidence, dependabotEvidence, labelEvidence, templateVerdict, evaluate,
 };
+
