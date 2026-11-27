@@ -57,7 +57,7 @@
         },
         "login": {
           "type": "string",
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\\\[bot\\\\]$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\[bot\\]$"
         }
       }
     },
@@ -94,7 +94,7 @@
           },
           "login": {
             "type": "string",
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\\\[bot\\\\]$"
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\[bot\\]$"
           }
         }
       }
