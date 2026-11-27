@@ -72,3 +72,64 @@ condition = "AND"
 regexTarget = "secret"
 paths = ['''^tests/''']
 regexes = ['''(?i)^(?:test|fake|dummy|example)[_.-][a-z0-9_.-]+$''']
+
+[[rules]]
+id = "gcp-wif-project-number"
+description = "Hardcoded GCP Workload Identity Pool path with numeric project number"
+regex = '''projects/\d{6,}/locations/global/workloadIdentityPools'''
+
+[[rules]]
+id = "gcs-real-bucket"
+description = "Non-placeholder Google Cloud Storage bucket URI"
+regex = '''gs://[a-z0-9][a-z0-9._-]{2,}'''
+
+[[rules.allowlists]]
+description = "Allow synthetic example-* and angle-bracket placeholder buckets"
+regexTarget = "match"
+regexes = [
+  '''^gs://example-[a-z0-9._-]+$''',
+  '''^gs://<[^>]+>$''',
+]
+
+[[rules]]
+id = "public-ipv4"
+description = "Public IPv4 literal outside RFC1918, loopback, and documentation ranges"
+regex = '''(?i)(?:(?:version|release|semver|chrome|node|python|sdk)[\s:="']{1,6}|(?:^|[\s"'(,=:@<>])v|(?:==|>=|<=|~=|\^|@v?)\s*)?\b((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})\b(?:[-+][A-Za-z0-9]+)?'''
+secretGroup = 1
+
+[[rules.allowlists]]
+description = "Allow private, loopback, unspecified, and RFC5737 documentation IPv4 ranges"
+regexTarget = "secret"
+regexes = [
+  '''^10\.''',
+  '''^172\.(?:1[6-9]|2\d|3[01])\.''',
+  '''^192\.168\.''',
+  '''^127\.''',
+  '''^0\.0\.0\.0$''',
+  '''^192\.0\.2\.''',
+  '''^198\.51\.100\.''',
+  '''^203\.0\.113\.''',
+]
+
+[[rules.allowlists]]
+description = "Allow dotted-quad version numbers and release identifiers without exempting the whole line"
+regexTarget = "match"
+regexes = [
+  '''(?i)^(?:version|release|semver|chrome|node|python|sdk)[\s:="']{1,6}\d+\.\d+\.\d+\.\d+$''',
+  '''(?i)^(?:^|[\s"'(,=:@<>])v\d+\.\d+\.\d+\.\d+$''',
+  '''(?i)^(?:==|>=|<=|~=|\^|@v?)\s*\d+\.\d+\.\d+\.\d+$''',
+  '''\d+\.\d+\.\d+\.\d+[-+][A-Za-z0-9]+$''',
+]
+
+[[rules]]
+id = "personal-tax-or-capital"
+description = "Personal tax residency, personal capital, or owner account disclosure"
+regex = '''(?i)(?:\btax\s+residen(?:t|cy)\b|税务居民|税收居民|本人资金|\bmy\s+account\s+is\b|\bowner'?s\s+account\b)'''
+
+[[rules.allowlists]]
+description = "Allow policy, rule definitions, and documentation describing the prohibited terms"
+paths = [
+  '''(?:^|/)\.gitleaks\.toml$''',
+  '''(?:^|/)AGENTS\.md$''',
+  '''(?:^|/)docs/STYLE_GUIDE\.md$''',
+]
