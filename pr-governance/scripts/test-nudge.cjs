@@ -36,6 +36,8 @@ test('requests a review for an old head with no receipt', async () => {
   await run({ ...h, core });
   assert.equal(h.posted.length, 1);
   assert.match(h.posted[0], /@codex review/);
+  assert.doesNotMatch(h.posted[0], /@claude review/);
+  assert.doesNotMatch(h.posted[0], /cursor review/);
   assert.match(h.posted[0], /governance-nudge:a{40}/);
 });
 
@@ -95,50 +97,107 @@ test('reports a clear error when commenting is forbidden', async () => {
   assert.equal(h.posted.length, 0);
 });
 
-test('falls back to @claude review immediately when codex hits quota after stage 1', async () => {
+test('a Codex quota after this head request asks DeepSeek when Claude is off', async () => {
+  const previous = process.env.GOVERNANCE_API_REVIEW_MENTION;
+  process.env.GOVERNANCE_API_REVIEW_MENTION = '@example-ai-reviewer review';
   const s1Time = new Date(Date.now() - 2 * 60 * 1000).toISOString();
   const quotaTime = new Date(Date.now() - 1 * 60 * 1000).toISOString();
+  try {
+    const h = harness({
+      comments: [
+        { user: { login: 'github-actions[bot]' }, created_at: s1Time, body: `${marker(HEAD, 1)}\n@codex review` },
+        { user: { id: codex.user_id, login: codex.login }, created_at: quotaTime, body: 'Codex usage limit reached. Please try again later.' },
+      ],
+    });
+    await run({ ...h, core });
+    assert.equal(h.posted.length, 1);
+    assert.match(h.posted[0], /@example-ai-reviewer review/);
+    assert.match(h.posted[0], /governance-nudge:a{40}:deepseek/);
+    assert.doesNotMatch(h.posted[0], /@claude review/);
+  } finally {
+    if (previous === undefined) delete process.env.GOVERNANCE_API_REVIEW_MENTION;
+    else process.env.GOVERNANCE_API_REVIEW_MENTION = previous;
+  }
+});
+
+test('an older Codex quota comment does not skip the current head', async () => {
   const h = harness({
-    comments: [
-      { user: { login: 'github-actions[bot]' }, created_at: s1Time, body: marker(HEAD, 1) },
-      { user: { id: codex.user_id, login: codex.login }, created_at: quotaTime, body: 'Codex usage limit reached. Please try again later.' },
-    ],
+    comments: [{
+      user: { id: codex.user_id, login: codex.login },
+      created_at: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+      body: 'Codex usage limit reached. Please try again later.',
+    }],
   });
   await run({ ...h, core });
   assert.equal(h.posted.length, 1);
-  assert.match(h.posted[0], /@claude review/);
-  assert.doesNotMatch(h.posted[0], /@codex review/);
-  assert.match(h.posted[0], /governance-nudge:a{40}:stage2/);
+  assert.match(h.posted[0], /@codex review/);
+  assert.doesNotMatch(h.posted[0], /:deepseek/);
 });
 
-test('falls back to @claude review on timeout and escalates to cursor human prompt at stage 3', async () => {
-  const oldS1 = new Date(Date.now() - 20 * 60 * 1000).toISOString();
-  const h2 = harness({
-    comments: [{ user: { login: 'github-actions[bot]' }, created_at: oldS1, body: marker(HEAD, 1) }],
-  });
-  await run({ ...h2, core });
-  assert.equal(h2.posted.length, 1);
-  assert.match(h2.posted[0], /@claude review/);
-
-  const prevReviewers = process.env.GOVERNANCE_REVIEWERS_JSON;
-  process.env.GOVERNANCE_REVIEWERS_JSON = JSON.stringify([
-    codex,
-    { provider: 'claude', app_id: 1236702, user_id: 209825114, login: 'claude[bot]' },
-    { provider: 'cursor', app_id: 1210556, user_id: 206951365, login: 'cursor[bot]' },
-  ]);
+test('mentions Claude after a Codex quota only when Claude is enabled', async () => {
+  const previous = process.env.CLAUDE_REVIEW_ENABLED;
+  process.env.CLAUDE_REVIEW_ENABLED = 'true';
+  const s1Time = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  const quotaTime = new Date(Date.now() - 1 * 60 * 1000).toISOString();
   try {
-    const h3 = harness({
+    const h = harness({
       comments: [
-        { user: { login: 'github-actions[bot]' }, created_at: oldS1, body: marker(HEAD, 1) },
-        { user: { login: 'github-actions[bot]' }, created_at: oldS1, body: marker(HEAD, 2) },
+        { user: { login: 'github-actions[bot]' }, created_at: s1Time, body: `${marker(HEAD, 1)}\n@codex review` },
+        { user: { id: codex.user_id, login: codex.login }, created_at: quotaTime, body: 'Codex usage limit reached. Please try again later.' },
       ],
     });
-    await run({ ...h3, core });
-    assert.equal(h3.posted.length, 1);
-    assert.match(h3.posted[0], /cursor review/);
-    assert.match(h3.posted[0], /governance-nudge:a{40}:stage3/);
+    await run({ ...h, core });
+    assert.equal(h.posted.length, 1);
+    assert.match(h.posted[0], /@claude review/);
+    assert.doesNotMatch(h.posted[0], /@codex review/);
+    assert.doesNotMatch(h.posted[0], /cursor review/);
+    assert.match(h.posted[0], /governance-nudge:a{40}:stage2/);
   } finally {
-    if (prevReviewers === undefined) delete process.env.GOVERNANCE_REVIEWERS_JSON;
-    else process.env.GOVERNANCE_REVIEWERS_JSON = prevReviewers;
+    if (previous === undefined) delete process.env.CLAUDE_REVIEW_ENABLED;
+    else process.env.CLAUDE_REVIEW_ENABLED = previous;
+  }
+});
+
+test('both subscriptions off posts the configured DeepSeek mention once', async () => {
+  const previousCodex = process.env.CODEX_REVIEW_ENABLED;
+  const previousClaude = process.env.CLAUDE_REVIEW_ENABLED;
+  const previousMention = process.env.GOVERNANCE_API_REVIEW_MENTION;
+  process.env.CODEX_REVIEW_ENABLED = 'false';
+  process.env.CLAUDE_REVIEW_ENABLED = 'false';
+  process.env.GOVERNANCE_API_REVIEW_MENTION = '@example-ai-reviewer review the security checklist';
+  try {
+    const comments = [];
+    const h = harness({ comments });
+    await run({ ...h, core });
+    assert.equal(h.posted.length, 1);
+    assert.match(h.posted[0], /@example-ai-reviewer review the security checklist/);
+    assert.doesNotMatch(h.posted[0], /cursor review/);
+    comments.push({ user: { login: 'github-actions[bot]' }, body: h.posted[0] });
+    h.posted.length = 0;
+    await run({ ...h, core });
+    assert.equal(h.posted.length, 0);
+  } finally {
+    if (previousCodex === undefined) delete process.env.CODEX_REVIEW_ENABLED;
+    else process.env.CODEX_REVIEW_ENABLED = previousCodex;
+    if (previousClaude === undefined) delete process.env.CLAUDE_REVIEW_ENABLED;
+    else process.env.CLAUDE_REVIEW_ENABLED = previousClaude;
+    if (previousMention === undefined) delete process.env.GOVERNANCE_API_REVIEW_MENTION;
+    else process.env.GOVERNANCE_API_REVIEW_MENTION = previousMention;
+  }
+});
+
+test('a custom Codex dispatch mention is posted unchanged', async () => {
+  const previous = process.env.GOVERNANCE_DISPATCH_MENTIONS_JSON;
+  process.env.GOVERNANCE_DISPATCH_MENTIONS_JSON = JSON.stringify([
+    '@codex review with the repository-specific security checklist',
+    '@claude review',
+  ]);
+  try {
+    const h = harness();
+    await run({ ...h, core });
+    assert.match(h.posted[0], /@codex review with the repository-specific security checklist/);
+  } finally {
+    if (previous === undefined) delete process.env.GOVERNANCE_DISPATCH_MENTIONS_JSON;
+    else process.env.GOVERNANCE_DISPATCH_MENTIONS_JSON = previous;
   }
 });

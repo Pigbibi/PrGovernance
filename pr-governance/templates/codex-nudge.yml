@@ -1,8 +1,11 @@
 name: Review request
 
 # Copy to .github/workflows/codex-nudge.yml and replace __GOVERNANCE_REPO__.
-# Nudges Codex then Claude (see policy.review_routing). Cursor Bugbot must be
-# triggered by a human (`cursor review` / `bugbot run`); bot-posted triggers are ignored.
+# Requests whichever of Codex and Claude is enabled. Set the repository or org
+# variables CODEX_REVIEW_ENABLED and CLAUDE_REVIEW_ENABLED to true or false.
+# Empty means Codex on and Claude off. When neither remains, the workflow posts
+# GOVERNANCE_API_REVIEW_MENTION once so the DeepSeek reviewer starts.
+# Cursor and Bugbot are not requested.
 # Optional org var GOVERNANCE_REVIEWERS_JSON overrides reviewer identities.
 
 on:
@@ -39,5 +42,8 @@ jobs:
         env:
           GOVERNANCE_REVIEWERS_JSON: ${{ vars.GOVERNANCE_REVIEWERS_JSON }}
           GOVERNANCE_DISPATCH_MENTIONS_JSON: ${{ vars.GOVERNANCE_DISPATCH_MENTIONS_JSON }}
+          CODEX_REVIEW_ENABLED: ${{ vars.CODEX_REVIEW_ENABLED }}
+          CLAUDE_REVIEW_ENABLED: ${{ vars.CLAUDE_REVIEW_ENABLED }}
+          GOVERNANCE_API_REVIEW_MENTION: ${{ vars.GOVERNANCE_API_REVIEW_MENTION }}
         with:
           mode: nudge

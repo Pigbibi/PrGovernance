@@ -10,11 +10,5 @@
     "app_id": 1236702,
     "user_id": 209825114,
     "login": "claude[bot]"
-  },
-  {
-    "provider": "cursor",
-    "app_id": 1210556,
-    "user_id": 206951365,
-    "login": "cursor[bot]"
   }
 ]
