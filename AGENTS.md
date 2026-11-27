@@ -42,11 +42,9 @@ python3 local/check_hygiene.py --root .
   `remains unchanged` prose or sections after `## License`.
 
 <!-- content-boundary:begin -->
-- Public material carries no real resource names, tokens, or private account ids:
-  use synthetic values (`<owner>`, `<repo>`, synthetic token fixtures) and read
-  sensitive configuration from repository variables or environment.
-- Judge whether a change is clean using `git diff` and `git ls-files`; `.gitignore`
-  only affects untracked files.
+- Keep shared rules in `AGENTS.md`, with single-line `@AGENTS.md` pointers in root `CLAUDE.md` and `GEMINI.md`.
+- Public material carries no personal details (nationality/tax residency, capital/account size, broker account, address, email, phone), real infra IDs (GCP project number/ID, bucket, server IP/hostname, WIF path), tokens, or private account IDs: use synthetic placeholders (`<owner>`, `<repo>`, `gs://<bucket>/...`, `<project-number>`, `<host>`, synthetic token fixtures) and read sensitive configuration from repository variables or environment; hashing or truncating IDs does not anonymize.
+- Judge whether a change is clean using `git diff` and `git ls-files`; `.gitignore` only affects untracked files.
 <!-- content-boundary:end -->
 
 ## Commits and pull requests

@@ -475,6 +475,29 @@ class SecretScanTests(unittest.TestCase):
         self.assertEqual(set(rows), {'new_findings', 'by_rule'})
         self.assertTrue(all(isinstance(count, int) for count in rows['by_rule'].values()))
 
+    def test_cloud_infra_and_personal_disclosure_rules(self):
+        safe = (
+            'gs://example-bucket/data.json\n'
+            'gs://<bucket>/data.json\n'
+            '10.0.0.1\n172.16.0.1\n192.168.1.1\n127.0.0.1\n192.0.2.1\n'
+            'version=1.2.3.4\nv1.2.3.4\n'
+        )
+        self.assertEqual(self.detect(safe, 'safe.txt'), [])
+
+        wif = 'projects/' + '123456789012' + '/locations/global/workloadIdentityPools/p/providers/gh'
+        bucket = 'gs://' + 'prod-runtime-bucket/data.json'
+        public_ip = '.'.join(['203', '0', '114', '9'])
+        tax_note = 'tax ' + 'residency'
+        capital_note = '本人' + '资金'
+
+        self.assertIn('gcp-wif-project-number', {row['RuleID'] for row in self.detect(wif, 'wif.txt')})
+        self.assertIn('gcs-real-bucket', {row['RuleID'] for row in self.detect(bucket, 'bucket.txt')})
+        self.assertIn('public-ipv4', {row['RuleID'] for row in self.detect(f'host={public_ip}\n', 'host.txt')})
+        self.assertIn(
+            'personal-tax-or-capital',
+            {row['RuleID'] for row in self.detect(f'{tax_note}\n{capital_note}\n', 'notes.txt')},
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

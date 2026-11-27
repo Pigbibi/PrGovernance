@@ -228,5 +228,19 @@ class CheckHygieneTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1)
             self.assertIn("list item runs", res.stdout)
 
+    def test_gemini_pointer_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._init_minimal_repo(root)
+            (root / "GEMINI.md").write_text("@AGENTS.md\n", encoding="utf-8")
+            subprocess.run(["git", "add", "GEMINI.md"], cwd=root, check=True)
+            ok = self._run_cli(root, "--private", "--strict")
+            self.assertEqual(ok.returncode, 0, msg=ok.stdout + ok.stderr)
+
+            (root / "GEMINI.md").write_text("# Copied body\n", encoding="utf-8")
+            bad = self._run_cli(root, "--private")
+            self.assertEqual(bad.returncode, 1)
+            self.assertIn("GEMINI.md must be the single line @AGENTS.md", bad.stdout)
+
 if __name__ == "__main__":
     unittest.main()
