@@ -7,6 +7,7 @@
 
 const ON = new Set(['1', 'true', 'yes', 'on']);
 const OFF = new Set(['0', 'false', 'no', 'off']);
+const AUTO = new Set(['auto']);
 const MENTION = {
   codex: '@codex review',
   claude: '@claude review',
@@ -18,13 +19,18 @@ function flagEnabled(value, fallback) {
   if (!text) return fallback;
   if (ON.has(text)) return true;
   if (OFF.has(text)) return false;
+  if (AUTO.has(text)) return 'auto';
   throw new Error(`Invalid review subscription flag: ${value}`);
 }
 
 function flagsFromEnv(env) {
+  const codex = flagEnabled(env.CODEX_REVIEW_ENABLED, true);
+  const claude = flagEnabled(env.CLAUDE_REVIEW_ENABLED, false);
   return {
-    codexEnabled: flagEnabled(env.CODEX_REVIEW_ENABLED, true),
-    claudeEnabled: flagEnabled(env.CLAUDE_REVIEW_ENABLED, false),
+    codexMode: codex,
+    claudeMode: claude,
+    codexEnabled: codex === 'auto' ? true : codex,
+    claudeEnabled: claude === 'auto' ? true : claude,
   };
 }
 
