@@ -1,0 +1,208 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "pr-governance/v4",
+  "title": "PR governance policy v4",
+  "description": "Trusted policy with independent review thresholds and an owner-only R3 tier.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "mode",
+    "reviewer",
+    "reviewers",
+    "review_requirements",
+    "r0_paths",
+    "r2_paths",
+    "r3_paths",
+    "dependabot_template_exemption",
+    "max_evidence_age_hours"
+  ],
+  "properties": {
+    "version": {
+      "const": "pr-governance/v4"
+    },
+    "mode": {
+      "enum": [
+        "enforce",
+        "local",
+        "report-only"
+      ]
+    },
+    "reviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "app_id",
+        "user_id",
+        "login"
+      ],
+      "properties": {
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "cursor",
+            "deepseek",
+            "opencode"
+          ]
+        },
+        "app_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "user_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "login": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\[bot\\]$"
+        }
+      }
+    },
+    "reviewers": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "app_id",
+          "user_id",
+          "login"
+        ],
+        "properties": {
+          "provider": {
+            "enum": [
+              "claude",
+              "codex",
+              "cursor",
+              "deepseek",
+              "opencode"
+            ]
+          },
+          "app_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "user_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "login": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*\\[bot\\]$"
+          }
+        }
+      }
+    },
+    "review_requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "r0",
+        "r1",
+        "r2",
+        "r3",
+        "distinct_providers"
+      ],
+      "properties": {
+        "r0": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "r1": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "r2": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "r3": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "distinct_providers": {
+          "type": "boolean"
+        }
+      }
+    },
+    "review_routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dispatch_mentions"
+      ],
+      "properties": {
+        "dispatch_mentions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "user_id",
+        "login"
+      ],
+      "properties": {
+        "user_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "login": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "r0_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "r2_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "r3_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "dependabot_template_exemption": {
+      "type": "boolean"
+    },
+    "max_evidence_age_hours": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 720
+    },
+    "max_r1_diff_lines": {
+      "type": "integer",
+      "minimum": 50,
+      "maximum": 5000
+    }
+  }
+}
+

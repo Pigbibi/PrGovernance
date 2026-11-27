@@ -468,3 +468,107 @@ test('new non-test source file over max_r1_diff_lines escalates to R2', () => {
   assert.equal(risk.tier, 'R2');
   assert.equal(risk.newMonolith, true);
 });
+
+
+function upgradeV4(f, requirements = {}) {
+  const second = {
+    provider: 'claude',
+    app_id: 1236702,
+    user_id: 209825114,
+    login: 'claude[bot]',
+  };
+  f.policy.version = 'pr-governance/v4';
+  f.policy.r3_paths = [];
+  f.policy.reviewers = [f.policy.reviewer, second];
+  f.policy.review_requirements = {
+    r0: 1,
+    r1: 1,
+    r2: 2,
+    r3: 2,
+    distinct_providers: true,
+    ...requirements,
+  };
+  return { f, second };
+}
+
+function secondReceipt(f, second, review = {}) {
+  return rawComment(f, `<!-- ai-review-receipt:v1 ${JSON.stringify({
+    review: {
+      provider: second.provider,
+      commit_sha: HEAD,
+      coverage: 'complete',
+      unresolved_findings: false,
+      status: 'completed',
+      ...review,
+    },
+  })} -->`, {
+    user: { id: second.user_id, login: second.login, type: 'Bot' },
+    id: 980 + f.snapshot.comments.length,
+  });
+}
+
+test('v4 requires monotonic review requirements and enough providers', () => {
+  const { f } = upgradeV4(fixture());
+  assert.deepEqual(gate.validatePolicy(f.policy), f.policy);
+  f.policy.review_requirements.r2 = 1;
+  f.policy.review_requirements.r3 = 2;
+  f.policy.review_requirements.r1 = 2;
+  assert.throws(() => gate.validatePolicy(f.policy), /monotonic/);
+});
+
+test('v4 schema login patterns accept every shipped reviewer', () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'policy.v4.schema.json'), 'utf8'));
+  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'policy.v4.default.json'), 'utf8'));
+  const primaryPattern = new RegExp(schema.properties.reviewer.properties.login.pattern);
+  const reviewerPattern = new RegExp(schema.properties.reviewers.items.properties.login.pattern);
+  assert.equal(primaryPattern.test(shipped.reviewer.login), true);
+  assert.equal(reviewerPattern.test(shipped.reviewers[0].login), true);
+  assert.equal(reviewerPattern.test(shipped.reviewers[1].login), true);
+});
+
+test('v4 R2 waits for two independent reviewer providers', () => {
+  const { f, second } = upgradeV4(fixture({ path: 'config/app.json' }));
+  receiptMarker(f);
+  const record = labelEvent(f, { name: 'agent-approved',
+    actor: { id: 202, login: 'synthetic-agent' } });
+  clearRecord(f, record);
+  let result = evaluate(f);
+  assert.equal(result.tier, 'R2');
+  assert.equal(result.allowed, false);
+  assert.equal(result.review.count, 1);
+  assert.equal(result.review.required, 2);
+  secondReceipt(f, second);
+  result = evaluate(f);
+  assert.equal(result.allowed, true);
+  assert.deepEqual(result.review.providers, ['claude', 'codex']);
+});
+
+test('v4 R3 requires owner approval even after two clean reviews', () => {
+  const { f, second } = upgradeV4(fixture({ path: 'infra/iam/policy.json' }));
+  receiptMarker(f);
+  secondReceipt(f, second);
+  let record = labelEvent(f, { name: 'agent-approved',
+    actor: { id: 202, login: 'synthetic-agent' } });
+  clearRecord(f, record);
+  let result = evaluate(f);
+  assert.equal(result.tier, 'R3');
+  assert.equal(result.allowed, false);
+  assert.equal(result.reason, 'owner_approval_required');
+
+  record = labelEvent(f, { name: 'owner-approved' });
+  clearRecord(f, record);
+  result = evaluate(f);
+  assert.equal(result.allowed, true);
+  assert.equal(result.labels.applied, 'owner');
+});
+
+test('v4 prose content escalation cannot downgrade an R3 path', () => {
+  const { f } = upgradeV4(fixture({ path: 'infra/production/README.md' }));
+  f.snapshot.files[0].patch = '+deploy with owner-approved evidence';
+  f.snapshot.files[0].additions = 1;
+  f.snapshot.files[0].deletions = 0;
+  const risk = gate.classify(f.snapshot.files, 1, f.policy);
+  assert.equal(risk.tier, 'R3');
+  assert.equal(risk.rules[0].tier, 'R3');
+});
+

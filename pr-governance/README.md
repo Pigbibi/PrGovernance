@@ -21,8 +21,9 @@ A pull request may merge when all of these hold:
   head contains the current base head. Supported markers:
   `ai-review-receipt:v1`, `codex-review-receipt:v1`, `codex-review-state:v1`.
 - `risk-gate` — the resolved risk tier allows the path. Low risk passes on the
-  reviewer receipt. High risk also needs one clearing label that was recorded
-  on this exact head.
+  reviewer receipt. Under `pr-governance/v4`, R2 requires the configured number
+  of independent reviewer providers plus a clearing label, while R3 requires
+  independent reviewers and `owner-approved` recorded on this exact head.
 - `Gitleaks` — no credential in the commits the pull request adds.
 - Repository-specific checks (`test`, `Documentation check`, `Repository
   hygiene`, `Commit message convention`, …) stay in each repository.
@@ -40,10 +41,14 @@ deployment workflow and is exempt from the gate.
 | --- | --- | --- |
 | R0 | prose, docs | template and reviewer receipt |
 | R1 | ordinary source | template and reviewer receipt |
-| R2 | auth, secrets, deploy, runtime, strategy, config, manifests | one clearing label bound to the head |
+| R2 | workflows, deploy, runtime, strategy and protected config | configured independent reviews and one clearing label bound to the head |
+| R3 | IAM, credentials, production state, live trading and destructive migration | configured independent reviews and owner-approved bound to the head |
 
 The tiers come from the engine's path rules plus the repository's `r2_paths`.
-`r0_paths` can only lower a path that has no sensitive token.
+A v4 policy also supplies `r3_paths` and monotonic reviewer counts for R0–R3.
+When `distinct_providers` is true, multiple receipts from one provider never
+satisfy the threshold. `r0_paths` can only lower a path that has no sensitive
+token.
 
 Clearing labels: `owner-approved` (owner only) and `agent-approved` (any actor
 with write permission). A label added by a coding agent is evidence that the
@@ -65,13 +70,19 @@ organization community-health files.
 | `scripts/secret_scan.py` | range, history baseline and artifact scans |
 | `scripts/install-gitleaks.sh` | checksum-verified Gitleaks 8.30.1 |
 | `.gitleaks.toml` | organization rules and narrow synthetic allowlists |
-| `policy.schema.json` | `pr-governance/v3` schema |
-| `policy.default.json` | starting policy |
+| `policy.schema.json` | backward-compatible `pr-governance/v3` schema |
+| `policy.default.json` | v3 starting policy |
+| `policy.v4.schema.json` | independent-review and owner-only R3 schema |
+| `policy.v4.default.json` | report-only v4 pilot policy |
 | `templates/` | caller workflows to copy into a repository |
 
 ## Wiring a repository
 
-1. Copy `.github/governance/policy.json` from `policy.default.json` and set
+1. For existing repositories, copy `.github/governance/policy.json` from
+   `policy.default.json`. For a v4 pilot, start from `policy.v4.default.json`,
+   keep `mode: report-only`, configure two distinct reviewer identities, and set
+   repository-specific `r3_paths`. After observed evidence is complete, switch
+   that repository to `enforce`. Set
    `reviewer` and repository-specific `r2_paths`. Leave `owner` out: account
    identities belong in protected configuration, so the action reads
    `RISK_GATE_OWNER_ID` and `RISK_GATE_OWNER` from repository or organization

@@ -1,0 +1,49 @@
+{
+  "version": "pr-governance/v4",
+  "mode": "report-only",
+  "reviewer": {
+    "provider": "codex",
+    "app_id": 123456,
+    "user_id": 123456,
+    "login": "example-reviewer[bot]"
+  },
+  "reviewers": [
+    {
+      "provider": "codex",
+      "app_id": 123456,
+      "user_id": 123456,
+      "login": "example-reviewer[bot]"
+    },
+    {
+      "provider": "claude",
+      "app_id": 234567,
+      "user_id": 234567,
+      "login": "example-second-reviewer[bot]"
+    }
+  ],
+  "review_requirements": {
+    "r0": 1,
+    "r1": 1,
+    "r2": 2,
+    "r3": 2,
+    "distinct_providers": true
+  },
+  "review_routing": {
+    "dispatch_mentions": [
+      "@codex review",
+      "@claude review"
+    ]
+  },
+  "r0_paths": [
+    "README.md"
+  ],
+  "r2_paths": [
+    ".github/workflows/"
+  ],
+  "r3_paths": [
+    "infra/production/"
+  ],
+  "dependabot_template_exemption": true,
+  "max_evidence_age_hours": 168
+}
+
