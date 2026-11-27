@@ -468,3 +468,65 @@ test('new non-test source file over max_r1_diff_lines escalates to R2', () => {
   assert.equal(risk.tier, 'R2');
   assert.equal(risk.newMonolith, true);
 });
+
+test('authenticated owner-approved on exact head overrides fresh complete bot findings when no inline threads remain', () => {
+  const buildFindings = (extra = {}) => {
+    const f = receiptMarker(fixture({ path: extra.path || 'docs/pilot-results.md' }), {
+      coverage: extra.coverage || 'complete',
+      unresolved_findings: true,
+    }, { updated: extra.updated ?? -60 });
+    return f;
+  };
+
+  // Owner label clears R1/R2 bot comment findings when fresh, complete, exact head, and 0 open inline threads.
+  for (const pathItem of ['docs/pilot-results.md', 'config/settings.json']) {
+    const f = buildFindings({ path: pathItem });
+    const record = labelEvent(f, { name: 'owner-approved' });
+    clearRecord(f, record);
+    const result = evaluate(f);
+    assert.equal(result.allowed, true);
+    assert.equal(result.review.state, 'success');
+    assert.equal(result.review.reason, 'review_findings_owner_override');
+    assert.deepEqual(result.blocking_findings, ['marker:unresolved_findings']);
+    assert.equal(result.statuses.find(s => s.context === 'ai-review').description, 'Reviewer findings overridden by owner-approved');
+    assert.match(result.statuses.find(s => s.context === 'risk-gate').description, /findings overridden by owner-approved$/);
+  }
+
+  // agent-approved never overrides review_findings.
+  const agent = buildFindings();
+  const agentRec = labelEvent(agent, { name: 'agent-approved', actor: { id: 5, login: 'author' } });
+  clearRecord(agent, agentRec);
+  const agentRes = evaluate(agent);
+  assert.equal(agentRes.allowed, false);
+  assert.equal(agentRes.reason, 'review_findings');
+
+  // Open inline thread still blocks even with owner-approved.
+  const withThread = buildFindings();
+  const ownerRec = labelEvent(withThread, { name: 'owner-approved' });
+  clearRecord(withThread, ownerRec);
+  thread(withThread, { id: 'PRRT_kwDO_still_open' });
+  assert.equal(evaluate(withThread).allowed, false);
+
+  // Partial or expired receipt never gets overridden even with owner-approved.
+  const partial = buildFindings({ coverage: 'partial' });
+  clearRecord(partial, labelEvent(partial, { name: 'owner-approved' }));
+  assert.equal(evaluate(partial).allowed, false);
+  assert.equal(evaluate(partial).reason, 'review_findings');
+
+  const expired = buildFindings({ updated: -200 * 3600 });
+  clearRecord(expired, labelEvent(expired, { name: 'owner-approved' }));
+  assert.equal(evaluate(expired).allowed, false);
+  assert.equal(evaluate(expired).reason, 'review_findings');
+
+  // Pending / stale never gets overridden by owner-approved.
+  const stale = fixture({ path: 'docs/pilot-results.md' });
+  receiptMarker(stale, { commit_sha: BASE, unresolved_findings: false });
+  clearRecord(stale, labelEvent(stale, { name: 'owner-approved' }));
+  assert.equal(evaluate(stale).allowed, false);
+  assert.equal(evaluate(stale).reason, 'review_stale');
+
+  const pending = fixture({ path: 'docs/pilot-results.md' });
+  clearRecord(pending, labelEvent(pending, { name: 'owner-approved' }));
+  assert.equal(evaluate(pending).allowed, false);
+  assert.equal(evaluate(pending).reason, 'ai_review_pending');
+});

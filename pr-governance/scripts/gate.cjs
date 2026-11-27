@@ -387,6 +387,7 @@ const REVIEW_TEXT = {
   review_malformed: 'Newest reviewer marker is malformed or ambiguous',
   review_stale: 'Reviewer evidence covers another commit',
   review_findings: 'Reviewer reported unresolved findings',
+  review_findings_owner_override: 'Reviewer findings overridden by owner-approved',
   review_findings_unknown: 'Reviewer findings state is not reported',
   review_partial: 'Reviewer coverage is incomplete',
   review_expired: 'Reviewer evidence exceeds the policy age limit',
@@ -462,13 +463,14 @@ function reviewerEvidence(snapshot, policy, now) {
     commit_sha: evidence.commit_sha, coverage: evidence.coverage, unresolved: evidence.unresolved });
   if (evidence.status !== 'completed') return { ...bound, state: 'pending', reason: 'review_running' };
   if (evidence.commit_sha !== snapshot.pr.head.sha) return { ...bound, state: 'failure', reason: 'review_stale' };
-  if (evidence.unresolved === true) return { ...bound, state: 'failure', reason: 'review_findings' };
+  const limit = policy.max_evidence_age_hours * 3600;
+  const fresh = Number.isFinite(stamp) && (now - Math.floor(stamp / 1000) <= limit);
+  if (evidence.unresolved === true) return { ...bound, fresh, state: 'failure', reason: 'review_findings' };
   if (evidence.unresolved === null) return { ...bound, state: 'failure', reason: 'review_findings_unknown' };
   if (evidence.coverage !== 'complete') return { ...bound, state: 'failure', reason: 'review_partial' };
-  const limit = policy.max_evidence_age_hours * 3600;
   if (!Number.isFinite(stamp)) return { ...bound, state: 'failure', reason: 'review_malformed' };
   if (now - Math.floor(stamp / 1000) > limit) return { ...bound, state: 'failure', reason: 'review_expired' };
-  return { ...bound, state: 'success', reason: 'review_complete' };
+  return { ...bound, fresh: true, state: 'success', reason: 'review_complete' };
 }
 
 function unresolvedReviewerThreads(snapshot, policy) {
@@ -563,6 +565,19 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
   if (threads.length && review.state !== 'failure') review = { ...review, state: 'failure', reason: 'review_threads' };
   const blocking = threads.map(id => `thread:${id}`);
   if (review.reason === 'review_findings') blocking.push('marker:unresolved_findings');
+  // Authenticated owner-approved bound to this head may override bot comment findings
+  // (which lack a GitHub UI Resolve button) ONLY when the review completed freshly on
+  // this exact head with full coverage and zero open inline review threads.
+  const ownerCanOverrideFindings = labels.applied === 'owner'
+    && threads.length === 0
+    && review.state === 'failure'
+    && review.reason === 'review_findings'
+    && review.commit_sha === snapshot.pr.head.sha
+    && review.coverage === 'complete'
+    && review.fresh === true;
+  if (ownerCanOverrideFindings) {
+    review = { ...review, state: 'success', reason: 'review_findings_owner_override', owner_override: true };
+  }
   const tierOK = risk.tier !== 'R2' || labels.applied !== null;
   const allowed = review.state === 'success' && tierOK && template.ok;
   let reason;
@@ -576,8 +591,9 @@ function evaluate(snapshot, policy, policySha, now = Math.floor(Date.now() / 100
       : allowed ? 'success' : 'failure';
   // Two labels, two claims: the gate names which one cleared the high-risk path
   // so an agent-cleared merge is visible instead of passing as a human review.
-  const cleared = labels.applied === 'owner' ? 'cleared by owner-approved'
-    : labels.applied === 'agent' ? 'cleared by agent-approved, NOT confirmed by the owner' : null;
+  const cleared = review.owner_override ? 'findings overridden by owner-approved'
+    : labels.applied === 'owner' ? 'cleared by owner-approved'
+      : labels.applied === 'agent' ? 'cleared by agent-approved, NOT confirmed by the owner' : null;
   const gateReasonText = reason === 'clearing_label_required' && risk.volumeEscalated
     ? 'diff volume exceeded; needs owner-approved or agent-approved'
     : (GATE_TEXT[reason] || REVIEW_TEXT[reason] || reason);
