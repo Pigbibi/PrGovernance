@@ -5,8 +5,9 @@ organization. AI review asks for Codex, Claude, or both, according to
 `CODEX_REVIEW_ENABLED` and `CLAUDE_REVIEW_ENABLED`.
 
 An empty value leaves Codex on and Claude off. When both are false, or an
-enabled reviewer reports a quota limit and no other subscription reviewer is
-on, DeepSeek is the reviewer. Cursor and Bugbot are not requested. No workflow
+enabled reviewer reports a quota limit on this head and no other subscription
+reviewer is on, the workflow posts `GOVERNANCE_API_REVIEW_MENTION` so the
+DeepSeek reviewer starts. Cursor and Bugbot are not requested. No workflow
 identifies or depends on the agent that wrote a pull request.
 
 ## What is enforced

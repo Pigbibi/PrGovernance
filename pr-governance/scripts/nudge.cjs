@@ -14,9 +14,12 @@ const MIN_HEAD_AGE_MS = 10 * 60 * 1000;
 const MAX_PULL_REQUESTS = 100;
 const QUOTA_PATTERN = /\b(?:usage\s+limit|rate\s*limit|quota\s+(?:exceeded|reached|exhausted)|out\s+of\s+credits?|limit\s+reached|try\s+again\s+later)\b|额度已用完|达到上限/i;
 
-const marker = (head, stage = 1) => (stage === 1
-  ? `<!-- governance-nudge:${head} -->`
-  : `<!-- governance-nudge:${head}:stage${stage} -->`);
+const marker = (head, stage = 1) => {
+  if (stage === 'deepseek') return `<!-- governance-nudge:${head}:deepseek -->`;
+  return stage === 1
+    ? `<!-- governance-nudge:${head} -->`
+    : `<!-- governance-nudge:${head}:stage${stage} -->`;
+};
 
 function dispatchMentions(policy) {
   const raw = process.env.GOVERNANCE_DISPATCH_MENTIONS_JSON;
@@ -68,7 +71,9 @@ function findNudgeComment(comments, head, stage) {
     const explicit = `<!-- governance-nudge:${head}:stage1 -->`;
     return comments.find(c => typeof c.body === 'string' && (c.body.includes(legacy) || c.body.includes(explicit))) || null;
   }
-  const needle = marker(head, stage);
+  const needle = stage === 'deepseek'
+    ? `<!-- governance-nudge:${head}:deepseek -->`
+    : marker(head, stage);
   return comments.find(c => typeof c.body === 'string' && c.body.includes(needle)) || null;
 }
 
@@ -77,7 +82,7 @@ function alreadyNudged(comments, head) {
 }
 
 function reviewerQuotaHit(comments, reviewer, sinceMs) {
-  if (!reviewer) return false;
+  if (!reviewer || sinceMs === Number.POSITIVE_INFINITY) return false;
   return comments.some(c => {
     if (!gate.matchesReviewer(c.user, reviewer) || typeof c.body !== 'string') return false;
     if (gate.MARKER_NAMES.some(name => c.body.includes(name))) return false;
@@ -103,9 +108,11 @@ function nudgeBody(head, mentions, stage = 1) {
     '',
     marker(head, stage),
     '',
-    stage === 1
-      ? 'This head has no AI review receipt after 10 minutes.'
-      : 'An enabled reviewer reported a quota limit. Requesting the other enabled subscription reviewer.',
+    stage === 'deepseek'
+      ? 'No enabled subscription reviewer remains for this head.'
+      : stage === 1
+        ? 'This head has no AI review receipt after 10 minutes.'
+        : 'An enabled reviewer reported a quota limit. Requesting the other enabled subscription reviewer.',
     `Enabled now: ${mentions.join(', ')}.`,
     'A subscription flag set to false is not requested. When none remain, DeepSeek reviews this head.',
     'Acceptable markers: `ai-review-receipt:v1`, `codex-review-state:v1`, `codex-review-receipt:v1`.',
@@ -113,14 +120,29 @@ function nudgeBody(head, mentions, stage = 1) {
   return lines.join('\n');
 }
 
-function routeFor(comments, chain) {
+function mentionFor(provider, configured) {
+  if (provider === 'codex') return configured[0] || '@codex review';
+  if (provider === 'claude') return configured[1] || '@claude review';
+  return null;
+}
+
+function apiReviewMention() {
+  const text = String(process.env.GOVERNANCE_API_REVIEW_MENTION || '').trim();
+  return text;
+}
+
+function routeFor(comments, chain, head) {
   const flags = flagsFromEnv(process.env);
+  const currentRequest = findNudgeComment(comments, head, 1);
+  const sinceMs = currentRequest ? Date.parse(currentRequest.created_at || '') : Number.POSITIVE_INFINITY;
   const quotaProviders = [];
   for (const reviewer of chain) {
-    if (reviewerQuotaHit(comments, reviewer, 0)) quotaProviders.push(reviewer.provider);
+    if (reviewerQuotaHit(comments, reviewer, sinceMs)) quotaProviders.push(reviewer.provider);
   }
   const route = selectReviewRoute({ ...flags, quotaProviders });
-  const acceptable = new Set(route.kind === 'deepseek' ? [] : route.providers);
+  const acceptable = new Set(route.kind === 'deepseek'
+    ? ['deepseek', 'opencode']
+    : route.providers);
   return { route, chain: chain.filter(reviewer => acceptable.has(reviewer.provider)) };
 }
 
@@ -130,12 +152,38 @@ async function reviewRequested(github, repo, pr, core, config) {
   const comments = await github.paginate(github.rest.issues.listComments, {
     ...repo, issue_number: pr.number, per_page: 100,
   });
-  const selected = routeFor(comments, config.chain);
+  const selected = routeFor(comments, config.chain, head);
   if (receiptFor(comments, head, selected.chain)) return 'reviewed';
-  if (selected.route.kind === 'deepseek') return 'api-fallback';
+  if (selected.route.kind === 'deepseek') {
+    if (findNudgeComment(comments, head, 'deepseek')) return 'api-fallback';
+    const mention = apiReviewMention();
+    if (!mention) {
+      throw new Error(
+        'GOVERNANCE_API_REVIEW_MENTION is required when no subscription reviewer is enabled'
+      );
+    }
+    try {
+      await github.rest.issues.createComment({
+        ...repo,
+        issue_number: pr.number,
+        body: nudgeBody(head, [mention], 'deepseek'),
+      });
+    } catch (err) {
+      if (err && err.status === 403) {
+        throw new Error(
+          'Cannot create the review-request comment: the Review request workflow needs '
+          + 'pull-requests: write (and issues: write). GitHub returned 403 '
+          + 'Resource not accessible by integration.'
+        );
+      }
+      throw err;
+    }
+    core.info(`Requested DeepSeek review for #${pr.number} at ${head.slice(0, 7)}`);
+    return 'api-fallback';
+  }
   const s1 = findNudgeComment(comments, head, 1);
   let nextStage = 1;
-  let mentions = selected.route.mentions;
+  let mentions = selected.route.providers.map(provider => mentionFor(provider, config.mentions)).filter(Boolean);
   if (s1) {
     if (!s1.body.includes('@')) return 'nudged';
     const missing = mentions.filter(mention => !s1.body.includes(mention));
