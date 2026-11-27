@@ -57,11 +57,11 @@ REVIEWER_PROVIDERS: dict[str, tuple[str, tuple[int, ...]]] = {
     "chatgpt-codex-connector[bot]": ("codex", (0, 1, 2)),
     "claude[bot]": ("claude", (0,)),
     "cursor[bot]": ("cursor", (0,)),
-    "pigbibi-local-ai-reviewer": ("opencode", (0,)),
-    "pigbibi-local-ai-reviewer[bot]": ("opencode", (0,)),
-    "pigbibi-ai-reviewer[bot]": ("opencode", (0,)),
-    "qsl-ai-reviewer[bot]": ("opencode", (0,)),
-    "gdei-ai-reviewer[bot]": ("opencode", (0,)),
+    "pigbibi-local-ai-reviewer": ("deepseek", (0,)),
+    "pigbibi-local-ai-reviewer[bot]": ("deepseek", (0,)),
+    "pigbibi-ai-reviewer[bot]": ("deepseek", (0,)),
+    "qsl-ai-reviewer[bot]": ("deepseek", (0,)),
+    "gdei-ai-reviewer[bot]": ("deepseek", (0,)),
 }
 ACTION_PIN = re.compile(r"^\s*-?\s*uses\s*:")
 ACTION_TARGET = re.compile(

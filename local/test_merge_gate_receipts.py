@@ -1281,14 +1281,14 @@ class ClearingLabelTests(unittest.TestCase):
             {
                 "id": 901,
                 "user": {"login": "pigbibi-local-ai-reviewer[bot]"},
-                "body": '<!-- ai-review-receipt:v1 {"review":{"provider":"opencode","model":"gemini","commit_sha":"%s","status":"completed","coverage":"complete","unresolved_findings":false}} -->'
+                "body": '<!-- ai-review-receipt:v1 {"review":{"provider":"deepseek","model":"deepseek-chat","commit_sha":"%s","status":"completed","coverage":"complete","unresolved_findings":false}} -->'
                 % head,
                 "updated_at": "2026-11-14T08:11:00Z",
             }
         ]
-        latest = gate._collect_latest_provider_receipts(comments, head, {"opencode"}, None)
-        self.assertIn("opencode", latest)
-        self.assertEqual(latest["opencode"].state, "success")
+        latest = gate._collect_latest_provider_receipts(comments, head, {"deepseek"}, None)
+        self.assertIn("deepseek", latest)
+        self.assertEqual(latest["deepseek"].state, "success")
 
 
 if __name__ == "__main__":
